@@ -1,0 +1,17 @@
+# CV-Quixer experiment config.
+# Only lists values that differ from configs/defaults.yaml.
+
+name: cv_quixer_baseline
+model: quantum
+use_wandb: false
+
+quantum:
+  num_modes: 8
+  num_layers: 4
+  cutoff_dim: 10
+  backend: strawberryfields.fock
+
+training:
+  epochs: 30
+  lr: 1.0e-3
+  seed: 42

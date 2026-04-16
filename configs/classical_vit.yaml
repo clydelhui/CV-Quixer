@@ -1,0 +1,18 @@
+# Classical ViT baseline config.
+# Only lists values that differ from configs/defaults.yaml.
+
+name: classical_vit_baseline
+model: classical
+use_wandb: false
+
+classical:
+  embed_dim: 64
+  num_heads: 4
+  num_layers: 4
+  mlp_ratio: 4.0
+  dropout: 0.1
+
+training:
+  epochs: 30
+  lr: 1.0e-3
+  seed: 42

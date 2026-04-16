@@ -1,3 +1,8 @@
+# Project-specific
+data/
+results/checkpoints/
+results/logs/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

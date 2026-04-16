@@ -1,0 +1,31 @@
+[project]
+name = "cv-quixer"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "dacite>=1.9.2",
+    "ipykernel>=7.2.0",
+    "jupyter>=1.1.1",
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.4",
+    "pennylane>=0.44.1",
+    "pennylane-sf>=0.29.0",
+    "pyyaml>=6.0.3",
+    "scikit-learn>=1.8.0",
+    "seaborn>=0.13.2",
+    "timm>=1.0.26",
+    "torch>=2.11.0",
+    "torchvision>=0.26.0",
+    "tqdm>=4.67.3",
+    "transformers>=5.5.4",
+    "wandb>=0.26.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.15.10",
+]

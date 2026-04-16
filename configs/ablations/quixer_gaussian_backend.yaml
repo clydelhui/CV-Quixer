@@ -1,0 +1,11 @@
+# Ablation: use the Gaussian backend (no Kerr non-linearity) to isolate
+# the contribution of non-Gaussian gates to model performance.
+
+name: cv_quixer_gaussian
+model: quantum
+
+quantum:
+  num_modes: 8
+  num_layers: 4
+  cutoff_dim: 10
+  backend: strawberryfields.gaussian
