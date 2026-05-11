@@ -65,7 +65,7 @@ EOF
 # -----------------------------------------------------------------------
 echo ""
 echo "Starting mini experiment..."
-uv run python experiments/mini_experiment.py
+PYTHONPATH="$HOME/CV-Quixer${PYTHONPATH:+:$PYTHONPATH}" uv run python experiments/mini_experiment.py
 
 echo ""
 echo "Finished: $(date)"
