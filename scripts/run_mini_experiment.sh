@@ -27,8 +27,9 @@ cd "$HOME/CV-Quixer"
 if ! command -v uv &> /dev/null; then
     echo "Installing uv..."
     curl -LsSf https://astral.sh/uv/install.sh | sh
-    source "$HOME/.cargo/env"
 fi
+# Add both possible install locations (newer uv uses .local/bin, older used .cargo/bin)
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 
 # -----------------------------------------------------------------------
 # Python environment
