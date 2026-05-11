@@ -97,8 +97,19 @@ class Trainer:
             labels = labels.to(self.device)
 
             self.optimizer.zero_grad()
-            logits = self.model(patches)
-            loss = self.criterion(logits, labels)
+
+            use_trunc = (
+                self.config.model == "quantum"
+                and self.config.quantum.trunc_penalty != "none"
+            )
+            if use_trunc:
+                logits, trunc_loss = self.model(patches, return_trunc_loss=True)
+                loss = (self.criterion(logits, labels)
+                        + self.config.quantum.trunc_lambda * trunc_loss)
+            else:
+                logits = self.model(patches)
+                loss = self.criterion(logits, labels)
+
             loss.backward()
             self.optimizer.step()
 

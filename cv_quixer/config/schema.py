@@ -3,8 +3,10 @@ from dataclasses import dataclass, field
 
 @dataclass
 class DataConfig:
+    dataset: str = "fashionmnist"  # "fashionmnist" | "mnist"
+    normalize: bool = True         # compute & cache stats on first load; False → ToTensor only
     image_size: int = 28
-    patch_size: int = 4          # must divide image_size evenly
+    patch_size: int = 4            # must divide image_size evenly
     num_classes: int = 10
     batch_size: int = 64
     num_workers: int = 2
@@ -13,10 +15,29 @@ class DataConfig:
 
 @dataclass
 class QuantumConfig:
-    num_modes: int = 8           # number of bosonic modes (qumodes)
-    num_layers: int = 4          # number of CV transformer layers
-    cutoff_dim: int = 10         # Fock space truncation dimension
-    backend: str = "strawberryfields.fock"  # PennyLane device string
+    num_modes: int = 4           # number of bosonic modes (qumodes)
+    num_layers: int = 4          # reserved — not read until multi-layer stacking is implemented
+    cutoff_dim: int = 6          # Fock space truncation (memory ~ cutoff_dim^num_modes)
+    grad_mode: str = "backprop"          # "backprop" | "parameter_shift"
+    param_shift_shift: float = 1.5708   # shift s for PSR (default π/2)
+    bs_topology: str = "linear"         # "linear" | "ring"
+    dtype: str = "complex128"           # "complex64" | "complex128"
+
+    # Multi-head hypernetwork
+    num_heads: int = 4            # parallel CV attention heads
+    embed_dim: int = 16           # patch embedding width (hypernetwork input)
+    hyper_hidden_dim: int = 32    # hidden dim of patch→gate-params MLP
+    decoder_hidden_dim: int = 64  # hidden dim of readout→logits MLP
+
+    # Matrix polynomial degree for LCU attention (P(M) = Σ c_j M^j, j=0..d)
+    poly_degree: int = 2           # keep ≤ 4; d=2 or d=3 recommended
+
+    # Auto-scaling: set > 0 to auto-adjust hyper_hidden_dim to hit this budget
+    target_params: int = -1
+
+    # Fock truncation penalty added to training loss
+    trunc_penalty: str = "none"   # "none" | "norm" | "photon_number"
+    trunc_lambda: float = 0.01
 
 
 @dataclass

@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 
 from cv_quixer.config.utils import load_config, save_config
-from cv_quixer.data.mnist import get_dataloaders
+from cv_quixer.data import get_dataloaders
 from cv_quixer.models import build_model
 from cv_quixer.training.trainer import Trainer
 from cv_quixer.utils.logging import finish_logging, init_logging

@@ -1,121 +1,104 @@
-"""Reusable CV quantum circuit primitives.
+"""Parameterised CV neural network layer.
 
-A single CV transformer layer follows the architecture from Killoran et al.
-(2019): Interferometer → Squeezing → Interferometer → Displacement → Kerr.
+CVLayer owns the nn.Parameter tensors for one complete CV transformer layer.
+The apply() method is the main implementation site — define the gate sequence
+for your layer architecture here.
 
-The Kerr non-linearity is the only non-Gaussian gate; it requires the Fock
-backend (strawberryfields.fock). For purely Gaussian experiments, omit Kerr
-and use strawberryfields.gaussian instead.
+Typical Killoran et al. (2019) structure:
+    Interferometer → Squeezing → Interferometer → Displacement → Kerr
 
-Reference:
-    Killoran et al., "Continuous-variable quantum neural networks" (2019)
+The engine tools to use inside apply():
+    from cv_quixer.quantum import (
+        clements_interferometer,
+        displacement_matrix, squeezing_matrix, rotation_matrix,
+        beamsplitter_matrix, kerr_matrix, cubic_phase_matrix,
+    )
+    state = circuit.apply_single_mode_gate(gate_matrix, mode_index, state)
+    state = circuit.apply_two_mode_gate(gate_matrix, mode_i, mode_j, state)
 """
 
-import pennylane as qml
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 
+from cv_quixer.quantum import CVCircuit, FockState
 
-def interferometer(params: torch.Tensor, wires: list[int]) -> None:
-    """Apply a general linear-optical interferometer (beam-splitter mesh).
-
-    Implements a rectangular mesh of beam splitters and phase shifters that
-    realises an arbitrary N×N unitary on N modes (Clements decomposition).
-
-    Args:
-        params: 1-D tensor of length num_modes * (num_modes - 1) / 2 * 3 +
-                num_modes containing all beam-splitter angles, phase shifts,
-                and final phase shifts.
-        wires: Wire indices for the N modes.
-    """
-    n = len(wires)
-    idx = 0
-    # Rectangular beam-splitter mesh (Clements-style, row by row)
-    for layer in range(n):
-        for i in range(layer % 2, n - 1, 2):
-            qml.Beamsplitter(params[idx], params[idx + 1], wires=[wires[i], wires[i + 1]])
-            idx += 2
-    # Per-mode phase shifts
-    for i in range(n):
-        qml.Rotation(params[idx], wires=wires[i])
-        idx += 1
-
-
-def cv_layer(
-    theta: torch.Tensor,
-    phi: torch.Tensor,
-    varphi: torch.Tensor,
-    r: torch.Tensor,
-    r_phi: torch.Tensor,
-    displacement: torch.Tensor,
-    kappa: torch.Tensor,
-    wires: list[int],
-    use_kerr: bool = True,
-) -> None:
-    """Apply one complete CV neural network layer to a set of modes.
-
-    Layer structure: Interferometer → Squeezing → Interferometer →
-                     Displacement → Kerr (optional)
-
-    Args:
-        theta:       Beam-splitter angles for first interferometer.
-        phi:         Phase shifts for first interferometer.
-        varphi:      All parameters for second interferometer (combined).
-        r:           Squeezing magnitude per mode.
-        r_phi:       Squeezing angle per mode.
-        displacement: Displacement amplitude per mode (real-valued).
-        kappa:       Kerr interaction strength per mode.
-        wires:       Wire indices.
-        use_kerr:    Whether to apply the Kerr non-linearity. Set False when
-                     using the Gaussian backend.
-    """
-    n = len(wires)
-    interferometer(torch.cat([theta, phi]), wires)
-    for i in range(n):
-        qml.Squeezing(r[i], r_phi[i], wires=wires[i])
-    interferometer(varphi, wires)
-    for i in range(n):
-        qml.Displacement(displacement[i], 0.0, wires=wires[i])
-    if use_kerr:
-        for i in range(n):
-            qml.Kerr(kappa[i], wires=wires[i])
-
-
-def interferometer_param_count(num_modes: int) -> int:
-    """Return the number of parameters needed for one interferometer."""
-    n = num_modes
-    # beam splitter pairs: n*(n-1)/2 pairs × 2 params + n phase shifts
-    return n * (n - 1) + n
+# Re-export so test_cv_quixer.py::TestInterferometerParamCount passes unchanged
+from cv_quixer.quantum import interferometer_param_count  # noqa: F401
 
 
 class CVLayer(nn.Module):
-    """Parameterised CV neural network layer with learnable weights.
+    """One parameterised CV neural network layer (scaffolding — not used in CVQuixer).
 
-    Wraps cv_layer() with nn.Parameter tensors so that PyTorch autograd
-    propagates gradients through the PennyLane circuit via the
-    parameter-shift rule.
+    The current model uses HyperCVAttentionHead with an iterative gate application
+    approach. CVLayer exists as a template for a future multi-layer architecture
+    where stacked CVLayer blocks replace the single HyperCVAttention block.
+
+    Owns all trainable parameters as nn.Parameter tensors. Implement the
+    gate sequence inside apply().
+
+    Parameter layout (Killoran et al. 2019 default — adjust to your design):
+        theta, phi   — first interferometer beamsplitter angles / phases
+        varphi       — second interferometer (all params combined)
+        r, r_phi     — squeezing magnitude and angle per mode
+        displacement — displacement amplitude per mode
+        kappa        — Kerr coupling per mode
+
+    Args:
+        num_modes: Number of bosonic modes.
     """
 
-    def __init__(self, num_modes: int, use_kerr: bool = True) -> None:
+    def __init__(self, num_modes: int) -> None:
         super().__init__()
         n = num_modes
         ic = interferometer_param_count(n)
 
+        # First interferometer
         self.theta = nn.Parameter(torch.randn(ic // 2))
         self.phi = nn.Parameter(torch.randn(ic // 2))
+        # Second interferometer (combined vector)
         self.varphi = nn.Parameter(torch.randn(ic))
+        # Squeezing
         self.r = nn.Parameter(torch.zeros(n))
         self.r_phi = nn.Parameter(torch.zeros(n))
+        # Displacement
         self.displacement = nn.Parameter(torch.zeros(n))
+        # Kerr
         self.kappa = nn.Parameter(torch.zeros(n))
-        self.use_kerr = use_kerr
+
         self.num_modes = num_modes
 
-    def apply(self, wires: list[int]) -> None:
-        """Apply this layer's gates inside a QNode context."""
-        cv_layer(
-            self.theta, self.phi, self.varphi,
-            self.r, self.r_phi,
-            self.displacement, self.kappa,
-            wires, self.use_kerr,
+    def apply(self, circuit: CVCircuit, state: FockState) -> FockState:
+        """Apply this layer's gate sequence to state.
+
+        This is the primary implementation site. Use circuit.apply_single_mode_gate()
+        and circuit.apply_two_mode_gate() together with gate matrix functions from
+        cv_quixer.quantum to build your circuit.
+
+        Args:
+            circuit: CVCircuit executor (stateless).
+            state:   Input FockState. Not mutated — always return a new state.
+
+        Returns:
+            New FockState after the gate sequence.
+
+        Example skeleton:
+            from cv_quixer.quantum import clements_interferometer, squeezing_matrix, kerr_matrix
+
+            # 1. First interferometer
+            state = clements_interferometer(self.theta[...], self.phi[...], ..., circuit, state)
+
+            # 2. Squeezing
+            for i in range(self.num_modes):
+                mat = squeezing_matrix(self.r[i], self.r_phi[i], circuit.cutoff_dim)
+                state = circuit.apply_single_mode_gate(mat, i, state)
+
+            # 3. Second interferometer, displacement, Kerr ...
+
+            return state
+        """
+        raise NotImplementedError(
+            "Implement the gate sequence for CVLayer.apply(). "
+            "See the docstring above for a skeleton."
         )

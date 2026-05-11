@@ -10,8 +10,6 @@ dependencies = [
     "jupyter>=1.1.1",
     "matplotlib>=3.10.8",
     "numpy>=2.4.4",
-    "pennylane>=0.44.1",
-    "pennylane-sf>=0.29.0",
     "pyyaml>=6.0.3",
     "scikit-learn>=1.8.0",
     "seaborn>=0.13.2",
@@ -22,6 +20,10 @@ dependencies = [
     "transformers>=5.5.4",
     "wandb>=0.26.0",
 ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [

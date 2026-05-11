@@ -1,11 +1,11 @@
-"""Tests for the MNIST data pipeline."""
+"""Tests for the data pipeline."""
 
 import torch
 import pytest
 
 from cv_quixer.config.schema import DataConfig
 from cv_quixer.data.transforms import extract_patches
-from cv_quixer.data.mnist import PatchedMNIST, get_dataloaders
+from cv_quixer.data.mnist import PatchedDataset, get_dataloaders
 
 
 class TestExtractPatches:
@@ -27,29 +27,49 @@ class TestExtractPatches:
             extract_patches(images, patch_size=5)  # 28 not divisible by 5
 
 
-class TestPatchedMNIST:
+class TestPatchedDataset:
     @pytest.fixture
     def config(self, tmp_path):
-        return DataConfig(patch_size=4, data_root=str(tmp_path))
+        return DataConfig(dataset="fashionmnist", patch_size=4, data_root=str(tmp_path))
 
     def test_item_shapes(self, config):
-        dataset = PatchedMNIST(config, train=True)
+        dataset = PatchedDataset(config, train=True)
         patches, label = dataset[0]
         assert patches.shape == (49, 16)
         assert isinstance(label, int)
 
     def test_length(self, config):
-        dataset = PatchedMNIST(config, train=True)
+        dataset = PatchedDataset(config, train=True)
         assert len(dataset) == 60_000
 
     def test_test_split_length(self, config):
-        dataset = PatchedMNIST(config, train=False)
+        dataset = PatchedDataset(config, train=False)
         assert len(dataset) == 10_000
+
+    def test_unknown_dataset_raises(self, tmp_path):
+        config = DataConfig(dataset="imagenet", data_root=str(tmp_path))
+        with pytest.raises(ValueError, match="Unknown dataset"):
+            PatchedDataset(config, train=True)
+
+    def test_normalize_false_range(self, tmp_path):
+        config = DataConfig(dataset="fashionmnist", normalize=False,
+                            patch_size=4, data_root=str(tmp_path))
+        dataset = PatchedDataset(config, train=True)
+        patches, _ = dataset[0]
+        assert patches.min() >= 0.0
+        assert patches.max() <= 1.0
+
+    def test_stats_cache_written(self, config):
+        import pathlib
+        PatchedDataset(config, train=True)
+        cache = pathlib.Path(config.data_root) / "fashionmnist_norm_stats.json"
+        assert cache.exists()
 
 
 class TestGetDataloaders:
     def test_batch_shapes(self, tmp_path):
-        config = DataConfig(patch_size=4, batch_size=8, data_root=str(tmp_path))
+        config = DataConfig(dataset="fashionmnist", patch_size=4,
+                            batch_size=8, data_root=str(tmp_path))
         train_loader, test_loader = get_dataloaders(config)
         patches, labels = next(iter(train_loader))
         assert patches.shape == (8, 49, 16)

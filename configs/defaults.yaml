@@ -6,6 +6,8 @@ model: quantum         # "quantum" or "classical"
 use_wandb: false
 
 data:
+  dataset: fashionmnist
+  normalize: true
   image_size: 28
   patch_size: 4        # → 49 patches of dim 16 (4×4 pixels, 1 channel)
   num_classes: 10
@@ -15,9 +17,12 @@ data:
 
 quantum:
   num_modes: 8
-  num_layers: 4
+  num_layers: 4        # reserved — not read until multi-layer stacking is implemented
   cutoff_dim: 10
-  backend: strawberryfields.fock
+  grad_mode: backprop       # "backprop" | "parameter_shift"
+  param_shift_shift: 1.5708  # π/2
+  bs_topology: linear       # "linear" | "ring"
+  dtype: complex128
 
 classical:
   embed_dim: 64
