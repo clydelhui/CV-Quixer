@@ -44,12 +44,9 @@ export UV_PROJECT_ENVIRONMENT="$HOME/.venvs/cv-quixer-cuda"
 # Remove any existing venv so uv starts clean (previous run may have CUDA 13 torch).
 rm -rf "$UV_PROJECT_ENVIRONMENT"
 
-# cu124 as PRIMARY index — uv resolves torch from here first, avoiding PyPI's cu130 build.
-# PyPI as extra index supplies all non-torch packages as normal.
-# cu124 (CUDA 12.4 runtime) is compatible with all nv nodes (CUDA 12.5 and 12.9).
-echo "Syncing dependencies (cu124 as primary index)..."
-UV_INDEX_URL="https://download.pytorch.org/whl/cu124" \
-UV_EXTRA_INDEX_URL="https://pypi.org/simple" \
+# pyproject.toml [tool.uv.sources] binds torch/torchvision exclusively to the cu124
+# index on Linux, so uv will not pick PyPI's incompatible cu130 build.
+echo "Syncing dependencies..."
 uv sync
 
 # -----------------------------------------------------------------------
