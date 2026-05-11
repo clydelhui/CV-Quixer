@@ -64,8 +64,14 @@ EOF
 # Run experiment
 # -----------------------------------------------------------------------
 echo ""
+echo "=== Import diagnostics ==="
+PYTHONPATH="$HOME/CV-Quixer${PYTHONPATH:+:$PYTHONPATH}" \
+    uv run python scripts/debug_imports.py
+
+echo ""
 echo "Starting mini experiment..."
-PYTHONPATH="$HOME/CV-Quixer${PYTHONPATH:+:$PYTHONPATH}" uv run python experiments/mini_experiment.py
+PYTHONPATH="$HOME/CV-Quixer${PYTHONPATH:+:$PYTHONPATH}" \
+    uv run python experiments/mini_experiment.py
 
 echo ""
 echo "Finished: $(date)"
