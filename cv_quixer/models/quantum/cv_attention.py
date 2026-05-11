@@ -26,6 +26,8 @@ passed to CVDecoder in cv_quixer.py.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -108,49 +110,114 @@ def photon_number_penalty(state: FockState, circuit: CVCircuit) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# PatchHypernetwork
+# 2D sinusoidal positional encoding helper
 # ---------------------------------------------------------------------------
 
 
-class PatchHypernetwork(nn.Module):
-    """Classical MLP that maps one embedded patch to quantum gate parameters.
+def _compute_2d_sinusoidal_pe(num_patches: int, feature_dim: int) -> torch.Tensor:
+    """Precompute additive 2D sinusoidal positional encodings for a patch grid.
 
-    Output layout — length _gate_param_count(num_modes, bs_topology):
-        [squeeze_r(m) | squeeze_phi(m) | bs_theta(n_bs) | bs_phi(n_bs) |
-         rot_phi(m) | disp_re(m) | disp_im(m) | kerr_kappa(m)]
-
-    Activation is Tanh so that gate parameters remain bounded, preventing
-    photon blow-up toward the Fock cutoff early in training.
+    The patch grid is assumed square (grid_size × grid_size = num_patches).
+    The feature_dim is split in half: first half encodes row position, second
+    half encodes column position, using alternating sin/cos pairs.
 
     Args:
-        embed_dim:   Width of the embedded patch (input size).
-        num_modes:   Number of bosonic modes.
-        hidden_dim:  Width of the single hidden layer.
-        bs_topology: "linear" | "ring" — determines beamsplitter pair count.
+        num_patches: Total number of patches (must be a perfect square).
+        feature_dim: Dimensionality of the CNN feature vector (must be even).
+
+    Returns:
+        Float tensor of shape (num_patches, feature_dim).
+    """
+    grid = int(num_patches ** 0.5)
+    assert grid * grid == num_patches, (
+        f"num_patches={num_patches} must be a perfect square for 2D PE"
+    )
+    assert feature_dim % 2 == 0, (
+        f"feature_dim={feature_dim} must be even for 2D sinusoidal PE"
+    )
+    d_half = feature_dim // 2
+    pe = torch.zeros(num_patches, feature_dim)
+    for idx in range(num_patches):
+        row, col = divmod(idx, grid)
+        for k in range(d_half // 2):
+            div = 10000.0 ** (2 * k / max(d_half, 1))
+            pe[idx, 2 * k]     = math.sin(row / div)
+            pe[idx, 2 * k + 1] = math.cos(row / div)
+        for k in range(d_half // 2):
+            div = 10000.0 ** (2 * k / max(d_half, 1))
+            pe[idx, d_half + 2 * k]     = math.sin(col / div)
+            pe[idx, d_half + 2 * k + 1] = math.cos(col / div)
+    return pe
+
+
+# ---------------------------------------------------------------------------
+# CNNHypernetwork
+# ---------------------------------------------------------------------------
+
+
+class CNNHypernetwork(nn.Module):
+    """CNN that maps one raw image patch to quantum gate parameters.
+
+    Architecture:
+        Conv2d(1, C1, k) → Tanh → Conv2d(C1, C2, k) → Tanh →
+        flatten → + 2D sinusoidal PE → Linear(feature_dim, gate_params)
+
+    No padding is used; spatial output size h_out = patch_size - 2*(k-1).
+    The 2D PE encodes each patch's (row, col) grid position and is added to
+    the flattened feature vector before the final linear projection.
+
+    Args:
+        patch_size:    Side length of each square patch in pixels.
+        num_patches:   Total number of patches (must be a perfect square).
+        num_modes:     Number of bosonic modes.
+        cnn_channels_1: Output channels of first conv layer.
+        cnn_channels_2: Output channels of second conv layer.
+        cnn_kernel_size: Kernel size for both conv layers.
+        bs_topology:   "linear" | "ring".
     """
 
     def __init__(
-        self, embed_dim: int, num_modes: int, hidden_dim: int, bs_topology: str
+        self,
+        patch_size: int,
+        num_patches: int,
+        num_modes: int,
+        cnn_channels_1: int,
+        cnn_channels_2: int,
+        cnn_kernel_size: int,
+        bs_topology: str,
     ) -> None:
         super().__init__()
-        self.num_modes = num_modes
-        out_dim = _gate_param_count(num_modes, bs_topology)
-        self.net = nn.Sequential(
-            nn.Linear(embed_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, out_dim),
+        h_out = patch_size - 2 * (cnn_kernel_size - 1)
+        assert h_out > 0, (
+            f"patch_size={patch_size} is too small for cnn_kernel_size={cnn_kernel_size}; "
+            f"need patch_size > {2 * (cnn_kernel_size - 1)}"
         )
+        self.patch_size = patch_size
+        feature_dim = cnn_channels_2 * h_out * h_out
+        gate_params = _gate_param_count(num_modes, bs_topology)
 
-    def forward(self, patch: torch.Tensor) -> torch.Tensor:
-        """Map one patch to gate parameters.
+        self.conv1 = nn.Conv2d(1, cnn_channels_1, cnn_kernel_size)
+        self.conv2 = nn.Conv2d(cnn_channels_1, cnn_channels_2, cnn_kernel_size)
+        self.linear = nn.Linear(feature_dim, gate_params)
+
+        pe = _compute_2d_sinusoidal_pe(num_patches, feature_dim)
+        self.register_buffer('pos_enc', pe)
+
+    def forward(self, patch: torch.Tensor, patch_idx: int) -> torch.Tensor:
+        """Map one raw patch to gate parameters.
 
         Args:
-            patch: 1-D tensor of shape (embed_dim,).
+            patch:     1-D tensor of shape (patch_size²,) — flattened greyscale patch.
+            patch_idx: Position index of this patch in the sequence (0-indexed).
 
         Returns:
             Tensor of shape (_gate_param_count(num_modes, bs_topology),).
         """
-        return self.net(patch)
+        x = patch.reshape(1, 1, self.patch_size, self.patch_size)
+        x = torch.tanh(self.conv1(x))
+        x = torch.tanh(self.conv2(x))
+        x = x.flatten(start_dim=1).squeeze(0) + self.pos_enc[patch_idx]
+        return self.linear(x)
 
 
 # ---------------------------------------------------------------------------
@@ -241,13 +308,13 @@ class HyperCVAttentionHead(nn.Module):
     CVCircuit is stateless — it holds no nn.Parameters.
 
     Args:
-        embed_dim:   Width of the embedded patch (hypernetwork input).
-        num_patches: Sequence length N — needed to size LCUSumCoefficients.
+        patch_size:  Side length of each raw image patch in pixels.
+        num_patches: Sequence length N — needed to size LCUSumCoefficients and PE.
         config:      QuantumConfig.
     """
 
     def __init__(
-        self, embed_dim: int, num_patches: int, config: QuantumConfig
+        self, patch_size: int, num_patches: int, config: QuantumConfig
     ) -> None:
         super().__init__()
         self.num_modes = config.num_modes
@@ -264,8 +331,10 @@ class HyperCVAttentionHead(nn.Module):
         else:
             self._bs_pairs = [(k, k + 1) for k in range(m - 1)]
 
-        self.hypernetwork = PatchHypernetwork(
-            embed_dim, config.num_modes, config.hyper_hidden_dim, config.bs_topology
+        self.hypernetwork = CNNHypernetwork(
+            patch_size, num_patches, config.num_modes,
+            config.cnn_channels_1, config.cnn_channels_2, config.cnn_kernel_size,
+            config.bs_topology,
         )
         self.lcu_coeffs = LCUSumCoefficients(num_patches)
         self.poly_coeffs = PolynomialCoefficients(config.poly_degree)
@@ -362,7 +431,7 @@ class HyperCVAttentionHead(nn.Module):
         b = self.lcu_coeffs().to(device)   # (N,) complex — move to quantum device
         result = torch.zeros_like(v)
         for i in range(patches.shape[0]):
-            params = self.hypernetwork(patches[i]).to(device)  # classical → quantum device
+            params = self.hypernetwork(patches[i], i).to(device)  # classical → quantum device
             state_i = FockState(v.reshape((D,) * m), m, D)
             out_i = self._apply_patch_gates_to_state(params, state_i, device, dtype)
             result = result + b[i].to(dtype) * out_i.data.reshape(-1)
@@ -474,20 +543,20 @@ class HyperCVAttention(nn.Module):
     vector per batch element.
 
     Args:
-        embed_dim:   Width of the embedded patch.
+        patch_size:  Side length of each raw image patch in pixels.
         num_patches: Sequence length N.
         config:      QuantumConfig.
     """
 
     def __init__(
-        self, embed_dim: int, num_patches: int, config: QuantumConfig
+        self, patch_size: int, num_patches: int, config: QuantumConfig
     ) -> None:
         super().__init__()
         self.num_heads = config.num_heads
         self.num_modes = config.num_modes
 
         self.heads = nn.ModuleList([
-            HyperCVAttentionHead(embed_dim, num_patches, config)
+            HyperCVAttentionHead(patch_size, num_patches, config)
             for _ in range(config.num_heads)
         ])
 

@@ -1,7 +1,7 @@
 """End-to-end smoke test: 5 train samples, 1 test sample, FashionMNIST.
 
 Verifies:
-  1. FashionMNIST patches load with correct shape (5, 49, 16)
+  1. FashionMNIST patches load with correct shape (5, 16, 49)
   2. Forward pass produces logits of shape (B, 10)
   3. Fock truncation loss is computed and logged each epoch
   4. Combined loss computes and backward() runs without error
@@ -27,7 +27,7 @@ EPOCHS = 5
 data_cfg = DataConfig(
     dataset="fashionmnist",
     normalize=True,
-    patch_size=4,
+    patch_size=7,
     batch_size=5,
     num_workers=0,
     data_root="data/",
@@ -36,8 +36,9 @@ quantum_cfg = QuantumConfig(
     num_modes=2,
     cutoff_dim=4,
     num_heads=2,
-    embed_dim=8,
-    hyper_hidden_dim=8,
+    cnn_channels_1=4,
+    cnn_channels_2=8,
+    cnn_kernel_size=3,
     decoder_hidden_dim=16,
     poly_degree=2,
     dtype="complex64",

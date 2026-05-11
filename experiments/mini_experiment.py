@@ -1,10 +1,11 @@
 """Mini experiment: 10× parameter scale, 200 train / 50 test, 100 epochs.
 
 Compared to smoke_test.py:
-  - ~13,760 trainable parameters (10× the smoke test's 1,376)
+  - ~13,760 trainable parameters
   - cutoff_dim raised from 4 → 6 for greater Fock-space expressivity
-  - num_heads 2 → 4, embed_dim 8 → 16, decoder_hidden_dim 16 → 32
-  - hyper_hidden_dim auto-scaled via target_params=13760
+  - num_heads 2 → 4, decoder_hidden_dim 16 → 32
+  - cnn_channels_2 auto-scaled via target_params=13760
+  - patch_size=7 (16 patches per image), CNN hypernetwork replaces MLP
   - 200 train / 50 test FashionMNIST samples, batch_size=32
   - 100 epochs; per-epoch train + test loss / accuracy tracked
 
@@ -47,7 +48,7 @@ TARGET_PARAMS = 13_760
 data_cfg = DataConfig(
     dataset="fashionmnist",
     normalize=True,
-    patch_size=4,
+    patch_size=7,
     batch_size=BATCH_SIZE,
     num_workers=0,
     data_root="data/",
@@ -56,8 +57,9 @@ quantum_cfg = QuantumConfig(
     num_modes=2,
     cutoff_dim=6,
     num_heads=4,
-    embed_dim=16,
-    hyper_hidden_dim=32,        # overridden by target_params auto-scaling
+    cnn_channels_1=8,
+    cnn_channels_2=16,          # overridden by target_params auto-scaling
+    cnn_kernel_size=3,
     decoder_hidden_dim=32,
     poly_degree=2,
     dtype="complex64",

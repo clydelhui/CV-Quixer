@@ -23,16 +23,20 @@ class QuantumConfig:
     bs_topology: str = "linear"         # "linear" | "ring"
     dtype: str = "complex128"           # "complex64" | "complex128"
 
-    # Multi-head hypernetwork
+    # Multi-head attention
     num_heads: int = 4            # parallel CV attention heads
-    embed_dim: int = 16           # patch embedding width (hypernetwork input)
-    hyper_hidden_dim: int = 32    # hidden dim of patch→gate-params MLP
     decoder_hidden_dim: int = 64  # hidden dim of readout→logits MLP
+
+    # CNN hypernetwork: Conv(1→C1) → Conv(C1→C2) → flatten → 2D PE → Linear → gate params
+    # No padding; spatial output: h_out = patch_size - 2*(cnn_kernel_size - 1)
+    cnn_channels_1: int = 8    # output channels of first conv layer
+    cnn_channels_2: int = 16   # output channels of second conv layer (auto-scaled if target_params > 0)
+    cnn_kernel_size: int = 3   # kernel size for both conv layers
 
     # Matrix polynomial degree for LCU attention (P(M) = Σ c_j M^j, j=0..d)
     poly_degree: int = 2           # keep ≤ 4; d=2 or d=3 recommended
 
-    # Auto-scaling: set > 0 to auto-adjust hyper_hidden_dim to hit this budget
+    # Auto-scaling: set > 0 to auto-adjust cnn_channels_2 to hit this budget
     target_params: int = -1
 
     # Fock truncation penalty added to training loss
