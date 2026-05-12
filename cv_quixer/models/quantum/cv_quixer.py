@@ -240,15 +240,10 @@ class CVQuixer(BaseVisionTransformer):
 
         if return_trunc_loss and self.trunc_penalty != "none":
             penalties: list[torch.Tensor] = []
-            for b_states in states:
-                for state in b_states:
-                    if self.trunc_penalty == "norm":
-                        penalties.append(norm_truncation_penalty(state))
-                    else:
-                        penalties.append(
-                            photon_number_penalty(state, self._circuit)
-                        )
-            trunc_loss = torch.stack(penalties).mean()
+            for state_t in states:                         # state_t: (B, D, ..., D)
+                dims = tuple(range(1, state_t.ndim))
+                penalties.append(1.0 - (state_t.abs() ** 2).sum(dim=dims))   # (B,)
+            trunc_loss = torch.cat(penalties).mean()
             return logits, trunc_loss.to(logits.device)
 
         return logits

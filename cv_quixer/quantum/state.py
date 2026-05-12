@@ -64,8 +64,13 @@ class FockState:
         Returns:
             FockState representing |0〉^⊗N.
         """
-        data = torch.zeros((cutoff_dim,) * num_modes, dtype=dtype, device=device)
-        data[(0,) * num_modes] = 1.0
+        total = cutoff_dim ** num_modes
+        flat = torch.zeros(total, dtype=dtype, device=device)
+        flat = flat.index_put(
+            (torch.zeros(1, dtype=torch.long, device=device),),
+            torch.ones(1, dtype=dtype, device=device),
+        )
+        data = flat.reshape((cutoff_dim,) * num_modes)
         return cls(data, num_modes, cutoff_dim)
 
     # ------------------------------------------------------------------

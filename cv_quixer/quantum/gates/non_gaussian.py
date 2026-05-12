@@ -48,7 +48,7 @@ def kerr_matrix(kappa: torch.Tensor, cutoff_dim: int) -> torch.Tensor:
 
     ns = torch.arange(cutoff_dim, dtype=kappa.dtype, device=device)
     phases = torch.exp(1j * kappa.to(dtype) * ns.to(dtype) ** 2)
-    return torch.diag(phases)
+    return torch.diag_embed(phases)
 
 
 def cubic_phase_matrix(gamma: torch.Tensor, cutoff_dim: int) -> torch.Tensor:

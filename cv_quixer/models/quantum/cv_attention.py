@@ -30,6 +30,7 @@ import math
 
 import torch
 import torch.nn as nn
+from torch.func import functional_call, vmap
 
 from cv_quixer.config.schema import QuantumConfig
 from cv_quixer.quantum import (
@@ -526,7 +527,7 @@ class HyperCVAttentionHead(nn.Module):
             self.circuit.measure_quadrature_x(i, output_state)
             for i in range(n)
         ]).to(classical_device)
-        return readout, output_state, success_prob
+        return readout, output_state.data, success_prob
 
 
 # ---------------------------------------------------------------------------
@@ -564,40 +565,41 @@ class HyperCVAttention(nn.Module):
         self,
         patches: torch.Tensor,
         input_state: FockState | None = None,
-    ) -> tuple[torch.Tensor, list[list[FockState]], list[list[torch.Tensor]]]:
+    ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
         """Apply all heads to a batch of patch sequences.
 
         Args:
-            patches:     Real tensor of shape (B, N, embed_dim).
-            input_state: Optional FockState passed to every head. If None,
-                         each head initialises from vacuum independently.
+            patches:     Real tensor of shape (B, N, patch_dim).
+            input_state: Not supported under vmap; must be None.
 
         Returns:
             readouts:      Float tensor of shape (B, num_heads × num_modes).
-            states:        states[b][h] — final FockState for batch element b,
-                           head h.
-            success_probs: success_probs[b][h] — scalar success probability
-                           for batch element b, head h.
+            states:        list[Tensor] — one (B, D, ..., D) state tensor per head.
+            success_probs: list[Tensor] — one (B,) success probability tensor per head.
         """
-        B = patches.shape[0]
+        if input_state is not None:
+            raise NotImplementedError("input_state is not supported under vmap")
+
         all_readouts: list[torch.Tensor] = []
-        all_states: list[list[FockState]] = []
-        all_success_probs: list[list[torch.Tensor]] = []
+        all_states: list[torch.Tensor] = []
+        all_success_probs: list[torch.Tensor] = []
 
-        for b in range(B):
-            head_readouts: list[torch.Tensor] = []
-            head_states: list[FockState] = []
-            head_success_probs: list[torch.Tensor] = []
+        for head in self.heads:
+            params  = dict(head.named_parameters())
+            buffers = dict(head.named_buffers())
 
-            for head in self.heads:
-                readout, state, sp = head(patches[b], input_state)
-                head_readouts.append(readout)
-                head_states.append(state)
-                head_success_probs.append(sp)
+            def _single(params, buffers, single_patches):
+                return functional_call(head, (params, buffers), (single_patches,))
 
-            all_readouts.append(torch.cat(head_readouts))
-            all_states.append(head_states)
-            all_success_probs.append(head_success_probs)
+            batched = vmap(_single, in_dims=(None, None, 0))
+            readout_b, state_b, sp_b = batched(params, buffers, patches)
+            # readout_b : (B, num_modes)
+            # state_b   : (B, cutoff_dim, ..., cutoff_dim)
+            # sp_b      : (B,)
 
-        readouts = torch.stack(all_readouts).to(patches.dtype)
+            all_readouts.append(readout_b)
+            all_states.append(state_b)
+            all_success_probs.append(sp_b)
+
+        readouts = torch.cat(all_readouts, dim=-1)   # (B, num_heads * num_modes)
         return readouts, all_states, all_success_probs

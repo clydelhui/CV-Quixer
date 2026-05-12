@@ -33,8 +33,9 @@ def small_quantum_config():
         cutoff_dim=4,
         grad_mode="backprop",
         num_heads=2,
-        embed_dim=8,
-        hyper_hidden_dim=8,
+        cnn_channels_1=4,
+        cnn_channels_2=8,
+        cnn_kernel_size=3,
         decoder_hidden_dim=16,
         poly_degree=2,
         dtype="complex64",
@@ -43,7 +44,7 @@ def small_quantum_config():
 
 @pytest.fixture
 def data_config():
-    return DataConfig(image_size=28, patch_size=4, num_classes=10)
+    return DataConfig(image_size=28, patch_size=7, num_classes=10)
 
 
 class TestDisplacementEncoding:
@@ -117,30 +118,31 @@ class TestLCUAndPolyCoeffs:
 class TestHyperCVAttentionHead:
     def test_readout_shape(self, small_quantum_config):
         head = HyperCVAttentionHead(
-            embed_dim=small_quantum_config.embed_dim,
-            num_patches=9,
-            config=small_quantum_config,
+            patch_size=7, num_patches=16, config=small_quantum_config,
         )
-        patches = torch.randn(9, small_quantum_config.embed_dim)
+        patches = torch.randn(16, 49)   # 16 patches of 7×7 pixels
         readout, _, _ = head(patches)
         assert readout.shape == (small_quantum_config.num_modes,)
 
     def test_readout_is_real(self, small_quantum_config):
         head = HyperCVAttentionHead(
-            embed_dim=small_quantum_config.embed_dim,
-            num_patches=9,
-            config=small_quantum_config,
+            patch_size=7, num_patches=16, config=small_quantum_config,
         )
-        readout, _, _ = head(torch.randn(9, small_quantum_config.embed_dim))
+        readout, _, _ = head(torch.randn(16, 49))
         assert not readout.is_complex()
+
+    def test_state_data_is_tensor(self, small_quantum_config):
+        head = HyperCVAttentionHead(
+            patch_size=7, num_patches=16, config=small_quantum_config,
+        )
+        _, state_data, _ = head(torch.randn(16, 49))
+        assert isinstance(state_data, torch.Tensor)
 
     def test_success_prob_positive(self, small_quantum_config):
         head = HyperCVAttentionHead(
-            embed_dim=small_quantum_config.embed_dim,
-            num_patches=9,
-            config=small_quantum_config,
+            patch_size=7, num_patches=16, config=small_quantum_config,
         )
-        _, _, success_prob = head(torch.randn(9, small_quantum_config.embed_dim))
+        _, _, success_prob = head(torch.randn(16, 49))
         assert success_prob.item() > 0
 
 
@@ -174,12 +176,13 @@ class TestParamCountConsistency:
     def test_formula_matches_actual(self, small_quantum_config, data_config):
         model = CVQuixer(small_quantum_config, data_config)
         actual = count_parameters(model)
-        patch_dim = data_config.patch_size ** 2
-        num_patches = (data_config.image_size // data_config.patch_size) ** 2
+        patch_size = data_config.patch_size
+        num_patches = (data_config.image_size // patch_size) ** 2
         expected = _param_count_formula(
-            patch_dim, num_patches,
-            small_quantum_config.embed_dim, small_quantum_config.num_heads,
-            small_quantum_config.num_modes, small_quantum_config.hyper_hidden_dim,
+            patch_size, num_patches,
+            small_quantum_config.num_heads, small_quantum_config.num_modes,
+            small_quantum_config.cnn_channels_1, small_quantum_config.cnn_channels_2,
+            small_quantum_config.cnn_kernel_size,
             small_quantum_config.decoder_hidden_dim, data_config.num_classes,
             small_quantum_config.bs_topology, small_quantum_config.poly_degree,
         )
