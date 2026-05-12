@@ -10,14 +10,20 @@ Compared to smoke_test.py:
   - 100 epochs; per-epoch train + test loss / accuracy tracked
 
 Outputs:
-  results/figures/mini_experiment_curve.png   — two-panel training curve
-  results/logs/mini_experiment/history.json   — per-epoch metrics
-  results/logs/mini_experiment/final_model.pt — final model weights
+  results/figures/mini_experiment_curve.png                     — two-panel training curve
+  results/logs/mini_experiment/history.json                     — per-epoch metrics
+  results/checkpoints/mini_experiment/final_model.pt            — final model weights
+  results/checkpoints/mini_experiment/checkpoint_epoch_NNNN.pt  — periodic checkpoints
 
-Run:
+Run (fresh):
     uv run python experiments/mini_experiment.py
+
+Resume from checkpoint:
+    uv run python experiments/mini_experiment.py \\
+        --resume results/checkpoints/mini_experiment/checkpoint_epoch_0050.pt
 """
 
+import argparse
 import json
 import time
 from pathlib import Path
@@ -44,6 +50,12 @@ TRAIN_SIZE = 200
 TEST_SIZE = 50
 BATCH_SIZE = 32
 TARGET_PARAMS = 13_760
+CHECKPOINT_INTERVAL = 10
+
+_parser = argparse.ArgumentParser()
+_parser.add_argument("--resume", type=str, default=None,
+                     help="path to checkpoint .pt file to resume from")
+_args = _parser.parse_args()
 
 data_cfg = DataConfig(
     dataset="fashionmnist",
@@ -114,6 +126,36 @@ print(f"Forward shape OK — logits: {tuple(_logits.shape)}\n")
 
 optimizer = torch.optim.Adam(model.parameters(), lr=config.training.lr)
 
+# ---------------------------------------------------------------------------
+# Directories (created before training so checkpoints can be written mid-run)
+# ---------------------------------------------------------------------------
+
+log_dir  = Path("results/logs/mini_experiment")
+ckpt_dir = Path("results/checkpoints/mini_experiment")
+fig_dir  = Path("results/figures")
+log_dir.mkdir(parents=True, exist_ok=True)
+ckpt_dir.mkdir(parents=True, exist_ok=True)
+fig_dir.mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Resume from checkpoint (if requested)
+# ---------------------------------------------------------------------------
+
+history: dict[str, list] = {
+    "train_loss": [], "train_acc": [],
+    "test_loss":  [], "test_acc":  [],
+    "trunc_loss": [],
+}
+
+start_epoch = 1
+if _args.resume:
+    ckpt = torch.load(_args.resume, map_location=device, weights_only=True)
+    model.load_state_dict(ckpt["model_state_dict"])
+    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    history = ckpt["history"]
+    start_epoch = ckpt["epoch"] + 1
+    print(f"Resumed from {_args.resume}  (continuing from epoch {start_epoch})\n")
+
 
 def train_epoch(epoch: int) -> tuple[float, float, float]:
     model.train()
@@ -155,19 +197,13 @@ def evaluate() -> tuple[float, float]:
 # Training loop
 # ---------------------------------------------------------------------------
 
-history: dict[str, list] = {
-    "train_loss": [], "train_acc": [],
-    "test_loss":  [], "test_acc":  [],
-    "trunc_loss": [],
-}
-
 print(f"{'Epoch':<7} {'Train loss':<12} {'Train acc':<11} "
       f"{'Test loss':<11} {'Test acc':<11} {'Trunc loss':<12} {'Time'}")
 print("─" * 76)
 
 run_start = time.time()
 
-for epoch in range(1, EPOCHS + 1):
+for epoch in range(start_epoch, EPOCHS + 1):
     t0 = time.time()
     train_loss, trunc_loss, train_acc = train_epoch(epoch)
     test_loss, test_acc = evaluate()
@@ -182,16 +218,19 @@ for epoch in range(1, EPOCHS + 1):
     print(f"{epoch:<7} {train_loss:<12.4f} {train_acc:<11.3f} "
           f"{test_loss:<11.4f} {test_acc:<11.3f} {trunc_loss:<12.4f} {elapsed:.1f}s")
 
+    if epoch % CHECKPOINT_INTERVAL == 0:
+        torch.save({
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "history": history,
+        }, ckpt_dir / f"checkpoint_epoch_{epoch:04d}.pt")
+
 total_runtime = time.time() - run_start
 
 # ---------------------------------------------------------------------------
 # Save outputs
 # ---------------------------------------------------------------------------
-
-log_dir = Path("results/logs/mini_experiment")
-fig_dir = Path("results/figures")
-log_dir.mkdir(parents=True, exist_ok=True)
-fig_dir.mkdir(parents=True, exist_ok=True)
 
 # JSON log
 with open(log_dir / "history.json", "w") as f:
@@ -200,11 +239,11 @@ with open(log_dir / "history.json", "w") as f:
 # Final model weights
 torch.save(
     {"model_state_dict": model.state_dict(), "history": history},
-    log_dir / "final_model.pt",
+    ckpt_dir / "final_model.pt",
 )
 
 # Training curve
-epochs_x = list(range(1, EPOCHS + 1))
+epochs_x = list(range(1, len(history["train_loss"]) + 1))
 fig, (ax_loss, ax_acc) = plt.subplots(1, 2, figsize=(12, 4))
 
 ax_loss.plot(epochs_x, history["train_loss"], label="train loss")
@@ -235,5 +274,6 @@ best_epoch    = history["test_acc"].index(best_test_acc) + 1
 
 print(f"\nTotal runtime:    {total_runtime / 60:.1f} min")
 print(f"Best test acc:    {best_test_acc:.4f} (epoch {best_epoch})")
-print(f"Logs saved  →  {log_dir}/")
-print(f"Curve saved →  {fig_dir}/mini_experiment_curve.png")
+print(f"Logs saved       →  {log_dir}/")
+print(f"Checkpoints saved →  {ckpt_dir}/")
+print(f"Curve saved      →  {fig_dir}/mini_experiment_curve.png")
