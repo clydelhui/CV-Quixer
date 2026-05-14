@@ -38,8 +38,8 @@ from cv_quixer.quantum import (
     FockState,
     beamsplitter_matrix,
     displacement_matrix,
-    kerr_matrix,
-    rotation_matrix,
+    kerr_phases,
+    rotation_phases,
     squeezing_matrix,
 )
 
@@ -396,8 +396,8 @@ class HyperCVAttentionHead(nn.Module):
             state = self.circuit.apply_two_mode_gate(BS, a, b, state)
 
         for k in range(m):
-            R = rotation_matrix(rot_phi[k], D).to(device=device, dtype=dtype)
-            state = self.circuit.apply_single_mode_gate(R, k, state)
+            phases = rotation_phases(rot_phi[k], D).to(device=device, dtype=dtype)
+            state = self.circuit.apply_single_mode_phases(phases, k, state)
 
         for k in range(m):
             alpha = torch.complex(disp_re[k], disp_im[k])
@@ -405,8 +405,8 @@ class HyperCVAttentionHead(nn.Module):
             state = self.circuit.apply_single_mode_gate(Dk, k, state)
 
         for k in range(m):
-            K = kerr_matrix(kerr_kappa[k], D).to(device=device, dtype=dtype)
-            state = self.circuit.apply_single_mode_gate(K, k, state)
+            phases = kerr_phases(kerr_kappa[k], D).to(device=device, dtype=dtype)
+            state = self.circuit.apply_single_mode_phases(phases, k, state)
 
         return state
 
@@ -438,6 +438,39 @@ class HyperCVAttentionHead(nn.Module):
             result = result + b[i].to(dtype) * out_i.data.reshape(-1)
         return result
 
+    def _compute_patch_trunc_loss(
+        self,
+        patches: torch.Tensor,
+        v: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Mean norm-based truncation loss across all N patches applied to the vacuum.
+
+        For each patch i, applies the hypernetwork gate sequence U_i to the
+        vacuum and computes 1 − ‖U_i|v⟩‖², i.e. the probability that the true
+        infinite-dimensional state has amplitude at photon number ≥ cutoff_dim.
+        This is non-zero because analytic Fock-basis gate matrices are true
+        sub-isometries (column norms ≤ 1).
+
+        Args:
+            patches: Real tensor of shape (N, embed_dim).
+            v:       Complex flat tensor of shape (D^num_modes,) — unit-norm vacuum.
+            device:  Target device.
+            dtype:   Complex dtype.
+
+        Returns:
+            Scalar tensor in [0, 1] — mean truncation loss over i = 0..N-1.
+        """
+        D, m = self.cutoff_dim, self.num_modes
+        losses: list[torch.Tensor] = []
+        for i in range(patches.shape[0]):
+            params = self.hypernetwork(patches[i], i).to(device)
+            state_i = FockState(v.reshape((D,) * m), m, D)
+            out_i = self._apply_patch_gates_to_state(params, state_i, device, dtype)
+            losses.append(1.0 - (out_i.data.abs() ** 2).sum())
+        return torch.stack(losses).mean()
+
     def _apply_polynomial_iterative(
         self,
         patches: torch.Tensor,
@@ -449,6 +482,8 @@ class HyperCVAttentionHead(nn.Module):
 
         Each M^j|ψ⟩ is derived from M^{j-1}|ψ⟩ via _apply_lcu_to_vector.
         Autograd unrolls the loop and builds the correct computation graph.
+        Intermediate states are not renormalised — the polynomial structure
+        from QSVT requires exact matrix-polynomial evaluation.
 
         Args:
             patches:    Real tensor of shape (N, embed_dim).
@@ -458,7 +493,7 @@ class HyperCVAttentionHead(nn.Module):
 
         Returns:
             out_unnorm:   Complex (D^num_modes,) — unnormalised output state.
-            success_prob: Scalar — ‖P(M)|ψ⟩‖² (post-selection probability).
+            success_prob: Scalar — ‖P(M)|ψ⟩‖² (QSVT post-selection probability).
         """
         c = self.poly_coeffs().to(device)   # (d+1,) real — move to quantum device
         result = torch.zeros_like(state_flat)
@@ -478,7 +513,7 @@ class HyperCVAttentionHead(nn.Module):
         self,
         patches: torch.Tensor,
         input_state: FockState | None = None,
-    ) -> tuple[torch.Tensor, FockState, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run the LCU + polynomial head on one batch element.
 
         Args:
@@ -488,15 +523,17 @@ class HyperCVAttentionHead(nn.Module):
                          this head. Defaults to vacuum |0,...,0⟩.
 
         Returns:
-            readout:      Real tensor of shape (num_modes,) — ⟨x̂_i⟩ for each
-                          mode, measured on the normalised post-selected state.
-            output_state: FockState — normalised post-selected output.
-            success_prob: Scalar tensor — ‖P(M)|ψ_in⟩‖² (post-selection
-                          probability; 1.0 for a unitary P(M)).
+            readout:        Real tensor of shape (num_modes,) — ⟨x̂_i⟩ for each
+                            mode, measured on the renormalised post-selected state.
+            output_state:   Tensor — renormalised post-selected output state data.
+            success_prob:   Scalar tensor — ‖P(M)|ψ_in⟩‖² (post-selection
+                            probability; 1.0 for a unitary P(M)).
+            avg_trunc_loss: Scalar tensor in [0, 1] — mean norm-based truncation
+                            loss (1 − ‖U_i|ψ⟩‖²) across all patches.
         """
         classical_device = patches.device
         # CUDA supports float64/complex128 natively; MPS does not.
-        # Quantum circuit (gate matrix_exp, complex128 arithmetic) runs on CPU for MPS.
+        # Quantum circuit (analytic gate matrices, complex128 arithmetic) runs on CPU for MPS.
         quantum_device = (
             classical_device if classical_device.type != "mps"
             else torch.device("cpu")
@@ -511,23 +548,31 @@ class HyperCVAttentionHead(nn.Module):
             state = input_state
         state_flat = state.data.reshape(-1)   # (D^n,)
 
-        # 2. LCU + polynomial (iterative — no matrix materialised)
+        # 2. Norm-based truncation loss per patch on the vacuum.
+        # Analytic gate matrices are true sub-isometries; 1 - ‖U|ψ⟩‖² is non-zero.
+        avg_trunc_loss = self._compute_patch_trunc_loss(
+            patches, state_flat, quantum_device, dtype
+        )
+
+        # 3. LCU + polynomial (iterative — no matrix materialised).
+        # Intermediate states are not renormalised; this preserves the QSVT polynomial structure.
         out_unnorm, success_prob = self._apply_polynomial_iterative(
             patches, state_flat, quantum_device, dtype
         )
 
-        # 3. Normalise (post-selection)
+        # 4. Post-selection renormalisation: divide by ‖P(M)|ψ⟩‖ to give a unit-norm state.
+        # success_prob = ‖out_unnorm‖²; deviation from 1 is the QSVT post-selection cost.
         out_norm = out_unnorm / success_prob.sqrt().clamp(min=1e-8)
 
-        # 4. Wrap as FockState
+        # 5. Wrap as FockState
         output_state = FockState(out_norm.reshape((D,) * n), n, D)
 
-        # 5. Measure quadratures; move result back to classical device for decoder
+        # 6. Measure quadratures; move result back to classical device for decoder
         readout = torch.stack([
             self.circuit.measure_quadrature_x(i, output_state)
             for i in range(n)
         ]).to(classical_device)
-        return readout, output_state.data, success_prob
+        return readout, output_state.data, success_prob, avg_trunc_loss
 
 
 # ---------------------------------------------------------------------------
@@ -565,7 +610,7 @@ class HyperCVAttention(nn.Module):
         self,
         patches: torch.Tensor,
         input_state: FockState | None = None,
-    ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], torch.Tensor]:
         """Apply all heads to a batch of patch sequences.
 
         Args:
@@ -576,6 +621,8 @@ class HyperCVAttention(nn.Module):
             readouts:      Float tensor of shape (B, num_heads × num_modes).
             states:        list[Tensor] — one (B, D, ..., D) state tensor per head.
             success_probs: list[Tensor] — one (B,) success probability tensor per head.
+            trunc_loss:    Scalar — mean per-patch truncation loss across all heads
+                           and batch elements.
         """
         if input_state is not None:
             raise NotImplementedError("input_state is not supported under vmap")
@@ -583,6 +630,7 @@ class HyperCVAttention(nn.Module):
         all_readouts: list[torch.Tensor] = []
         all_states: list[torch.Tensor] = []
         all_success_probs: list[torch.Tensor] = []
+        all_trunc_losses: list[torch.Tensor] = []
 
         for head in self.heads:
             params  = dict(head.named_parameters())
@@ -592,14 +640,27 @@ class HyperCVAttention(nn.Module):
                 return functional_call(head, (params, buffers), (single_patches,))
 
             batched = vmap(_single, in_dims=(None, None, 0))
-            readout_b, state_b, sp_b = batched(params, buffers, patches)
+            readout_b, state_b, sp_b, tl_b = batched(params, buffers, patches)
             # readout_b : (B, num_modes)
             # state_b   : (B, cutoff_dim, ..., cutoff_dim)
             # sp_b      : (B,)
+            # tl_b      : (B,)
+
+            if (sp_b < 1e-6).any().item():
+                import warnings
+                bad = sp_b[sp_b < 1e-6]
+                warnings.warn(
+                    f"HyperCVAttention: {len(bad)} batch element(s) have "
+                    f"success_prob < 1e-6 (min={bad.min().item():.2e}); "
+                    "post-selection clamp active — polynomial output has near-zero norm.",
+                    RuntimeWarning, stacklevel=2,
+                )
 
             all_readouts.append(readout_b)
             all_states.append(state_b)
             all_success_probs.append(sp_b)
+            all_trunc_losses.append(tl_b)
 
         readouts = torch.cat(all_readouts, dim=-1)   # (B, num_heads * num_modes)
-        return readouts, all_states, all_success_probs
+        trunc_loss = torch.stack(all_trunc_losses).mean()   # scalar over heads × batch
+        return readouts, all_states, all_success_probs, trunc_loss

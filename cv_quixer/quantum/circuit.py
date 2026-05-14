@@ -85,6 +85,33 @@ class CVCircuit:
         new_data = torch.einsum(subscript, gate, state.data)
         return FockState(new_data, N, self.cutoff_dim)
 
+    def apply_single_mode_phases(
+        self,
+        phases: torch.Tensor,   # shape (D,) — complex phase vector
+        mode: int,
+        state: FockState,
+    ) -> FockState:
+        """Multiply state along `mode` axis by a (D,) phase vector.
+
+        Equivalent to apply_single_mode_gate with a diagonal matrix, but avoids
+        the einsum by using broadcasting. O(D^N) elementwise multiply.
+
+        Args:
+            phases: Complex tensor of shape (D,). phases[n] = gate phase for |n⟩.
+            mode:   Which mode axis to multiply along (0-indexed).
+            state:  Input FockState. Not mutated.
+
+        Returns:
+            New FockState after applying the diagonal gate.
+        """
+        shape = [1] * state.num_modes
+        shape[mode] = -1
+        return FockState(
+            state.data * phases.reshape(shape),
+            state.num_modes,
+            state.cutoff_dim,
+        )
+
     def apply_two_mode_gate(
         self,
         gate: GateMatrix,   # shape (D, D, D, D)

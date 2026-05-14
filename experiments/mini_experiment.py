@@ -55,7 +55,12 @@ CHECKPOINT_INTERVAL = 10
 _parser = argparse.ArgumentParser()
 _parser.add_argument("--resume", type=str, default=None,
                      help="path to checkpoint .pt file to resume from")
+_parser.add_argument("--epochs", type=int, default=None,
+                     help=f"override the default EPOCHS={EPOCHS} (useful for short regression runs)")
 _args = _parser.parse_args()
+
+if _args.epochs is not None:
+    EPOCHS = _args.epochs
 
 data_cfg = DataConfig(
     dataset="fashionmnist",
@@ -244,7 +249,7 @@ torch.save(
 
 # Training curve
 epochs_x = list(range(1, len(history["train_loss"]) + 1))
-fig, (ax_loss, ax_acc) = plt.subplots(1, 2, figsize=(12, 4))
+fig, (ax_loss, ax_acc, ax_trunc) = plt.subplots(1, 3, figsize=(18, 4))
 
 ax_loss.plot(epochs_x, history["train_loss"], label="train loss")
 ax_loss.plot(epochs_x, history["test_loss"],  label="test loss")
@@ -259,6 +264,12 @@ ax_acc.set_xlabel("Epoch")
 ax_acc.set_ylabel("Accuracy")
 ax_acc.set_title("Accuracy")
 ax_acc.legend()
+
+ax_trunc.plot(epochs_x, history["trunc_loss"], label="trunc loss", color="tab:orange")
+ax_trunc.set_xlabel("Epoch")
+ax_trunc.set_ylabel("Avg per-patch truncation loss")
+ax_trunc.set_title("Truncation Loss")
+ax_trunc.legend()
 
 fig.suptitle(f"CV-Quixer mini experiment  |  {n_params:,} params  |  {TRAIN_SIZE} train samples")
 fig.tight_layout()

@@ -14,7 +14,7 @@ from __future__ import annotations
 import torch
 
 from cv_quixer.quantum.circuit import CVCircuit
-from cv_quixer.quantum.gates.gaussian import beamsplitter_matrix, rotation_matrix
+from cv_quixer.quantum.gates.gaussian import beamsplitter_matrix, rotation_phases
 from cv_quixer.quantum.state import FockState
 
 
@@ -80,7 +80,7 @@ def clements_interferometer(
 
     # Per-mode phase shifts
     for i in range(n):
-        rot = rotation_matrix(mode_phases[i], D).to(state.device)
-        state = circuit.apply_single_mode_gate(rot, i, state)
+        phases = rotation_phases(mode_phases[i], D).to(state.device)
+        state = circuit.apply_single_mode_phases(phases, i, state)
 
     return state

@@ -141,11 +141,25 @@ class TestGaussianGates:
         R = rotation_matrix(torch.tensor(0.0), D)
         assert torch.allclose(R, torch.eye(D, dtype=torch.complex128), atol=1e-12)
 
-    def test_rotation_unitary(self):
-        from cv_quixer.quantum.gates.gaussian import rotation_matrix
-        R = rotation_matrix(torch.tensor(1.2), D)
-        eye = torch.eye(D, dtype=torch.complex128)
-        assert torch.allclose(R @ R.conj().T, eye, atol=1e-10)
+    def test_rotation_phases_shape(self):
+        from cv_quixer.quantum.gates.gaussian import rotation_phases
+        phases = rotation_phases(torch.tensor(0.5), D)
+        assert phases.shape == (D,)
+
+    def test_rotation_phases_zero_is_ones(self):
+        from cv_quixer.quantum.gates.gaussian import rotation_phases
+        phases = rotation_phases(torch.tensor(0.0), D)
+        assert torch.allclose(phases, torch.ones(D, dtype=torch.complex128))
+
+    def test_rotation_preserves_norm(self):
+        """Rotation is phase-only — norm must stay exactly 1.0."""
+        from cv_quixer.quantum import CVCircuit, FockState
+        from cv_quixer.quantum.gates.gaussian import rotation_phases
+        circuit = CVCircuit(num_modes=1, cutoff_dim=D)
+        state = FockState.vacuum(num_modes=1, cutoff_dim=D)
+        phases = rotation_phases(torch.tensor(1.2), D)
+        state = circuit.apply_single_mode_phases(phases, 0, state)
+        assert state.norm().item() == pytest.approx(1.0, rel=1e-10)
 
     def test_displacement_shape(self):
         from cv_quixer.quantum.gates.gaussian import displacement_matrix
@@ -157,11 +171,24 @@ class TestGaussianGates:
         M = displacement_matrix(torch.tensor(0.0), D)
         assert torch.allclose(M, torch.eye(D, dtype=torch.complex128), atol=1e-12)
 
-    def test_displacement_unitary(self):
+    def test_displacement_sub_isometry_small_alpha(self):
+        """Small |α| → sub-isometry with norm close to 1 (small truncation loss)."""
+        from cv_quixer.quantum import CVCircuit, FockState
         from cv_quixer.quantum.gates.gaussian import displacement_matrix
-        M = displacement_matrix(torch.tensor(0.7), D)
-        eye = torch.eye(D, dtype=torch.complex128)
-        assert torch.allclose(M @ M.conj().T, eye, atol=1e-8)
+        circuit = CVCircuit(num_modes=1, cutoff_dim=D)
+        state = FockState.vacuum(num_modes=1, cutoff_dim=D)
+        state = circuit.apply_single_mode_gate(displacement_matrix(torch.tensor(0.5), D), 0, state)
+        assert state.norm().item() <= 1.0 + 1e-8
+
+    def test_displacement_norm_loss_large_alpha(self):
+        """Large |α| shows real truncation loss (norm < 1)."""
+        from cv_quixer.quantum import CVCircuit, FockState
+        from cv_quixer.quantum.gates.gaussian import displacement_matrix
+        circuit = CVCircuit(num_modes=1, cutoff_dim=D)
+        state = FockState.vacuum(num_modes=1, cutoff_dim=D)
+        # α=2, D=6: P(n<6 | coherent |α=2⟩) ≈ 0.98 → norm² ≈ 0.98
+        state = circuit.apply_single_mode_gate(displacement_matrix(torch.tensor(2.0), D), 0, state)
+        assert state.norm().item() < 1.0 - 1e-3
 
     def test_squeezing_shape(self):
         from cv_quixer.quantum.gates.gaussian import squeezing_matrix
@@ -173,11 +200,14 @@ class TestGaussianGates:
         S = squeezing_matrix(torch.tensor(0.0), torch.tensor(0.0), D)
         assert torch.allclose(S, torch.eye(D, dtype=torch.complex128), atol=1e-12)
 
-    def test_squeezing_unitary(self):
+    def test_squeezing_sub_isometry(self):
+        from cv_quixer.quantum import CVCircuit, FockState
         from cv_quixer.quantum.gates.gaussian import squeezing_matrix
-        S = squeezing_matrix(torch.tensor(0.5), torch.tensor(0.3), D)
-        eye = torch.eye(D, dtype=torch.complex128)
-        assert torch.allclose(S @ S.conj().T, eye, atol=1e-8)
+        circuit = CVCircuit(num_modes=1, cutoff_dim=D)
+        state = FockState.vacuum(num_modes=1, cutoff_dim=D)
+        mat = squeezing_matrix(torch.tensor(0.5), torch.tensor(0.3), D)
+        state = circuit.apply_single_mode_gate(mat, 0, state)
+        assert state.norm().item() <= 1.0 + 1e-8
 
     def test_beamsplitter_shape(self):
         from cv_quixer.quantum.gates.gaussian import beamsplitter_matrix
@@ -191,12 +221,20 @@ class TestGaussianGates:
         BS_flat = BS.reshape(D * D, D * D)
         assert torch.allclose(BS_flat, torch.eye(D * D, dtype=torch.complex128), atol=1e-10)
 
-    def test_beamsplitter_unitary(self):
-        from cv_quixer.quantum.gates.gaussian import beamsplitter_matrix
+    def test_beamsplitter_photon_conservation(self):
+        """BS conserves total photon number: ⟨n̂_a⟩ + ⟨n̂_b⟩ unchanged."""
+        from cv_quixer.quantum import CVCircuit, FockState
+        from cv_quixer.quantum.gates.gaussian import beamsplitter_matrix, displacement_matrix
+        circuit = CVCircuit(num_modes=2, cutoff_dim=D)
+        state = FockState.vacuum(num_modes=2, cutoff_dim=D)
+        state = circuit.apply_single_mode_gate(displacement_matrix(torch.tensor(0.8), D), 0, state)
+        n_before = (circuit.measure_photon_number(0, state)
+                    + circuit.measure_photon_number(1, state)).item()
         BS = beamsplitter_matrix(torch.tensor(math.pi / 4), torch.tensor(0.3), D)
-        BS_flat = BS.reshape(D * D, D * D)
-        eye = torch.eye(D * D, dtype=torch.complex128)
-        assert torch.allclose(BS_flat @ BS_flat.conj().T, eye, atol=1e-8)
+        state = circuit.apply_two_mode_gate(BS, 0, 1, state)
+        n_after = (circuit.measure_photon_number(0, state)
+                   + circuit.measure_photon_number(1, state)).item()
+        assert n_after == pytest.approx(n_before, rel=1e-5)
 
     def test_two_mode_squeezing_shape(self):
         from cv_quixer.quantum.gates.gaussian import two_mode_squeezing_matrix
@@ -270,6 +308,24 @@ class TestNonGaussianGates:
         kappa = torch.tensor(0.1, requires_grad=True)
         kerr_matrix(kappa, D).abs().sum().backward()
         assert kappa.grad is not None
+
+    def test_kerr_phases_shape(self):
+        from cv_quixer.quantum.gates.non_gaussian import kerr_phases
+        assert kerr_phases(torch.tensor(0.1), D).shape == (D,)
+
+    def test_kerr_phases_zero_is_ones(self):
+        from cv_quixer.quantum.gates.non_gaussian import kerr_phases
+        phases = kerr_phases(torch.tensor(0.0), D)
+        assert torch.allclose(phases, torch.ones(D, dtype=torch.complex128))
+
+    def test_kerr_preserves_norm(self):
+        from cv_quixer.quantum import CVCircuit, FockState
+        from cv_quixer.quantum.gates.non_gaussian import kerr_phases
+        circuit = CVCircuit(num_modes=1, cutoff_dim=D)
+        state = FockState.vacuum(num_modes=1, cutoff_dim=D)
+        phases = kerr_phases(torch.tensor(0.3), D)
+        state = circuit.apply_single_mode_phases(phases, 0, state)
+        assert state.norm().item() == pytest.approx(1.0, rel=1e-10)
 
     def test_cubic_phase_shape(self):
         from cv_quixer.quantum.gates.non_gaussian import cubic_phase_matrix
@@ -368,29 +424,29 @@ class TestCVCircuit:
     def test_coherent_state_quadrature_x(self):
         """D(α)|0⟩ with real α: ⟨x̂⟩ = √2 Re(α).
 
-        Tolerance is 5e-3 (≈ 0.35%) to allow for Fock truncation error at D=6:
-        the coherent state tail beyond |n=5⟩ is clipped, introducing ~0.25% error.
+        Uses α=0.5 so P(n≥6) < 1e-8 at D=6: the state is fully represented and
+        the analytic sub-isometric displacement gives the exact Fock coefficients.
         """
         from cv_quixer.quantum import CVCircuit, FockState
         from cv_quixer.quantum.gates.gaussian import displacement_matrix
         circuit = CVCircuit(num_modes=1, cutoff_dim=D)
         state = FockState.vacuum(num_modes=1, cutoff_dim=D)
-        alpha = torch.tensor(1.0)
+        alpha = torch.tensor(0.5)
         state = circuit.apply_single_mode_gate(displacement_matrix(alpha, D), 0, state)
-        assert circuit.measure_quadrature_x(0, state).item() == pytest.approx(math.sqrt(2), abs=5e-3)
+        assert circuit.measure_quadrature_x(0, state).item() == pytest.approx(math.sqrt(2) / 2, abs=1e-5)
 
     def test_coherent_state_quadrature_p(self):
         """D(iβ)|0⟩ with purely imaginary α: ⟨p̂⟩ = √2 β.
 
-        Same Fock truncation tolerance as test_coherent_state_quadrature_x.
+        Uses α=0.5j so P(n≥6) < 1e-8 at D=6 (same reasoning as quadrature_x test).
         """
         from cv_quixer.quantum import CVCircuit, FockState
         from cv_quixer.quantum.gates.gaussian import displacement_matrix
         circuit = CVCircuit(num_modes=1, cutoff_dim=D)
         state = FockState.vacuum(num_modes=1, cutoff_dim=D)
-        alpha = torch.tensor(0.0 + 1.0j, dtype=torch.complex128)
+        alpha = torch.tensor(0.0 + 0.5j, dtype=torch.complex128)
         state = circuit.apply_single_mode_gate(displacement_matrix(alpha, D), 0, state)
-        assert circuit.measure_quadrature_p(0, state).item() == pytest.approx(math.sqrt(2), abs=5e-3)
+        assert circuit.measure_quadrature_p(0, state).item() == pytest.approx(math.sqrt(2) / 2, abs=1e-5)
 
     def test_coherent_state_photon_number(self):
         """D(α)|0⟩: ⟨n̂⟩ = |α|²."""
@@ -398,9 +454,9 @@ class TestCVCircuit:
         from cv_quixer.quantum.gates.gaussian import displacement_matrix
         circuit = CVCircuit(num_modes=1, cutoff_dim=D)
         state = FockState.vacuum(num_modes=1, cutoff_dim=D)
-        alpha = torch.tensor(1.0)
+        alpha = torch.tensor(0.5)
         state = circuit.apply_single_mode_gate(displacement_matrix(alpha, D), 0, state)
-        assert circuit.measure_photon_number(0, state).item() == pytest.approx(1.0, rel=1e-3)
+        assert circuit.measure_photon_number(0, state).item() == pytest.approx(0.25, rel=1e-3)
 
     def test_rotation_preserves_photon_number(self):
         """Rotation is photon-number preserving: ⟨n̂⟩ unchanged after R(φ)."""
@@ -414,24 +470,28 @@ class TestCVCircuit:
         n_after = circuit.measure_photon_number(0, state).item()
         assert n_after == pytest.approx(n_before, rel=1e-6)
 
-    def test_unitary_gate_preserves_norm(self):
-        """Applying a unitary gate should keep the state norm at 1.0."""
+    def test_gate_is_sub_isometry(self):
+        """Analytic squeezing is a sub-isometry: norm ≤ 1 (amplitude may leak to n ≥ D)."""
         from cv_quixer.quantum import CVCircuit, FockState
         from cv_quixer.quantum.gates.gaussian import squeezing_matrix
         circuit = CVCircuit(num_modes=N, cutoff_dim=D)
         state = FockState.vacuum(num_modes=N, cutoff_dim=D)
         mat = squeezing_matrix(torch.tensor(0.4), torch.tensor(0.5), D)
         state = circuit.apply_single_mode_gate(mat, 0, state)
-        assert state.norm().item() == pytest.approx(1.0, rel=1e-6)
+        assert state.norm().item() <= 1.0 + 1e-8
 
     def test_second_mode_unaffected_by_single_mode_gate(self):
-        """A gate on mode 0 must not change the reduced state of mode 1."""
+        """A gate on mode 0 must not change the reduced state of mode 1.
+
+        Uses rotation (exactly unitary at any D — diagonal unit-modulus phases, zero
+        truncation loss) so ρ₁ is preserved to machine precision.
+        """
         from cv_quixer.quantum import CVCircuit, FockState
-        from cv_quixer.quantum.gates.gaussian import displacement_matrix
+        from cv_quixer.quantum.gates.gaussian import rotation_matrix
         circuit = CVCircuit(num_modes=N, cutoff_dim=D)
         state = FockState.vacuum(num_modes=N, cutoff_dim=D)
         rho1_before = state.reduced_density_matrix(1).clone()
-        mat = displacement_matrix(torch.tensor(1.0), D)
+        mat = rotation_matrix(torch.tensor(0.7), D)
         state = circuit.apply_single_mode_gate(mat, 0, state)
         rho1_after = state.reduced_density_matrix(1)
         assert torch.allclose(rho1_before, rho1_after, atol=1e-10)
@@ -472,7 +532,7 @@ class TestInterferometer:
         bs_phases = torch.randn(n_bs) * 0.3
         mode_phases = torch.randn(n_modes) * 0.3
         new_state = clements_interferometer(bs_angles, bs_phases, mode_phases, circuit, state)
-        assert new_state.norm().item() == pytest.approx(1.0, rel=1e-5)
+        assert new_state.norm().item() == pytest.approx(1.0, abs=1e-5)
 
     def test_output_is_new_state(self):
         """clements_interferometer should not return the same object as the input."""
@@ -566,9 +626,11 @@ class TestEnginePublicAPI:
             ParameterShiftFunction,
             displacement_matrix,
             squeezing_matrix,
+            rotation_phases,
             rotation_matrix,
             beamsplitter_matrix,
             two_mode_squeezing_matrix,
+            kerr_phases,
             kerr_matrix,
             cubic_phase_matrix,
             clements_interferometer,

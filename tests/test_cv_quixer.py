@@ -7,6 +7,7 @@ so large values make tests prohibitively slow.
 
 import torch
 import pytest
+from unittest.mock import MagicMock
 
 from cv_quixer.config.schema import DataConfig, QuantumConfig
 from cv_quixer.models.base import BaseVisionTransformer
@@ -121,29 +122,104 @@ class TestHyperCVAttentionHead:
             patch_size=7, num_patches=16, config=small_quantum_config,
         )
         patches = torch.randn(16, 49)   # 16 patches of 7×7 pixels
-        readout, _, _ = head(patches)
+        readout, _, _, _ = head(patches)
         assert readout.shape == (small_quantum_config.num_modes,)
 
     def test_readout_is_real(self, small_quantum_config):
         head = HyperCVAttentionHead(
             patch_size=7, num_patches=16, config=small_quantum_config,
         )
-        readout, _, _ = head(torch.randn(16, 49))
+        readout, _, _, _ = head(torch.randn(16, 49))
         assert not readout.is_complex()
 
     def test_state_data_is_tensor(self, small_quantum_config):
         head = HyperCVAttentionHead(
             patch_size=7, num_patches=16, config=small_quantum_config,
         )
-        _, state_data, _ = head(torch.randn(16, 49))
+        _, state_data, _, _ = head(torch.randn(16, 49))
         assert isinstance(state_data, torch.Tensor)
 
     def test_success_prob_positive(self, small_quantum_config):
         head = HyperCVAttentionHead(
             patch_size=7, num_patches=16, config=small_quantum_config,
         )
-        _, _, success_prob = head(torch.randn(16, 49))
+        _, _, success_prob, _ = head(torch.randn(16, 49))
         assert success_prob.item() > 0
+
+
+class TestPatchTruncLoss:
+    """Tests for HyperCVAttentionHead._compute_patch_trunc_loss.
+
+    Uses a mocked hypernetwork to inject known gate parameters, bypassing the
+    CNN so the test controls exactly what circuits U_i are applied to the vacuum.
+
+    Gate matrices are analytic Fock-basis sub-isometries (column norms ≤ 1),
+    so _compute_patch_trunc_loss returns the physically correct norm-based loss
+    1 - ‖U_i|v⟩‖², which is non-zero whenever amplitude leaks to n ≥ cutoff_dim.
+    """
+
+    # m=2, linear topology (n_bs = m-1 = 1), total gate params = 6m + 2*n_bs = 14
+    # disp_re lives at offset 3m + 2*n_bs = 8
+    _M = 2
+    _D = 4
+    _N_BS = _M - 1
+    _TOTAL_PARAMS = 6 * _M + 2 * _N_BS        # 14
+    _DISP_RE_OFFSET = 3 * _M + 2 * _N_BS      # 8
+
+    @pytest.fixture
+    def head(self):
+        config = QuantumConfig(
+            num_modes=self._M,
+            cutoff_dim=self._D,
+            num_heads=1,
+            cnn_channels_1=4,
+            cnn_channels_2=8,
+            cnn_kernel_size=3,
+            decoder_hidden_dim=16,
+            poly_degree=1,
+            dtype="complex64",
+            bs_topology="linear",
+        )
+        return HyperCVAttentionHead(patch_size=7, num_patches=16, config=config)
+
+    def _vacuum_flat(self):
+        device = torch.device("cpu")
+        return FockState.vacuum(self._M, self._D, device, torch.complex64).data.reshape(-1)
+
+    def test_nonzero_with_large_displacement(self, head):
+        """Large real displacement (|α|=2) causes real truncation loss: norm-based
+        loss 1 - ‖U|v⟩‖² > 0.5 for D=4, α=2 applied to both modes."""
+        m, offset, total = self._M, self._DISP_RE_OFFSET, self._TOTAL_PARAMS
+
+        def _large_disp(patch, idx):
+            p = torch.zeros(total)
+            p[offset:offset + m] = 2.0
+            return p
+
+        # object.__setattr__ bypasses nn.Module's __setattr__, which rejects non-Module values
+        object.__setattr__(head, 'hypernetwork', MagicMock(side_effect=_large_disp))
+        state_flat = self._vacuum_flat()
+        patches = torch.zeros(16, 49)
+        device = torch.device("cpu")
+
+        loss = head._compute_patch_trunc_loss(patches, state_flat, device, torch.complex64)
+
+        assert loss.item() > 0.5, f"Expected norm-based truncation loss > 0.5, got {loss.item():.4f}"
+        assert loss.item() <= 1.0, f"Expected norm-based truncation loss <= 1.0, got {loss.item():.4f}"
+
+    def test_near_zero_with_identity_gates(self, head):
+        """All-zero gate parameters leave the vacuum unchanged: norm loss
+        1 - ‖U|v⟩‖² = 0 since the state is still unit-norm."""
+        total = self._TOTAL_PARAMS
+
+        object.__setattr__(head, 'hypernetwork', MagicMock(side_effect=lambda p, i: torch.zeros(total)))
+        state_flat = self._vacuum_flat()
+        patches = torch.zeros(16, 49)
+        device = torch.device("cpu")
+
+        loss = head._compute_patch_trunc_loss(patches, state_flat, device, torch.complex64)
+
+        assert loss.item() == pytest.approx(0.0, abs=1e-5)
 
 
 class TestTruncationHelpers:

@@ -235,15 +235,10 @@ class CVQuixer(BaseVisionTransformer):
                 "CVQuixer is pending."
             )
 
-        readouts, states, _ = self.cv_attention(patches)       # (B, M×n), [B][M], [B][M]
-        logits = self.decoder(readouts)                        # (B, num_classes)
+        readouts, _, _, trunc_loss = self.cv_attention(patches)   # (B, M×n), states, probs, scalar
+        logits = self.decoder(readouts)                           # (B, num_classes)
 
         if return_trunc_loss and self.trunc_penalty != "none":
-            penalties: list[torch.Tensor] = []
-            for state_t in states:                         # state_t: (B, D, ..., D)
-                dims = tuple(range(1, state_t.ndim))
-                penalties.append(1.0 - (state_t.abs() ** 2).sum(dim=dims))   # (B,)
-            trunc_loss = torch.cat(penalties).mean()
             return logits, trunc_loss.to(logits.device)
 
         return logits

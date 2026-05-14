@@ -24,7 +24,9 @@ from cv_quixer.quantum.gates import (
     cubic_phase_matrix,
     displacement_matrix,
     kerr_matrix,
+    kerr_phases,
     rotation_matrix,
+    rotation_phases,
     squeezing_matrix,
     two_mode_squeezing_matrix,
 )
@@ -46,10 +48,12 @@ __all__ = [
     # Gate matrix factories — Gaussian
     "displacement_matrix",
     "squeezing_matrix",
-    "rotation_matrix",
+    "rotation_phases",
+    "rotation_matrix",      # backward-compat wrapper
     "beamsplitter_matrix",
     "two_mode_squeezing_matrix",
     # Gate matrix factories — non-Gaussian
+    "kerr_phases",
     "kerr_matrix",
     "cubic_phase_matrix",
     # Interferometer

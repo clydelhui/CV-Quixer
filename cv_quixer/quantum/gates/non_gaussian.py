@@ -46,9 +46,26 @@ def kerr_matrix(kappa: torch.Tensor, cutoff_dim: int) -> torch.Tensor:
     dtype = torch.complex128
     device = kappa.device
 
-    ns = torch.arange(cutoff_dim, dtype=kappa.dtype, device=device)
+    ns = torch.arange(cutoff_dim, dtype=torch.float64, device=device)
     phases = torch.exp(1j * kappa.to(dtype) * ns.to(dtype) ** 2)
     return torch.diag_embed(phases)
+
+
+def kerr_phases(kappa: torch.Tensor, cutoff_dim: int) -> torch.Tensor:
+    """Returns (D,) phase vector for K(κ): phases[n] = exp(i·κ·n²).
+
+    Kerr gate is diagonal in Fock basis: K_{nn} = exp(iκn²).
+    Kerr is exactly norm-preserving at any cutoff_dim.
+
+    Args:
+        kappa:      Kerr coupling strength (real scalar tensor).
+        cutoff_dim: Fock space truncation D.
+
+    Returns:
+        Complex tensor of shape (D,). Differentiable w.r.t. kappa.
+    """
+    ns = torch.arange(cutoff_dim, dtype=torch.float64, device=kappa.device)
+    return torch.exp(1j * kappa.to(torch.complex128) * ns.to(torch.complex128) ** 2)
 
 
 def cubic_phase_matrix(gamma: torch.Tensor, cutoff_dim: int) -> torch.Tensor:
@@ -76,6 +93,10 @@ def cubic_phase_matrix(gamma: torch.Tensor, cutoff_dim: int) -> torch.Tensor:
         Matrix exponentiation is expensive (O(D³)). For large cutoff_dim
         (D > 20) consider using a Padé approximant or Trotter decomposition.
         Numerical accuracy also degrades for large |gamma|.
+
+    Note:
+        CV-Quixer uses exp(i γ x̂³ / 6); SF's Vgate(γ) uses exp(i γ x̂³ / 3).
+        Equivalence: cubic_phase_matrix(γ) ≡ SF.Vgate(γ / 2).
     """
     from cv_quixer.quantum.ops import quadrature_x_matrix
 

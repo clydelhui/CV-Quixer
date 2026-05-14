@@ -33,6 +33,7 @@ dev = [
     "pytest>=9.0.3",
     "pytest-cov>=7.1.0",
     "ruff>=0.15.10",
+    "strawberryfields>=0.23.0",
     "torch>=2.5.0",
     "torchvision>=0.20.0",
 ]
