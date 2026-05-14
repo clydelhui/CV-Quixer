@@ -1,15 +1,16 @@
 #!/bin/bash
 # -----------------------------------------------------------------------
-# SLURM directives — A100 (40 GB), 6 h wall time for 3 epochs of full
-# FashionMNIST training (~30-45 min/epoch on A100).
+# SLURM directives — A100 (40 GB), 24 h wall time for 3 epochs of full
+# FashionMNIST training (~4 h/epoch observed → ~12 h, plus buffer for
+# checkpointing, dataset normalisation stats, and dependency sync).
 #
-# V100 fallback: change to `--gres=gpu:nv:1` and `--time=08:00:00` if
-# A100 queues are congested.
+# V100 fallback: change to `--gres=gpu:nv:1` if A100 queues are
+# congested (V100 will be slower; keep the 24 h time).
 # -----------------------------------------------------------------------
 #SBATCH --job-name=cv_quixer_full
 #SBATCH --output=slurm-%x-%j.out
 #SBATCH --error=slurm-%x-%j.err
-#SBATCH --time=06:00:00
+#SBATCH --time=24:00:00
 #SBATCH --gres=gpu:a100-40:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
