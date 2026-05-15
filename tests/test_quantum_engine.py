@@ -84,6 +84,64 @@ class TestFockState:
         assert rho[1:, :].abs().sum().item() == pytest.approx(0.0, abs=1e-10)
         assert rho[:, 1:].abs().sum().item() == pytest.approx(0.0, abs=1e-10)
 
+    def test_photon_number_probabilities_vacuum(self):
+        """Vacuum: P(0)=1, P(k>0)=0 for every mode."""
+        from cv_quixer.quantum import FockState
+        state = FockState.vacuum(num_modes=2, cutoff_dim=D)
+        for mode in range(2):
+            probs = state.photon_number_probabilities(mode)
+            assert probs.shape == (D,)
+            assert probs[0].item() == pytest.approx(1.0, abs=1e-10)
+            assert probs[1:].abs().sum().item() == pytest.approx(0.0, abs=1e-10)
+
+    def test_photon_number_probabilities_single_photon(self):
+        """|1⟩_mode0 ⊗ |0⟩_mode1: P(1)=1 on mode 0, P(0)=1 on mode 1."""
+        from cv_quixer.quantum import FockState
+        data = torch.zeros((D, D), dtype=torch.complex128)
+        data[1, 0] = 1.0   # one photon in mode 0, vacuum in mode 1
+        state = FockState(data, num_modes=2, cutoff_dim=D)
+        probs0 = state.photon_number_probabilities(0)
+        probs1 = state.photon_number_probabilities(1)
+        assert probs0[1].item() == pytest.approx(1.0, abs=1e-10)
+        assert (probs0[:1].sum() + probs0[2:].sum()).item() == pytest.approx(0.0, abs=1e-10)
+        assert probs1[0].item() == pytest.approx(1.0, abs=1e-10)
+        assert probs1[1:].abs().sum().item() == pytest.approx(0.0, abs=1e-10)
+
+    def test_photon_number_probabilities_matches_expectation(self):
+        """Σ k·P(k) must equal measure_photon_number for any state."""
+        from cv_quixer.quantum import CVCircuit, FockState
+        from cv_quixer.quantum.gates.gaussian import displacement_matrix
+        circuit = CVCircuit(num_modes=1, cutoff_dim=D)
+        state = FockState.vacuum(num_modes=1, cutoff_dim=D)
+        state = circuit.apply_single_mode_gate(
+            displacement_matrix(torch.tensor(0.6), D), 0, state
+        )
+        probs = state.photon_number_probabilities(0)
+        k = torch.arange(D, dtype=probs.dtype)
+        mean_from_probs = (k * probs).sum().item()
+        mean_from_op = circuit.measure_photon_number(0, state).item()
+        assert mean_from_probs == pytest.approx(mean_from_op, abs=1e-6)
+
+    def test_photon_number_probabilities_non_negative_and_real(self):
+        """After gates, every probability is real-valued and non-negative."""
+        from cv_quixer.quantum import CVCircuit, FockState
+        from cv_quixer.quantum.gates.gaussian import (
+            displacement_matrix,
+            squeezing_matrix,
+        )
+        circuit = CVCircuit(num_modes=1, cutoff_dim=D)
+        state = FockState.vacuum(num_modes=1, cutoff_dim=D)
+        state = circuit.apply_single_mode_gate(
+            squeezing_matrix(torch.tensor(0.3), torch.tensor(0.4), D), 0, state
+        )
+        state = circuit.apply_single_mode_gate(
+            displacement_matrix(torch.tensor(0.4), D), 0, state
+        )
+        probs = state.photon_number_probabilities(0)
+        assert probs.dtype.is_floating_point
+        assert (probs >= 0.0).all()
+        assert probs.sum().item() <= 1.0 + 1e-6
+
 
 # ============================================================
 # Observable matrices (ops.py)
@@ -420,6 +478,29 @@ class TestCVCircuit:
         circuit = CVCircuit(num_modes=1, cutoff_dim=D)
         state = FockState.vacuum(num_modes=1, cutoff_dim=D)
         assert circuit.measure_photon_number(0, state).item() == pytest.approx(0.0, abs=1e-10)
+
+    def test_measure_pnr_distribution_shape_and_dtype(self):
+        """PNR readout returns a real (cutoff_dim,) tensor."""
+        from cv_quixer.quantum import CVCircuit, FockState
+        circuit = CVCircuit(num_modes=1, cutoff_dim=D)
+        state = FockState.vacuum(num_modes=1, cutoff_dim=D)
+        probs = circuit.measure_pnr_distribution(0, state)
+        assert probs.shape == (D,)
+        assert probs.dtype.is_floating_point
+
+    def test_measure_pnr_distribution_sums_to_unit_or_less(self):
+        """Truncated PNR may lose mass to n ≥ D, so the sum is ≤ 1 + ε."""
+        from cv_quixer.quantum import CVCircuit, FockState
+        from cv_quixer.quantum.gates.gaussian import squeezing_matrix
+        circuit = CVCircuit(num_modes=1, cutoff_dim=D)
+        state = FockState.vacuum(num_modes=1, cutoff_dim=D)
+        state = circuit.apply_single_mode_gate(
+            squeezing_matrix(torch.tensor(0.5), torch.tensor(0.0), D), 0, state
+        )
+        probs = circuit.measure_pnr_distribution(0, state)
+        total = probs.sum().item()
+        assert total <= 1.0 + 1e-8
+        assert total >= 0.0
 
     def test_coherent_state_quadrature_x(self):
         """D(α)|0⟩ with real α: ⟨x̂⟩ = √2 Re(α).

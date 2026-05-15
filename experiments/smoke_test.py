@@ -1,6 +1,10 @@
 """End-to-end smoke test: 5 train samples, 1 test sample, FashionMNIST.
 
-Verifies:
+Runs the full forward + backward + eval cycle once per quantum readout
+observable ("quadrature_x", "photon_number", "pnr_distribution") so a
+single invocation exercises every supported configuration.
+
+Verifies (for each readout):
   1. FashionMNIST patches load with correct shape (5, 16, 49)
   2. Forward pass produces logits of shape (B, 10)
   3. Fock truncation loss is computed and logged each epoch
@@ -22,8 +26,9 @@ from cv_quixer.models import build_model
 from cv_quixer.utils import print_parameter_table
 
 EPOCHS = 5
+READOUTS = ("quadrature_x", "photon_number", "pnr_distribution")
 
-# --- Config (hardcoded, no YAML) ---
+# --- Shared data config (hardcoded, no YAML) ---
 data_cfg = DataConfig(
     dataset="fashionmnist",
     normalize=True,
@@ -32,75 +37,81 @@ data_cfg = DataConfig(
     num_workers=0,
     data_root="data/",
 )
-quantum_cfg = QuantumConfig(
-    num_modes=2,
-    cutoff_dim=4,
-    num_heads=2,
-    cnn_channels_1=4,
-    cnn_channels_2=8,
-    cnn_kernel_size=3,
-    decoder_hidden_dim=16,
-    poly_degree=2,
-    dtype="complex64",
-    trunc_penalty="norm",
-    trunc_lambda=0.01,
-)
-config = ExperimentConfig(
-    name="smoke_test",
-    model="quantum",
-    data=data_cfg,
-    quantum=quantum_cfg,
-    training=TrainingConfig(lr=1e-3, epochs=EPOCHS, seed=0),
-    use_wandb=False,
-)
 
-# --- Dataset (5 train, 1 test) ---
+# --- Dataset (5 train, 1 test) — built once, reused for every readout ---
 train_ds = Subset(PatchedDataset(data_cfg, train=True),  indices=list(range(5)))
 test_ds  = Subset(PatchedDataset(data_cfg, train=False), indices=[0])
 train_loader = DataLoader(train_ds, batch_size=5, shuffle=False)
 test_loader  = DataLoader(test_ds,  batch_size=1, shuffle=False)
 
-# --- Model ---
-model = build_model(config)
-print_parameter_table(model)
 
-# --- Shape check (before training) ---
-patches, labels = next(iter(train_loader))
-logits_check = model(patches)
-assert logits_check.shape == (5, 10), f"Expected (5, 10), got {logits_check.shape}"
-print(f"\nForward shape OK — logits: {tuple(logits_check.shape)}")
+def run_one(readout_observable: str) -> None:
+    print(f"\n{'=' * 60}\nReadout observable: {readout_observable}\n{'=' * 60}")
 
-# --- Training loop ---
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-print(f"\n{'Epoch':<6} {'CE loss':<12} {'Trunc loss':<14} {'Total loss'}")
-print("─" * 46)
+    quantum_cfg = QuantumConfig(
+        num_modes=2,
+        cutoff_dim=4,
+        num_heads=2,
+        cnn_channels_1=4,
+        cnn_channels_2=8,
+        cnn_kernel_size=3,
+        decoder_hidden_dim=16,
+        poly_degree=2,
+        dtype="complex64",
+        trunc_penalty="norm",
+        trunc_lambda=0.01,
+        readout_observable=readout_observable,
+    )
+    config = ExperimentConfig(
+        name=f"smoke_test_{readout_observable}",
+        model="quantum",
+        data=data_cfg,
+        quantum=quantum_cfg,
+        training=TrainingConfig(lr=1e-3, epochs=EPOCHS, seed=0),
+        use_wandb=False,
+    )
 
-for epoch in range(1, EPOCHS + 1):
-    model.train()
+    model = build_model(config)
+    print_parameter_table(model)
+
     patches, labels = next(iter(train_loader))
-    optimizer.zero_grad()
+    logits_check = model(patches)
+    assert logits_check.shape == (5, 10), f"Expected (5, 10), got {logits_check.shape}"
+    print(f"\nForward shape OK — logits: {tuple(logits_check.shape)}")
 
-    logits, trunc_loss = model(patches, return_trunc_loss=True)
-    ce_loss = F.cross_entropy(logits, labels)
-    total_loss = ce_loss + quantum_cfg.trunc_lambda * trunc_loss
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    print(f"\n{'Epoch':<6} {'CE loss':<12} {'Trunc loss':<14} {'Total loss'}")
+    print("─" * 46)
 
-    total_loss.backward()
-    optimizer.step()
+    for epoch in range(1, EPOCHS + 1):
+        model.train()
+        patches, labels = next(iter(train_loader))
+        optimizer.zero_grad()
 
-    print(f"{epoch:<6} {ce_loss.item():<12.4f} {trunc_loss.item():<14.4f} {total_loss.item():.4f}")
+        logits, trunc_loss = model(patches, return_trunc_loss=True)
+        ce_loss = F.cross_entropy(logits, labels)
+        total_loss = ce_loss + quantum_cfg.trunc_lambda * trunc_loss
 
-# --- Gradient check (after final backward) ---
-missing = [n for n, p in model.named_parameters() if p.requires_grad and p.grad is None]
-if missing:
-    raise AssertionError(f"Missing gradients: {missing}")
-print(f"\nGradients OK — all {sum(1 for p in model.parameters() if p.requires_grad)} params have gradients")
+        total_loss.backward()
+        optimizer.step()
 
-# --- Eval pass ---
-model.eval()
-with torch.no_grad():
-    test_patches, test_label = next(iter(test_loader))
-    test_logits = model(test_patches)
-    pred = test_logits.argmax(dim=-1).item()
-print(f"Eval OK     — predicted class: {pred}, true label: {test_label.item()}")
+        print(f"{epoch:<6} {ce_loss.item():<12.4f} {trunc_loss.item():<14.4f} {total_loss.item():.4f}")
 
-print("\nSmoke test PASSED")
+    missing = [n for n, p in model.named_parameters() if p.requires_grad and p.grad is None]
+    if missing:
+        raise AssertionError(f"Missing gradients: {missing}")
+    n_params = sum(1 for p in model.parameters() if p.requires_grad)
+    print(f"\nGradients OK — all {n_params} params have gradients")
+
+    model.eval()
+    with torch.no_grad():
+        test_patches, test_label = next(iter(test_loader))
+        test_logits = model(test_patches)
+        pred = test_logits.argmax(dim=-1).item()
+    print(f"Eval OK     — predicted class: {pred}, true label: {test_label.item()}")
+
+
+for readout in READOUTS:
+    run_one(readout)
+
+print("\nSmoke test PASSED for all readouts: " + ", ".join(READOUTS))

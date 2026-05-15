@@ -27,6 +27,7 @@ from cv_quixer.models.base import BaseVisionTransformer
 from cv_quixer.models.quantum.cv_attention import (
     HyperCVAttention,
     _gate_param_count,
+    _readout_dim_per_mode,
     norm_truncation_penalty,
     photon_number_penalty,
 )
@@ -42,7 +43,10 @@ class CVDecoder(nn.Module):
     """Two-layer MLP: concatenated head readouts → class logits.
 
     Args:
-        in_dim:      num_heads × num_modes (total readout width).
+        in_dim:      Total readout width
+                     = num_heads × num_modes × readout_dim_per_mode,
+                     where readout_dim_per_mode is 1 for ⟨x̂⟩ / ⟨n̂⟩ and
+                     cutoff_dim for the "pnr_distribution" readout.
         hidden_dim:  Width of the hidden layer.
         num_classes: Number of output classes.
     """
@@ -84,6 +88,8 @@ def _param_count_formula(
     num_classes: int,
     bs_topology: str,
     poly_degree: int,
+    readout_observable: str,
+    cutoff_dim: int,
 ) -> int:
     """Closed-form parameter count for CVQuixer."""
     h_out = patch_size - 2 * (cnn_kernel_size - 1)
@@ -99,8 +105,9 @@ def _param_count_formula(
     poly = poly_degree + 1
     per_head = conv1 + conv2 + linear + lcu + poly
     heads = num_heads * per_head
-    # CVDecoder
-    decoder_in = num_heads * num_modes
+    # CVDecoder — input width depends on readout observable
+    per_mode = _readout_dim_per_mode(readout_observable, cutoff_dim)
+    decoder_in = num_heads * num_modes * per_mode
     decoder = (decoder_in * decoder_hidden + decoder_hidden
                + decoder_hidden * num_classes + num_classes)
     return heads + decoder
@@ -124,6 +131,7 @@ def _resolve_cnn_channels(
             config.cnn_channels_1, c2, config.cnn_kernel_size,
             config.decoder_hidden_dim, num_classes,
             config.bs_topology, config.poly_degree,
+            config.readout_observable, config.cutoff_dim,
         )
 
     lo, hi = 1, 4096
@@ -196,8 +204,11 @@ class CVQuixer(BaseVisionTransformer):
 
         self.config = config
         self.cv_attention = HyperCVAttention(patch_size, num_patches, config)
+        per_mode = _readout_dim_per_mode(
+            config.readout_observable, config.cutoff_dim
+        )
         self.decoder = CVDecoder(
-            in_dim=config.num_heads * config.num_modes,
+            in_dim=config.num_heads * config.num_modes * per_mode,
             hidden_dim=config.decoder_hidden_dim,
             num_classes=data_config.num_classes,
         )

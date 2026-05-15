@@ -43,6 +43,20 @@ class QuantumConfig:
     trunc_penalty: str = "none"   # "none" | "norm" | "photon_number"
     trunc_lambda: float = 0.01
 
+    # Quantum-circuit readout used as input to the classical decoder.
+    #   "quadrature_x"     — 〈x̂〉 per mode                       (num_modes scalars)
+    #   "photon_number"    — 〈n̂〉 per mode                       (num_modes scalars)
+    #   "pnr_distribution" — P(n_mode=k) for k=0..cutoff_dim-1   (num_modes × cutoff_dim values)
+    readout_observable: str = "quadrature_x"
+
+    def __post_init__(self) -> None:
+        valid_readouts = {"quadrature_x", "photon_number", "pnr_distribution"}
+        if self.readout_observable not in valid_readouts:
+            raise ValueError(
+                f"readout_observable must be one of {sorted(valid_readouts)}, "
+                f"got {self.readout_observable!r}"
+            )
+
 
 @dataclass
 class ClassicalConfig:

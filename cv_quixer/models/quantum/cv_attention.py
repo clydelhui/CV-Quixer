@@ -49,6 +49,15 @@ from cv_quixer.quantum import (
 # ---------------------------------------------------------------------------
 
 
+def _readout_dim_per_mode(readout_observable: str, cutoff_dim: int) -> int:
+    """Decoder-input contribution from one mode under the chosen readout.
+
+    * ``"quadrature_x"`` / ``"photon_number"`` — 1 scalar per mode.
+    * ``"pnr_distribution"`` — ``cutoff_dim`` probabilities per mode.
+    """
+    return cutoff_dim if readout_observable == "pnr_distribution" else 1
+
+
 def _gate_param_count(num_modes: int, bs_topology: str) -> int:
     """Total hypernetwork output size for the given gate set and topology.
 
@@ -320,6 +329,7 @@ class HyperCVAttentionHead(nn.Module):
         super().__init__()
         self.num_modes = config.num_modes
         self.cutoff_dim = config.cutoff_dim
+        self.readout_observable = config.readout_observable
         self.torch_dtype = (
             torch.complex128 if config.dtype == "complex128" else torch.complex64
         )
@@ -523,8 +533,12 @@ class HyperCVAttentionHead(nn.Module):
                          this head. Defaults to vacuum |0,...,0⟩.
 
         Returns:
-            readout:        Real tensor of shape (num_modes,) — ⟨x̂_i⟩ for each
-                            mode, measured on the renormalised post-selected state.
+            readout:        Real tensor measured on the renormalised post-selected
+                            state. Shape depends on ``config.readout_observable``:
+                              * ``"quadrature_x"``     → (num_modes,) — ⟨x̂_i⟩
+                              * ``"photon_number"``    → (num_modes,) — ⟨n̂_i⟩
+                              * ``"pnr_distribution"`` → (num_modes × cutoff_dim,) —
+                                P(n_i = k) flattened over (mode, k).
             output_state:   Tensor — renormalised post-selected output state data.
             success_prob:   Scalar tensor — ‖P(M)|ψ_in⟩‖² (post-selection
                             probability; 1.0 for a unitary P(M)).
@@ -567,11 +581,28 @@ class HyperCVAttentionHead(nn.Module):
         # 5. Wrap as FockState
         output_state = FockState(out_norm.reshape((D,) * n), n, D)
 
-        # 6. Measure quadratures; move result back to classical device for decoder
-        readout = torch.stack([
-            self.circuit.measure_quadrature_x(i, output_state)
-            for i in range(n)
-        ]).to(classical_device)
+        # 6. Measure chosen observable; move result back to classical device for decoder
+        if self.readout_observable == "quadrature_x":
+            readout = torch.stack([
+                self.circuit.measure_quadrature_x(i, output_state)
+                for i in range(n)
+            ])
+        elif self.readout_observable == "photon_number":
+            readout = torch.stack([
+                self.circuit.measure_photon_number(i, output_state)
+                for i in range(n)
+            ])
+        elif self.readout_observable == "pnr_distribution":
+            probs = torch.stack([
+                self.circuit.measure_pnr_distribution(i, output_state)
+                for i in range(n)
+            ])                                    # (num_modes, cutoff_dim)
+            readout = probs.reshape(-1)           # (num_modes * cutoff_dim,)
+        else:
+            raise ValueError(
+                f"Unknown readout_observable {self.readout_observable!r}"
+            )
+        readout = readout.to(classical_device)
         return readout, output_state.data, success_prob, avg_trunc_loss
 
 
@@ -600,6 +631,11 @@ class HyperCVAttention(nn.Module):
         super().__init__()
         self.num_heads = config.num_heads
         self.num_modes = config.num_modes
+        self.cutoff_dim = config.cutoff_dim
+        self.readout_observable = config.readout_observable
+        self.readout_dim_per_mode = _readout_dim_per_mode(
+            config.readout_observable, config.cutoff_dim
+        )
 
         self.heads = nn.ModuleList([
             HyperCVAttentionHead(patch_size, num_patches, config)
@@ -618,7 +654,10 @@ class HyperCVAttention(nn.Module):
             input_state: Not supported under vmap; must be None.
 
         Returns:
-            readouts:      Float tensor of shape (B, num_heads × num_modes).
+            readouts:      Float tensor of shape
+                           (B, num_heads × num_modes × readout_dim_per_mode).
+                           readout_dim_per_mode is 1 for ⟨x̂⟩ / ⟨n̂⟩ and equals
+                           cutoff_dim for "pnr_distribution".
             states:        list[Tensor] — one (B, D, ..., D) state tensor per head.
             success_probs: list[Tensor] — one (B,) success probability tensor per head.
             trunc_loss:    Scalar — mean per-patch truncation loss across all heads

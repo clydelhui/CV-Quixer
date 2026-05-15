@@ -196,3 +196,18 @@ class CVCircuit:
         n_mat = number_operator_matrix(self.cutoff_dim, dtype=state.dtype).to(state.device)
         rho = state.reduced_density_matrix(mode)
         return torch.trace(rho @ n_mat).real
+
+    def measure_pnr_distribution(self, mode: int, state: FockState) -> torch.Tensor:
+        """Simulated photon-number-resolving detector output for one mode.
+
+        Returns P(n_mode = k) for k = 0, …, cutoff_dim-1 — the diagonal of the
+        reduced density matrix.
+
+        Args:
+            mode:  Mode index.
+            state: Current FockState.
+
+        Returns:
+            Real tensor of shape (cutoff_dim,) with non-negative entries.
+        """
+        return state.photon_number_probabilities(mode)

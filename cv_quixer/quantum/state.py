@@ -129,6 +129,23 @@ class FockState:
         psi = psi.reshape(self._cutoff_dim, -1)          # (D, D^(N-1))
         return torch.einsum("ia,ja->ij", psi, psi.conj())  # (D, D)
 
+    def photon_number_probabilities(self, mode: int) -> torch.Tensor:
+        """Photon-number probability distribution P(n) for a single mode.
+
+        Returns the diagonal of the reduced density matrix ρ_mode, which is
+        the probability of measuring n photons in `mode` for n = 0, …, D-1.
+        Truncation may cause the sum to be slightly less than 1; values are
+        clamped to be non-negative for numerical safety.
+
+        Args:
+            mode: Index of the mode to measure (0-indexed).
+
+        Returns:
+            Real tensor of shape (cutoff_dim,) with non-negative entries.
+        """
+        rho = self.reduced_density_matrix(mode)
+        return rho.diagonal().real.clamp(min=0.0)
+
     def __repr__(self) -> str:
         return (
             f"FockState(num_modes={self._num_modes}, "
