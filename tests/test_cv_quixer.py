@@ -15,6 +15,8 @@ from cv_quixer.models.quantum.cv_attention import (
     HyperCVAttentionHead,
     LCUSumCoefficients,
     PolynomialCoefficients,
+    _GATE_SEQUENCE,
+    _bs_pair_count,
     _gate_param_count,
     norm_truncation_penalty,
     photon_number_penalty,
@@ -90,6 +92,27 @@ class TestGateParamCount:
 
     def test_linear_2_modes(self):
         assert _gate_param_count(2, "linear") == 14   # 6*2 + 2*1
+
+    @pytest.mark.parametrize("m,topo", [
+        (1, "linear"),
+        (2, "linear"),
+        (4, "linear"),
+        (4, "ring"),
+        (8, "linear"),
+        (8, "ring"),
+    ])
+    def test_derivation_matches_gate_sequence(self, m, topo):
+        """_gate_param_count must equal a direct sum over _GATE_SEQUENCE.
+
+        Locks in the contract that _gate_param_count is derived from the
+        gate-op list rather than a separate magic formula.
+        """
+        n_bs = _bs_pair_count(m, topo)
+        expected = sum(
+            len(op.param_names) * (m if op.site_kind == "mode" else n_bs)
+            for op in _GATE_SEQUENCE
+        )
+        assert _gate_param_count(m, topo) == expected
 
 
 class TestLCUAndPolyCoeffs:

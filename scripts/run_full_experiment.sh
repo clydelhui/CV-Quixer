@@ -1,16 +1,16 @@
 #!/bin/bash
 # -----------------------------------------------------------------------
-# SLURM directives — A100 (40 GB), 24 h wall time for 3 epochs of full
-# FashionMNIST training (~4 h/epoch observed → ~12 h, plus buffer for
-# checkpointing, dataset normalisation stats, and dependency sync).
+# SLURM directives — A100 (40 GB), 3 h wall time for 3 epochs on a 10%
+# subset of FashionMNIST (~6k train / 1k test), plus buffer for
+# checkpointing, dataset normalisation stats, and dependency sync.
 #
 # V100 fallback: change to `--gres=gpu:nv:1` if A100 queues are
-# congested (V100 will be slower; keep the 24 h time).
+# congested (V100 will be slower; bump --time if needed).
 # -----------------------------------------------------------------------
 #SBATCH --job-name=cv_quixer_full
 #SBATCH --output=slurm-%x-%j.out
 #SBATCH --error=slurm-%x-%j.err
-#SBATCH --time=24:00:00
+#SBATCH --time=03:00:00
 #SBATCH --gres=gpu:a100-40:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
@@ -78,12 +78,16 @@ echo "Starting full FashionMNIST experiment..."
 
 # To resume from a previous run, comment out the fresh-start line below and
 # uncomment the resume line, replacing the timestamp with the actual run directory.
+# Note: when resuming, re-pass the same --train-fraction/--test-fraction/--subset-seed
+# values so the loaders are rebuilt with identical subsets.
 PYTHONPATH="$HOME/CV-Quixer${PYTHONPATH:+:$PYTHONPATH}" \
-    uv run python experiments/full_experiment.py
+    uv run python experiments/full_experiment.py \
+        --train-fraction 0.1 --test-fraction 0.1
 
 # Resume variant (continues writing into the same run directory):
 # PYTHONPATH="$HOME/CV-Quixer${PYTHONPATH:+:$PYTHONPATH}" \
 #     uv run python experiments/full_experiment.py \
+#         --train-fraction 0.1 --test-fraction 0.1 \
 #         --resume results/runs/full_fashionmnist_YYYY-MM-DD_HH-MM-SS/checkpoints/latest.pt
 
 echo ""

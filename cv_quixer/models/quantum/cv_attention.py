@@ -27,6 +27,8 @@ passed to CVDecoder in cv_quixer.py.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
+from typing import Callable
 
 import torch
 import torch.nn as nn
@@ -54,20 +56,99 @@ def _readout_total_dim(observable_plan: list) -> int:
     return len(observable_plan)
 
 
-def _gate_param_count(num_modes: int, bs_topology: str) -> int:
-    """Total hypernetwork output size for the given gate set and topology.
+# ---------------------------------------------------------------------------
+# Declarative gate-op list
+#
+# `_GATE_SEQUENCE` is the single source of truth for the per-patch unitary
+# U_i applied by HyperCVAttentionHead._apply_patch_gates_to_state. Both the
+# hypernetwork output width (_gate_param_count) and the slicing/dispatch
+# logic in _apply_patch_gates_to_state are derived from it, so adding or
+# removing a gate is a one-line edit and the two pieces of code cannot drift.
+#
+# Layout convention (parameter-name-major): for each op with k param names
+# and N sites, the hypernetwork output contains N values for param_names[0],
+# then N values for param_names[1], etc. This matches the original manual
+# layout and preserves checkpoint compatibility.
+# ---------------------------------------------------------------------------
 
-    Layout: squeeze_r(m) + squeeze_phi(m) + bs_theta(n_bs) + bs_phi(n_bs)
-            + rot_phi(m) + disp_re(m) + disp_im(m) + kerr_kappa(m)
+
+@dataclass(frozen=True)
+class GateOp:
+    """One gate in the per-patch unitary U_i.
+
+    Attributes:
+        name:        Short identifier (also used to build slice-name keys
+                     in diagnostic snapshots, e.g. f"{name}_{param_name}").
+        param_names: Names of the real scalars consumed per site, in order
+                     (e.g. ("r", "phi") for squeeze).
+        site_kind:   "mode" — gate acts on each of the m modes; or "pair"
+                     — gate acts on each beamsplitter pair.
+        apply:       (circuit, state, slc, site, D, device, dtype) -> FockState
+                     where slc is a dict {param_name: scalar_tensor}.
+    """
+
+    name: str
+    param_names: tuple[str, ...]
+    site_kind: str
+    apply: Callable
+
+
+def _apply_squeeze(circuit, state, slc, k, D, device, dtype):
+    S = squeezing_matrix(slc["r"], slc["phi"], D).to(device=device, dtype=dtype)
+    return circuit.apply_single_mode_gate(S, k, state)
+
+
+def _apply_bs(circuit, state, slc, pair, D, device, dtype):
+    a, b = pair
+    BS = beamsplitter_matrix(slc["theta"], slc["phi"], D).to(device=device, dtype=dtype)
+    return circuit.apply_two_mode_gate(BS, a, b, state)
+
+
+def _apply_rot(circuit, state, slc, k, D, device, dtype):
+    phases = rotation_phases(slc["phi"], D).to(device=device, dtype=dtype)
+    return circuit.apply_single_mode_phases(phases, k, state)
+
+
+def _apply_disp(circuit, state, slc, k, D, device, dtype):
+    alpha = torch.complex(slc["re"], slc["im"])
+    Dk = displacement_matrix(alpha, D).to(device=device, dtype=dtype)
+    return circuit.apply_single_mode_gate(Dk, k, state)
+
+
+def _apply_kerr(circuit, state, slc, k, D, device, dtype):
+    phases = kerr_phases(slc["kappa"], D).to(device=device, dtype=dtype)
+    return circuit.apply_single_mode_phases(phases, k, state)
+
+
+_GATE_SEQUENCE: tuple[GateOp, ...] = (
+    GateOp("squeeze", ("r", "phi"),     "mode", _apply_squeeze),
+    GateOp("bs",      ("theta", "phi"), "pair", _apply_bs),
+    GateOp("rot",     ("phi",),         "mode", _apply_rot),
+    GateOp("disp",    ("re", "im"),     "mode", _apply_disp),
+    GateOp("kerr",    ("kappa",),       "mode", _apply_kerr),
+)
+
+
+def _bs_pair_count(num_modes: int, bs_topology: str) -> int:
+    """Number of beamsplitter pairs given the mode count and topology."""
+    if num_modes <= 1:
+        return 0
+    return num_modes if bs_topology == "ring" else num_modes - 1
+
+
+def _gate_param_count(num_modes: int, bs_topology: str) -> int:
+    """Total hypernetwork output size for the configured gate set and topology.
+
+    Derived from `_GATE_SEQUENCE`: sums `len(op.param_names) * n_sites` over
+    each op, where n_sites is `num_modes` for "mode" gates and the number of
+    beamsplitter pairs for "pair" gates.
     """
     m = num_modes
-    if m <= 1:
-        n_bs = 0
-    elif bs_topology == "ring":
-        n_bs = m
-    else:
-        n_bs = m - 1
-    return 2 * m + 2 * n_bs + m + 2 * m + m  # = 6m + 2*n_bs
+    n_bs = _bs_pair_count(m, bs_topology)
+    return sum(
+        len(op.param_names) * (m if op.site_kind == "mode" else n_bs)
+        for op in _GATE_SEQUENCE
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -358,17 +439,17 @@ class HyperCVAttentionHead(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> FockState:
-        """Apply the full Killoran gate sequence U_i directly to a FockState.
+        """Apply the configured gate sequence U_i directly to a FockState.
 
-        Gate sequence (squeeze acts on state first, Kerr last):
-            S(r_k, φ_k) per mode →
-            BS(θ_i, φ_i) on adjacent pairs →
-            R(φ_k) per mode →
-            D(α_k) per mode →
-            K(κ_k) per mode
+        Iterates over `_GATE_SEQUENCE` (single source of truth for the gate
+        set) and dispatches through each op's apply callback. Parameter
+        slicing follows the parameter-name-major layout: for each op, the
+        full vector for each param name is read in order before iterating
+        over sites.
 
-        Uses circuit.apply_single_mode_gate / apply_two_mode_gate directly —
-        no D^m × D^m matrix is ever assembled.
+        Uses circuit.apply_single_mode_gate / apply_two_mode_gate /
+        apply_single_mode_phases via the per-op adapters — no D^m × D^m
+        matrix is ever assembled.
 
         Args:
             params: Real tensor of shape (_gate_param_count(num_modes, topology),).
@@ -381,38 +462,19 @@ class HyperCVAttentionHead(nn.Module):
         """
         m = self.num_modes
         D = self.cutoff_dim
-        n_bs = len(self._bs_pairs)
+        bs_pairs = self._bs_pairs
         idx = 0
 
-        squeeze_r   = params[idx:idx + m];     idx += m
-        squeeze_phi = params[idx:idx + m];     idx += m
-        bs_theta    = params[idx:idx + n_bs];  idx += n_bs
-        bs_phi      = params[idx:idx + n_bs];  idx += n_bs
-        rot_phi     = params[idx:idx + m];     idx += m
-        disp_re     = params[idx:idx + m];     idx += m
-        disp_im     = params[idx:idx + m];     idx += m
-        kerr_kappa  = params[idx:idx + m];     idx += m
-
-        for k in range(m):
-            S = squeezing_matrix(squeeze_r[k], squeeze_phi[k], D).to(device=device, dtype=dtype)
-            state = self.circuit.apply_single_mode_gate(S, k, state)
-
-        for i, (a, b) in enumerate(self._bs_pairs):
-            BS = beamsplitter_matrix(bs_theta[i], bs_phi[i], D).to(device=device, dtype=dtype)
-            state = self.circuit.apply_two_mode_gate(BS, a, b, state)
-
-        for k in range(m):
-            phases = rotation_phases(rot_phi[k], D).to(device=device, dtype=dtype)
-            state = self.circuit.apply_single_mode_phases(phases, k, state)
-
-        for k in range(m):
-            alpha = torch.complex(disp_re[k], disp_im[k])
-            Dk = displacement_matrix(alpha, D).to(device=device, dtype=dtype)
-            state = self.circuit.apply_single_mode_gate(Dk, k, state)
-
-        for k in range(m):
-            phases = kerr_phases(kerr_kappa[k], D).to(device=device, dtype=dtype)
-            state = self.circuit.apply_single_mode_phases(phases, k, state)
+        for op in _GATE_SEQUENCE:
+            sites = list(range(m)) if op.site_kind == "mode" else bs_pairs
+            n_sites = len(sites)
+            param_vectors: dict[str, torch.Tensor] = {}
+            for p in op.param_names:
+                param_vectors[p] = params[idx:idx + n_sites]
+                idx += n_sites
+            for site_idx, site in enumerate(sites):
+                slc = {p: param_vectors[p][site_idx] for p in op.param_names}
+                state = op.apply(self.circuit, state, slc, site, D, device, dtype)
 
         return state
 

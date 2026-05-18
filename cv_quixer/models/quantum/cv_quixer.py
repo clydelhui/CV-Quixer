@@ -219,6 +219,8 @@ class CVQuixer(BaseVisionTransformer):
         patches: torch.Tensor,
         return_trunc_loss: bool = False,
         return_success_prob: bool = False,
+        return_states: bool = False,
+        return_readouts: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Run the full CV-Quixer model.
 
@@ -228,11 +230,24 @@ class CVQuixer(BaseVisionTransformer):
                                 return the mean truncation penalty across all
                                 batch elements and heads.
             return_success_prob: Not yet implemented. Raises NotImplementedError.
+            return_states:      If True, also return ``(states, success_probs)``
+                                as appended trailing tuple entries —
+                                ``states`` is ``list[Tensor]`` (one per head,
+                                shape ``(B, cutoff_dim, ..., cutoff_dim)``),
+                                ``success_probs`` is ``list[Tensor]`` (one
+                                ``(B,)`` per head). Diagnostic-only;
+                                training path leaves this False.
+            return_readouts:    If True, also return the pre-decoder readouts
+                                ``(B, num_heads * len(observable_plan))``.
 
         Returns:
-            logits:     (B, num_classes) — always returned.
-            trunc_loss: scalar — appended when return_trunc_loss=True and
-                        trunc_penalty != "none".
+            logits:        (B, num_classes) — always returned.
+            trunc_loss:    scalar — appended when return_trunc_loss=True and
+                           trunc_penalty != "none".
+            readouts:      (B, num_heads * len(observable_plan)) — appended
+                           when return_readouts=True.
+            states:        list[Tensor] — appended when return_states=True.
+            success_probs: list[Tensor] — appended when return_states=True.
         """
         if return_success_prob:
             raise NotImplementedError(
@@ -242,10 +257,18 @@ class CVQuixer(BaseVisionTransformer):
                 "CVQuixer is pending."
             )
 
-        readouts, _, _, trunc_loss = self.cv_attention(patches)   # (B, M×n), states, probs, scalar
+        readouts, states, success_probs, trunc_loss = self.cv_attention(patches)
         logits = self.decoder(readouts)                           # (B, num_classes)
 
+        extras: list = []
         if return_trunc_loss and self.trunc_penalty != "none":
-            return logits, trunc_loss.to(logits.device)
+            extras.append(trunc_loss.to(logits.device))
+        if return_readouts:
+            extras.append(readouts)
+        if return_states:
+            extras.append(states)
+            extras.append(success_probs)
 
-        return logits
+        if not extras:
+            return logits
+        return (logits, *extras)

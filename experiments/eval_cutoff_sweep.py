@@ -11,8 +11,12 @@ Run:
         --checkpoint results/runs/full_fashionmnist_*/checkpoints/final_model.pt \\
         [--cutoffs 6 8 10 12] \\
         [--batch-size 64] \\
-        [--test-fraction 0.5] [--test-seed 42] \\
-        [--test-limit 64]              # mutex with --test-fraction; smoke only
+        [--eval-splits test train] \\        # default: just test
+        [--test-fraction 0.5] \\             # random subset of test set
+        [--test-limit 64] \\                 # mutex with --test-fraction; smoke only
+        [--train-fraction 0.1] \\            # random subset of train set
+        [--train-limit 64] \\                # mutex with --train-fraction; smoke only
+        [--subset-seed 42] \\
         [--dtype complex64|complex128] \\
         [--output-name <name>]
 
@@ -57,14 +61,25 @@ parser.add_argument("--checkpoint", type=str, required=True,
 parser.add_argument("--cutoffs", type=int, nargs="+", default=[6, 8, 10, 12],
                     help="list of cutoff_dim values to evaluate at")
 parser.add_argument("--batch-size", type=int, default=64)
+parser.add_argument("--eval-splits", type=str, nargs="+",
+                    default=["test"], choices=["train", "test"],
+                    help="which dataset splits to evaluate on; supply both to "
+                         "compare train vs test at each cutoff (default: test only)")
 parser.add_argument("--test-fraction", type=float, default=None,
                     help="random subset of test set (0 < x <= 1). "
                          "Mutually exclusive with --test-limit.")
-parser.add_argument("--test-seed", type=int, default=42,
-                    help="seed for the --test-fraction random subset")
 parser.add_argument("--test-limit", type=int, default=None,
                     help="take first N test samples (deterministic, "
                          "smoke-test only). Mutually exclusive with --test-fraction.")
+parser.add_argument("--train-fraction", type=float, default=None,
+                    help="random subset of train set (0 < x <= 1). "
+                         "Mutually exclusive with --train-limit.")
+parser.add_argument("--train-limit", type=int, default=None,
+                    help="take first N train samples (deterministic, "
+                         "smoke-test only). Mutually exclusive with --train-fraction.")
+parser.add_argument("--subset-seed", type=int, default=42,
+                    help="seed for the --train-fraction / --test-fraction random subsets "
+                         "(applied independently to each split via dedicated generators)")
 parser.add_argument("--dtype", type=str, default=None,
                     choices=["complex64", "complex128"],
                     help="override the quantum dtype (default: match training)")
@@ -72,10 +87,17 @@ parser.add_argument("--output-name", type=str, default=None,
                     help="override eval folder name (default: cutoff_sweep_<timestamp>)")
 args = parser.parse_args()
 
+# de-dup while preserving order (argparse allows repeated values with nargs="+")
+args.eval_splits = list(dict.fromkeys(args.eval_splits))
+
 if args.test_fraction is not None and args.test_limit is not None:
     parser.error("--test-fraction and --test-limit are mutually exclusive")
 if args.test_fraction is not None and not (0.0 < args.test_fraction <= 1.0):
     parser.error("--test-fraction must be in (0, 1]")
+if args.train_fraction is not None and args.train_limit is not None:
+    parser.error("--train-fraction and --train-limit are mutually exclusive")
+if args.train_fraction is not None and not (0.0 < args.train_fraction <= 1.0):
+    parser.error("--train-fraction must be in (0, 1]")
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +172,7 @@ print(f"Checkpoint:        {ckpt_path}")
 print(f"Run directory:     {run_dir}")
 print(f"Training cutoff:   {training_cutoff}")
 print(f"Sweep cutoffs:     {args.cutoffs}")
+print(f"Eval splits:       {args.eval_splits}")
 print(f"Eval output dir:   {eval_dir}\n")
 
 
@@ -167,29 +190,57 @@ print(f"Using device: {device}\n")
 
 
 # ---------------------------------------------------------------------------
-# Test loader (selected once, reused across cutoffs for an apples-to-apples
-# comparison)
+# Per-split loaders (selected once, reused across cutoffs for an apples-to-
+# apples comparison)
 # ---------------------------------------------------------------------------
 
-test_ds_full = PatchedDataset(config.data, train=False)
+def _build_split_loader(split: str, fraction: float | None,
+                        limit: int | None) -> tuple[DataLoader, int, int]:
+    """Build a (DataLoader, subset_size, full_size) for `split`.
 
-if args.test_limit is not None:
-    indices = list(range(min(args.test_limit, len(test_ds_full))))
-    test_ds = Subset(test_ds_full, indices=indices)
-    print(f"Test subset:       first {len(test_ds):,} samples (--test-limit)")
-elif args.test_fraction is not None and args.test_fraction < 1.0:
-    n = int(args.test_fraction * len(test_ds_full))
-    g = torch.Generator().manual_seed(args.test_seed)
-    perm = torch.randperm(len(test_ds_full), generator=g)[:n].tolist()
-    test_ds = Subset(test_ds_full, indices=perm)
-    print(f"Test subset:       random {len(test_ds):,} / {len(test_ds_full):,} "
-          f"samples (--test-fraction {args.test_fraction}, seed {args.test_seed})")
-else:
-    test_ds = test_ds_full
-    print(f"Test set:          full {len(test_ds):,} samples")
+    Honours `--{split}-fraction` / `--{split}-limit`; both random subset
+    selections use a local `torch.Generator` seeded with `--subset-seed`, so
+    runs with the same seed are reproducible and do not perturb global RNG.
+    """
+    is_train = split == "train"
+    ds_full = PatchedDataset(config.data, train=is_train)
+    label = split.capitalize()
 
-test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
-print(f"Test batches:      {len(test_loader)}\n")
+    if limit is not None:
+        indices = list(range(min(limit, len(ds_full))))
+        ds = Subset(ds_full, indices=indices)
+        print(f"{label} subset:       first {len(ds):,} samples (--{split}-limit)")
+    elif fraction is not None and fraction < 1.0:
+        n = int(fraction * len(ds_full))
+        g = torch.Generator().manual_seed(args.subset_seed)
+        perm = torch.randperm(len(ds_full), generator=g)[:n].tolist()
+        ds = Subset(ds_full, indices=perm)
+        print(f"{label} subset:       random {len(ds):,} / {len(ds_full):,} "
+              f"samples (--{split}-fraction {fraction}, subset-seed {args.subset_seed})")
+    else:
+        ds = ds_full
+        print(f"{label} set:          full {len(ds):,} samples")
+
+    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False)
+    print(f"{label} batches:      {len(loader)}")
+    return loader, len(ds), len(ds_full)
+
+
+loaders: dict[str, DataLoader] = {}
+split_sizes: dict[str, int] = {}
+split_full_sizes: dict[str, int] = {}
+
+# Build in a stable order so the printed log is deterministic.
+for split in ("train", "test"):
+    if split not in args.eval_splits:
+        continue
+    fraction = args.train_fraction if split == "train" else args.test_fraction
+    limit    = args.train_limit    if split == "train" else args.test_limit
+    loader, n, n_full = _build_split_loader(split, fraction, limit)
+    loaders[split] = loader
+    split_sizes[split] = n
+    split_full_sizes[split] = n_full
+    print()
 
 
 # ---------------------------------------------------------------------------
@@ -205,9 +256,14 @@ state_dict = ckpt["model_state_dict"]
 # ---------------------------------------------------------------------------
 
 
+_param_table_printed = False
+
+
 @torch.no_grad()
-def evaluate_at_cutoff(D_new: int) -> dict:
-    """Build a fresh model at cutoff_dim=D_new, load weights, evaluate."""
+def evaluate_at_cutoff(D_new: int, split: str, loader: DataLoader) -> dict:
+    """Build a fresh model at cutoff_dim=D_new, load weights, evaluate `split`."""
+    global _param_table_printed
+
     quantum_cfg_eval = replace(quantum_cfg_base, cutoff_dim=D_new)
     cfg_eval = replace(config, quantum=quantum_cfg_eval)
 
@@ -221,12 +277,13 @@ def evaluate_at_cutoff(D_new: int) -> dict:
         f"missing={missing}, unexpected={unexpected}"
     )
 
-    if D_new == args.cutoffs[0]:
-        # One-time parameter sanity check at the first cutoff
+    if not _param_table_printed:
+        # One-time parameter sanity check on the very first (split, cutoff)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             print_parameter_table(model)
         print(buf.getvalue())
+        _param_table_printed = True
 
     model.eval()
 
@@ -241,7 +298,9 @@ def evaluate_at_cutoff(D_new: int) -> dict:
     labels_chunks: list[torch.Tensor] = []
 
     t0 = time.time()
-    for patches, labels in tqdm(test_loader, desc=f"D={D_new:>2}", unit="batch", leave=False):
+    for patches, labels in tqdm(
+        loader, desc=f"{split:<5} D={D_new:>2}", unit="batch", leave=False
+    ):
         patches = patches.to(device)
         labels = labels.to(device)
         logits, trunc_loss = model(patches, return_trunc_loss=True)
@@ -261,13 +320,14 @@ def evaluate_at_cutoff(D_new: int) -> dict:
     labels_all = torch.cat(labels_chunks, dim=0)
     torch.save(
         {"logits": logits_all, "labels": labels_all,
-         "cutoff_dim": D_new, "test_set_size": total},
-        eval_dir / f"logits_D{D_new:02d}.pt",
+         "cutoff_dim": D_new, "split": split, "set_size": total},
+        eval_dir / f"logits_{split}_D{D_new:02d}.pt",
     )
 
     return {
+        "split":        split,
         "cutoff_dim":   D_new,
-        "test_acc":     correct / total,
+        "acc":          correct / total,
         "ce_loss":      ce_sum / total,
         "trunc_loss":   trunc_sum / total,
         "elapsed_sec":  elapsed,
@@ -276,19 +336,21 @@ def evaluate_at_cutoff(D_new: int) -> dict:
     }
 
 
-print(f"{'Cutoff':<8} {'Test acc':<10} {'CE loss':<10} {'Trunc loss':<12} "
+print(f"{'Split':<7} {'Cutoff':<8} {'Acc':<10} {'CE loss':<10} {'Trunc loss':<12} "
       f"{'Elapsed':<10} {'Peak mem':<10}")
-print("─" * 64)
+print("─" * 72)
 
 per_cutoff: list[dict] = []
-for D_new in args.cutoffs:
-    res = evaluate_at_cutoff(D_new)
-    per_cutoff.append(res)
-    mem_str = (f"{res['peak_mem_mb']:.0f} MB"
-               if res["peak_mem_mb"] is not None else "n/a")
-    print(f"{res['cutoff_dim']:<8} {res['test_acc']:<10.4f} "
-          f"{res['ce_loss']:<10.4f} {res['trunc_loss']:<12.4f} "
-          f"{res['elapsed_sec']:<10.1f} {mem_str:<10}")
+for split in args.eval_splits:
+    loader = loaders[split]
+    for D_new in args.cutoffs:
+        res = evaluate_at_cutoff(D_new, split, loader)
+        per_cutoff.append(res)
+        mem_str = (f"{res['peak_mem_mb']:.0f} MB"
+                   if res["peak_mem_mb"] is not None else "n/a")
+        print(f"{res['split']:<7} {res['cutoff_dim']:<8} {res['acc']:<10.4f} "
+              f"{res['ce_loss']:<10.4f} {res['trunc_loss']:<12.4f} "
+              f"{res['elapsed_sec']:<10.1f} {mem_str:<10}")
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +361,8 @@ results_payload = {
     "checkpoint": str(ckpt_path),
     "run_dir": str(run_dir),
     "training_cutoff": training_cutoff,
-    "test_set_size": int(per_cutoff[0]["n_samples"]),
+    "splits": list(args.eval_splits),
+    "split_sizes": split_sizes,
     "per_cutoff": per_cutoff,
 }
 with open(eval_dir / "results.json", "w") as f:
@@ -308,7 +371,7 @@ with open(eval_dir / "results.json", "w") as f:
 with open(eval_dir / "results.csv", "w", newline="") as f:
     writer = csv.DictWriter(
         f,
-        fieldnames=["cutoff_dim", "test_acc", "ce_loss", "trunc_loss",
+        fieldnames=["split", "cutoff_dim", "acc", "ce_loss", "trunc_loss",
                     "elapsed_sec", "peak_mem_mb", "n_samples"],
     )
     writer.writeheader()
@@ -319,9 +382,14 @@ meta = {
     "run_dir": str(run_dir),
     "training_cutoff": training_cutoff,
     "sweep_cutoffs": list(args.cutoffs),
+    "eval_splits": list(args.eval_splits),
     "test_fraction": args.test_fraction,
-    "test_seed": args.test_seed,
     "test_limit": args.test_limit,
+    "train_fraction": args.train_fraction,
+    "train_limit": args.train_limit,
+    "subset_seed": args.subset_seed,
+    "split_sizes": split_sizes,
+    "split_full_sizes": split_full_sizes,
     "dtype": quantum_cfg_base.dtype,
     "device": str(device),
     "batch_size": args.batch_size,
@@ -341,12 +409,21 @@ with open(eval_dir / "meta.json", "w") as f:
 # ---------------------------------------------------------------------------
 
 
+_SPLIT_STYLE = {
+    "test":  {"color": "tab:blue",   "marker": "o"},
+    "train": {"color": "tab:orange", "marker": "s"},
+}
+
+
 def _plot(metric: str, ylabel: str, title: str, fname: str,
           log_y: bool = False) -> None:
-    xs = [r["cutoff_dim"] for r in per_cutoff]
-    ys = [r[metric] for r in per_cutoff]
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    ax.plot(xs, ys, marker="o", lw=1.8)
+    for split in args.eval_splits:
+        rows = [r for r in per_cutoff if r["split"] == split]
+        xs = [r["cutoff_dim"] for r in rows]
+        ys = [r[metric] for r in rows]
+        style = _SPLIT_STYLE.get(split, {})
+        ax.plot(xs, ys, lw=1.8, label=split, **style)
     ax.axvline(training_cutoff, color="gray", ls="--", alpha=0.6,
                label=f"training D={training_cutoff}")
     if log_y:
@@ -361,7 +438,7 @@ def _plot(metric: str, ylabel: str, title: str, fname: str,
     plt.close(fig)
 
 
-_plot("test_acc",   "Test accuracy",   "Test accuracy vs cutoff_dim",
+_plot("acc",        "Accuracy",        "Accuracy vs cutoff_dim",
       "acc_vs_cutoff.png")
 _plot("trunc_loss", "Mean truncation loss",
       "Truncation loss vs cutoff_dim", "trunc_loss_vs_cutoff.png")
@@ -376,9 +453,9 @@ _plot("elapsed_sec", "Elapsed (s)",
 # Summary
 # ---------------------------------------------------------------------------
 
-print(f"\nEval directory:   {eval_dir}/")
-print(f"  results.json    (per-cutoff metrics)")
-print(f"  results.csv     (same data, pandas-friendly)")
-print(f"  meta.json       (sweep configuration)")
-print(f"  logits_D*.pt    (per-cutoff logits + labels for offline analysis)")
-print(f"  figures/        (4 PNGs: acc, trunc_loss, ce_loss, elapsed)")
+print(f"\nEval directory:        {eval_dir}/")
+print(f"  results.json         (per-(split, cutoff) metrics)")
+print(f"  results.csv          (same data, pandas-friendly)")
+print(f"  meta.json            (sweep configuration)")
+print(f"  logits_<split>_D*.pt (per-(split, cutoff) logits + labels for offline analysis)")
+print(f"  figures/             (4 PNGs: acc, trunc_loss, ce_loss, elapsed)")
