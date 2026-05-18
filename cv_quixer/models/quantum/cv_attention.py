@@ -49,13 +49,9 @@ from cv_quixer.quantum import (
 # ---------------------------------------------------------------------------
 
 
-def _readout_dim_per_mode(readout_observable: str, cutoff_dim: int) -> int:
-    """Decoder-input contribution from one mode under the chosen readout.
-
-    * ``"quadrature_x"`` / ``"photon_number"`` — 1 scalar per mode.
-    * ``"pnr_distribution"`` — ``cutoff_dim`` probabilities per mode.
-    """
-    return cutoff_dim if readout_observable == "pnr_distribution" else 1
+def _readout_total_dim(observable_plan: list) -> int:
+    """Per-head readout width = number of scalars in the normalised plan."""
+    return len(observable_plan)
 
 
 def _gate_param_count(num_modes: int, bs_topology: str) -> int:
@@ -329,7 +325,7 @@ class HyperCVAttentionHead(nn.Module):
         super().__init__()
         self.num_modes = config.num_modes
         self.cutoff_dim = config.cutoff_dim
-        self.readout_observable = config.readout_observable
+        self._observable_plan = config._observable_plan
         self.torch_dtype = (
             torch.complex128 if config.dtype == "complex128" else torch.complex64
         )
@@ -533,12 +529,9 @@ class HyperCVAttentionHead(nn.Module):
                          this head. Defaults to vacuum |0,...,0⟩.
 
         Returns:
-            readout:        Real tensor measured on the renormalised post-selected
-                            state. Shape depends on ``config.readout_observable``:
-                              * ``"quadrature_x"``     → (num_modes,) — ⟨x̂_i⟩
-                              * ``"photon_number"``    → (num_modes,) — ⟨n̂_i⟩
-                              * ``"pnr_distribution"`` → (num_modes × cutoff_dim,) —
-                                P(n_i = k) flattened over (mode, k).
+            readout:        Real tensor of shape ``(len(config._observable_plan),)``
+                            — one scalar per entry in the expanded observable plan,
+                            measured on the renormalised post-selected state.
             output_state:   Tensor — renormalised post-selected output state data.
             success_prob:   Scalar tensor — ‖P(M)|ψ_in⟩‖² (post-selection
                             probability; 1.0 for a unitary P(M)).
@@ -581,28 +574,29 @@ class HyperCVAttentionHead(nn.Module):
         # 5. Wrap as FockState
         output_state = FockState(out_norm.reshape((D,) * n), n, D)
 
-        # 6. Measure chosen observable; move result back to classical device for decoder
-        if self.readout_observable == "quadrature_x":
-            readout = torch.stack([
-                self.circuit.measure_quadrature_x(i, output_state)
-                for i in range(n)
-            ])
-        elif self.readout_observable == "photon_number":
-            readout = torch.stack([
-                self.circuit.measure_photon_number(i, output_state)
-                for i in range(n)
-            ])
-        elif self.readout_observable == "pnr_distribution":
-            probs = torch.stack([
-                self.circuit.measure_pnr_distribution(i, output_state)
-                for i in range(n)
-            ])                                    # (num_modes, cutoff_dim)
-            readout = probs.reshape(-1)           # (num_modes * cutoff_dim,)
-        else:
-            raise ValueError(
-                f"Unknown readout_observable {self.readout_observable!r}"
-            )
-        readout = readout.to(classical_device)
+        # 6. Measure observable plan in order; move result back to classical device for decoder.
+        # Plan order is the source of truth for the readout vector layout —
+        # legacy alias translation preserves the pre-refactor ordering so
+        # checkpoints remain bit-compatible.
+        readout_values: list[torch.Tensor] = []
+        for spec in self._observable_plan:
+            if spec.type == "x":
+                readout_values.append(self.circuit.measure_quadrature_x(spec.mode, output_state))
+            elif spec.type == "p":
+                readout_values.append(self.circuit.measure_quadrature_p(spec.mode, output_state))
+            elif spec.type == "x_squared":
+                readout_values.append(self.circuit.measure_quadrature_x_squared(spec.mode, output_state))
+            elif spec.type == "p_squared":
+                readout_values.append(self.circuit.measure_quadrature_p_squared(spec.mode, output_state))
+            elif spec.type == "n":
+                readout_values.append(self.circuit.measure_photon_number(spec.mode, output_state))
+            elif spec.type == "prob_n":
+                readout_values.append(
+                    self.circuit.measure_prob_n_photons(spec.mode, spec.n, output_state)
+                )
+            else:
+                raise ValueError(f"Unknown observable type {spec.type!r}")
+        readout = torch.stack(readout_values).to(classical_device)
         return readout, output_state.data, success_prob, avg_trunc_loss
 
 
@@ -632,10 +626,8 @@ class HyperCVAttention(nn.Module):
         self.num_heads = config.num_heads
         self.num_modes = config.num_modes
         self.cutoff_dim = config.cutoff_dim
-        self.readout_observable = config.readout_observable
-        self.readout_dim_per_mode = _readout_dim_per_mode(
-            config.readout_observable, config.cutoff_dim
-        )
+        self._observable_plan = config._observable_plan
+        self.readout_total_dim = _readout_total_dim(config._observable_plan)
 
         self.heads = nn.ModuleList([
             HyperCVAttentionHead(patch_size, num_patches, config)
@@ -655,9 +647,7 @@ class HyperCVAttention(nn.Module):
 
         Returns:
             readouts:      Float tensor of shape
-                           (B, num_heads × num_modes × readout_dim_per_mode).
-                           readout_dim_per_mode is 1 for ⟨x̂⟩ / ⟨n̂⟩ and equals
-                           cutoff_dim for "pnr_distribution".
+                           (B, num_heads × len(config._observable_plan)).
             states:        list[Tensor] — one (B, D, ..., D) state tensor per head.
             success_probs: list[Tensor] — one (B,) success probability tensor per head.
             trunc_loss:    Scalar — mean per-patch truncation loss across all heads

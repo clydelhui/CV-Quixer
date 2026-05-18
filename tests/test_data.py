@@ -8,6 +8,21 @@ from cv_quixer.data.transforms import extract_patches
 from cv_quixer.data.mnist import PatchedDataset, get_dataloaders
 
 
+@pytest.fixture(scope="session")
+def fashionmnist_cache():
+    """Persistent FashionMNIST download cache shared across test runs.
+
+    Without it, every test re-downloaded FashionMNIST from scratch (~80s per
+    test). A session-scoped tmp_path_factory dir collapses 6 downloads into 1
+    per run; a persistent path under tests/.cache further collapses across
+    runs so the first run pays 80s and every later run pays nothing.
+    """
+    import pathlib
+    cache_dir = pathlib.Path(__file__).parent / ".cache" / "fashionmnist"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return str(cache_dir)
+
+
 class TestExtractPatches:
     def test_output_shape(self):
         # 28x28 image, patch_size=4 → 49 patches of dim 16
@@ -29,8 +44,10 @@ class TestExtractPatches:
 
 class TestPatchedDataset:
     @pytest.fixture
-    def config(self, tmp_path):
-        return DataConfig(dataset="fashionmnist", patch_size=4, data_root=str(tmp_path))
+    def config(self, fashionmnist_cache):
+        return DataConfig(
+            dataset="fashionmnist", patch_size=4, data_root=fashionmnist_cache
+        )
 
     def test_item_shapes(self, config):
         dataset = PatchedDataset(config, train=True)
@@ -47,13 +64,17 @@ class TestPatchedDataset:
         assert len(dataset) == 10_000
 
     def test_unknown_dataset_raises(self, tmp_path):
+        # Uses tmp_path because this test errors before any download — no
+        # benefit from sharing the FashionMNIST cache.
         config = DataConfig(dataset="imagenet", data_root=str(tmp_path))
         with pytest.raises(ValueError, match="Unknown dataset"):
             PatchedDataset(config, train=True)
 
-    def test_normalize_false_range(self, tmp_path):
-        config = DataConfig(dataset="fashionmnist", normalize=False,
-                            patch_size=4, data_root=str(tmp_path))
+    def test_normalize_false_range(self, fashionmnist_cache):
+        config = DataConfig(
+            dataset="fashionmnist", normalize=False,
+            patch_size=4, data_root=fashionmnist_cache,
+        )
         dataset = PatchedDataset(config, train=True)
         patches, _ = dataset[0]
         assert patches.min() >= 0.0
@@ -67,9 +88,11 @@ class TestPatchedDataset:
 
 
 class TestGetDataloaders:
-    def test_batch_shapes(self, tmp_path):
-        config = DataConfig(dataset="fashionmnist", patch_size=4,
-                            batch_size=8, data_root=str(tmp_path))
+    def test_batch_shapes(self, fashionmnist_cache):
+        config = DataConfig(
+            dataset="fashionmnist", patch_size=4,
+            batch_size=8, data_root=fashionmnist_cache,
+        )
         train_loader, test_loader = get_dataloaders(config)
         patches, labels = next(iter(train_loader))
         assert patches.shape == (8, 49, 16)

@@ -9,7 +9,7 @@ import torch
 import pytest
 from unittest.mock import MagicMock
 
-from cv_quixer.config.schema import DataConfig, QuantumConfig
+from cv_quixer.config.schema import QuantumConfig
 from cv_quixer.models.base import BaseVisionTransformer
 from cv_quixer.models.quantum.cv_attention import (
     HyperCVAttentionHead,
@@ -26,7 +26,7 @@ from cv_quixer.quantum import CVCircuit, FockState
 from cv_quixer.utils.params import count_parameters
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def small_quantum_config():
     return QuantumConfig(
         num_modes=2,
@@ -43,9 +43,7 @@ def small_quantum_config():
     )
 
 
-@pytest.fixture
-def data_config():
-    return DataConfig(image_size=28, patch_size=7, num_classes=10)
+# data_config is provided by tests/conftest.py (session scope).
 
 
 class TestDisplacementEncoding:
@@ -261,7 +259,7 @@ class TestParamCountConsistency:
             small_quantum_config.cnn_kernel_size,
             small_quantum_config.decoder_hidden_dim, data_config.num_classes,
             small_quantum_config.bs_topology, small_quantum_config.poly_degree,
-            small_quantum_config.readout_observable, small_quantum_config.cutoff_dim,
+            small_quantum_config._observable_plan,
         )
         assert actual == expected
 
@@ -291,7 +289,7 @@ class TestParamCountConsistency:
             config.cnn_kernel_size,
             config.decoder_hidden_dim, data_config.num_classes,
             config.bs_topology, config.poly_degree,
-            config.readout_observable, config.cutoff_dim,
+            config._observable_plan,
         )
         assert actual == expected
 
@@ -307,21 +305,21 @@ class TestCVQuixer:
         model = CVQuixer(small_quantum_config, data_config)
         assert model.get_num_parameters() > 0
 
-    def test_forward_shape(self, small_quantum_config, data_config):
+    def test_forward_shape(self, small_quantum_config, tiny_data_config):
         """Forward pass produces correct output shape (batch × num_classes)."""
         from cv_quixer.models.quantum.cv_quixer import CVQuixer
-        model = CVQuixer(small_quantum_config, data_config)
-        patch_dim = data_config.patch_size ** 2
-        num_patches = (data_config.image_size // data_config.patch_size) ** 2
+        model = CVQuixer(small_quantum_config, tiny_data_config)
+        patch_dim = tiny_data_config.patch_size ** 2
+        num_patches = (tiny_data_config.image_size // tiny_data_config.patch_size) ** 2
         patches = torch.randn(1, num_patches, patch_dim)
         logits = model(patches)
-        assert logits.shape == (1, data_config.num_classes)
+        assert logits.shape == (1, tiny_data_config.num_classes)
 
-    def test_no_nan_output(self, small_quantum_config, data_config):
+    def test_no_nan_output(self, small_quantum_config, tiny_data_config):
         from cv_quixer.models.quantum.cv_quixer import CVQuixer
-        model = CVQuixer(small_quantum_config, data_config)
-        patch_dim = data_config.patch_size ** 2
-        num_patches = (data_config.image_size // data_config.patch_size) ** 2
+        model = CVQuixer(small_quantum_config, tiny_data_config)
+        patch_dim = tiny_data_config.patch_size ** 2
+        num_patches = (tiny_data_config.image_size // tiny_data_config.patch_size) ** 2
         patches = torch.randn(1, num_patches, patch_dim)
         logits = model(patches)
         assert not torch.isnan(logits).any(), "NaN detected — check Fock cutoff_dim"
@@ -344,43 +342,47 @@ class TestReadoutObservable:
             readout_observable=readout,
         )
 
-    def test_default_readout_is_quadrature_x(self, small_quantum_config, data_config):
-        """Omitting readout_observable leaves the decoder shape unchanged."""
-        assert small_quantum_config.readout_observable == "quadrature_x"
-        model = CVQuixer(small_quantum_config, data_config)
+    def test_default_readout_is_quadrature_x(self, small_quantum_config, tiny_data_config):
+        """Omitting readout_observable / readout_observables yields x-per-mode."""
+        assert small_quantum_config.readout_observable is None
+        assert small_quantum_config.readout_observables is None
+        plan = small_quantum_config._observable_plan
+        assert len(plan) == small_quantum_config.num_modes
+        assert all(entry.type == "x" for entry in plan)
+        model = CVQuixer(small_quantum_config, tiny_data_config)
         first_linear = model.decoder.net[0]
         assert first_linear.in_features == (
             small_quantum_config.num_heads * small_quantum_config.num_modes
         )
 
-    def test_photon_number_forward_shape(self, data_config):
+    def test_photon_number_forward_shape(self, tiny_data_config):
         config = self._config("photon_number")
-        model = CVQuixer(config, data_config)
+        model = CVQuixer(config, tiny_data_config)
         first_linear = model.decoder.net[0]
         assert first_linear.in_features == config.num_heads * config.num_modes
 
-        patch_dim = data_config.patch_size ** 2
-        num_patches = (data_config.image_size // data_config.patch_size) ** 2
+        patch_dim = tiny_data_config.patch_size ** 2
+        num_patches = (tiny_data_config.image_size // tiny_data_config.patch_size) ** 2
         patches = torch.randn(2, num_patches, patch_dim)
         logits = model(patches)
-        assert logits.shape == (2, data_config.num_classes)
+        assert logits.shape == (2, tiny_data_config.num_classes)
         assert torch.isfinite(logits).all()
 
-    def test_pnr_distribution_decoder_dim_and_forward(self, data_config):
+    def test_pnr_distribution_decoder_dim_and_forward(self, tiny_data_config):
         config = self._config("pnr_distribution")
-        model = CVQuixer(config, data_config)
+        model = CVQuixer(config, tiny_data_config)
         first_linear = model.decoder.net[0]
         expected_in = config.num_heads * config.num_modes * config.cutoff_dim
         assert first_linear.in_features == expected_in
 
-        patch_dim = data_config.patch_size ** 2
-        num_patches = (data_config.image_size // data_config.patch_size) ** 2
+        patch_dim = tiny_data_config.patch_size ** 2
+        num_patches = (tiny_data_config.image_size // tiny_data_config.patch_size) ** 2
         patches = torch.randn(2, num_patches, patch_dim)
         logits = model(patches)
-        assert logits.shape == (2, data_config.num_classes)
+        assert logits.shape == (2, tiny_data_config.num_classes)
         assert torch.isfinite(logits).all()
 
-    def test_pnr_distribution_gradient_flows_to_hypernetwork(self, data_config):
+    def test_pnr_distribution_gradient_flows_to_hypernetwork(self, tiny_data_config):
         """A backward pass through the PNR readout must reach CNN params.
 
         The default PolynomialCoefficients init is [1, 0, 0…], which collapses
@@ -388,13 +390,13 @@ class TestReadoutObservable:
         the data-dependent branch we set c_1 = 0.5 on every head before forward.
         """
         config = self._config("pnr_distribution")
-        model = CVQuixer(config, data_config)
+        model = CVQuixer(config, tiny_data_config)
         with torch.no_grad():
             for head in model.cv_attention.heads:
                 head.poly_coeffs.c.data[1] = 0.5
 
-        patch_dim = data_config.patch_size ** 2
-        num_patches = (data_config.image_size // data_config.patch_size) ** 2
+        patch_dim = tiny_data_config.patch_size ** 2
+        num_patches = (tiny_data_config.image_size // tiny_data_config.patch_size) ** 2
         patches = torch.randn(2, num_patches, patch_dim)
         logits = model(patches)
         loss = logits.sum()

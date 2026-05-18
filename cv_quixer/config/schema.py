@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from typing import NamedTuple, Optional, Union
 
 
 @dataclass
@@ -11,6 +12,113 @@ class DataConfig:
     batch_size: int = 64
     num_workers: int = 2
     data_root: str = "data/"
+
+
+_VALID_OBSERVABLE_TYPES = {"x", "p", "x_squared", "p_squared", "n", "prob_n"}
+_LEGACY_READOUT_VALUES = {"quadrature_x", "photon_number", "pnr_distribution"}
+
+
+@dataclass
+class ObservableSpec:
+    """User-facing observable specification.
+
+    Attributes:
+        type: One of "x", "p", "x_squared", "p_squared", "n", "prob_n".
+        mode: Mode index (int), list of mode indices, or "all" for every mode.
+        n:    Required iff type == "prob_n". Single int or list of ints in
+              [0, cutoff_dim). Forbidden for other types.
+    """
+
+    type: str
+    mode: Union[int, str, list[int]] = "all"
+    n: Optional[Union[int, list[int]]] = None
+
+
+class _EvalSpec(NamedTuple):
+    """Normalised single-scalar observable evaluation entry."""
+
+    type: str
+    mode: int
+    n: Optional[int]
+
+
+def _expand_observable_specs(
+    specs: list[ObservableSpec], num_modes: int, cutoff_dim: int
+) -> list[_EvalSpec]:
+    """Expand user specs into a flat ordered list of single-scalar evaluations.
+
+    Order: outer = spec list position, middle = mode index, inner = n index
+    (for prob_n only). This order is the source of truth for the readout
+    vector and for decoder input dimension.
+    """
+    plan: list[_EvalSpec] = []
+    for spec in specs:
+        if spec.type not in _VALID_OBSERVABLE_TYPES:
+            raise ValueError(
+                f"Unknown observable type {spec.type!r}; "
+                f"valid: {sorted(_VALID_OBSERVABLE_TYPES)}"
+            )
+
+        if isinstance(spec.mode, str):
+            if spec.mode != "all":
+                raise ValueError(
+                    f"observable mode string must be 'all', got {spec.mode!r}"
+                )
+            mode_list = list(range(num_modes))
+        elif isinstance(spec.mode, bool):
+            raise ValueError(f"observable mode must not be bool, got {spec.mode!r}")
+        elif isinstance(spec.mode, int):
+            mode_list = [spec.mode]
+        elif isinstance(spec.mode, list):
+            mode_list = list(spec.mode)
+        else:
+            raise ValueError(
+                f"observable mode must be int, list[int], or 'all'; got {spec.mode!r}"
+            )
+
+        for m in mode_list:
+            if isinstance(m, bool) or not isinstance(m, int):
+                raise ValueError(f"observable mode entries must be int, got {m!r}")
+            if not (0 <= m < num_modes):
+                raise ValueError(
+                    f"observable mode {m} out of range [0, {num_modes})"
+                )
+
+        if spec.type == "prob_n":
+            if spec.n is None:
+                raise ValueError(
+                    "observable type 'prob_n' requires 'n' to be specified"
+                )
+            if isinstance(spec.n, bool):
+                raise ValueError(f"observable n must not be bool, got {spec.n!r}")
+            if isinstance(spec.n, int):
+                n_list = [spec.n]
+            elif isinstance(spec.n, list):
+                n_list = list(spec.n)
+            else:
+                raise ValueError(
+                    f"observable n must be int or list[int], got {spec.n!r}"
+                )
+            for nv in n_list:
+                if isinstance(nv, bool) or not isinstance(nv, int):
+                    raise ValueError(
+                        f"observable n entries must be int, got {nv!r}"
+                    )
+                if not (0 <= nv < cutoff_dim):
+                    raise ValueError(
+                        f"observable n={nv} out of range [0, {cutoff_dim})"
+                    )
+            for m in mode_list:
+                for nv in n_list:
+                    plan.append(_EvalSpec(type="prob_n", mode=m, n=nv))
+        else:
+            if spec.n is not None:
+                raise ValueError(
+                    f"observable type {spec.type!r} must not specify 'n'"
+                )
+            for m in mode_list:
+                plan.append(_EvalSpec(type=spec.type, mode=m, n=None))
+    return plan
 
 
 @dataclass
@@ -43,19 +151,57 @@ class QuantumConfig:
     trunc_penalty: str = "none"   # "none" | "norm" | "photon_number"
     trunc_lambda: float = 0.01
 
-    # Quantum-circuit readout used as input to the classical decoder.
+    # Legacy single-string readout selector. Kept for backward compatibility
+    # (existing YAMLs, saved configs, trained checkpoints). Translated to the
+    # canonical list at __post_init__ time.
     #   "quadrature_x"     — 〈x̂〉 per mode                       (num_modes scalars)
     #   "photon_number"    — 〈n̂〉 per mode                       (num_modes scalars)
     #   "pnr_distribution" — P(n_mode=k) for k=0..cutoff_dim-1   (num_modes × cutoff_dim values)
-    readout_observable: str = "quadrature_x"
+    readout_observable: Optional[str] = None
+
+    # Canonical observable list. Mutually exclusive with readout_observable.
+    # If both are None, defaults to a single ⟨x̂⟩-per-mode entry.
+    readout_observables: Optional[list[ObservableSpec]] = None
 
     def __post_init__(self) -> None:
-        valid_readouts = {"quadrature_x", "photon_number", "pnr_distribution"}
-        if self.readout_observable not in valid_readouts:
+        if (
+            self.readout_observable is not None
+            and self.readout_observables is not None
+        ):
             raise ValueError(
-                f"readout_observable must be one of {sorted(valid_readouts)}, "
+                "Set either readout_observable (legacy string) or "
+                "readout_observables (new list), not both."
+            )
+        if (
+            self.readout_observable is not None
+            and self.readout_observable not in _LEGACY_READOUT_VALUES
+        ):
+            raise ValueError(
+                f"readout_observable must be one of "
+                f"{sorted(_LEGACY_READOUT_VALUES)}, "
                 f"got {self.readout_observable!r}"
             )
+
+        if self.readout_observables is not None:
+            specs = self.readout_observables
+        elif self.readout_observable == "quadrature_x":
+            specs = [ObservableSpec(type="x", mode="all")]
+        elif self.readout_observable == "photon_number":
+            specs = [ObservableSpec(type="n", mode="all")]
+        elif self.readout_observable == "pnr_distribution":
+            specs = [
+                ObservableSpec(
+                    type="prob_n",
+                    mode="all",
+                    n=list(range(self.cutoff_dim)),
+                )
+            ]
+        else:
+            specs = [ObservableSpec(type="x", mode="all")]
+
+        self._observable_plan = _expand_observable_specs(
+            specs, self.num_modes, self.cutoff_dim
+        )
 
 
 @dataclass

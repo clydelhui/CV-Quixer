@@ -32,6 +32,7 @@ mode = "compat"
 dev = [
     "pytest>=9.0.3",
     "pytest-cov>=7.1.0",
+    "pytest-xdist>=3.8.0",
     "ruff>=0.15.10",
     "strawberryfields>=0.23.0",
     "torch>=2.5.0",
@@ -50,3 +51,6 @@ torch = [
 torchvision = [
   { index = "pytorch-cu124", marker = "sys_platform == 'linux'" },
 ]
+
+[tool.pytest.ini_options]
+addopts = "--durations=20 --durations-min=0.5"

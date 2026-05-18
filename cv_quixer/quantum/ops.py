@@ -65,3 +65,15 @@ def quadrature_p_matrix(cutoff_dim: int, dtype: torch.dtype = torch.complex128) 
     a_dag = torch.diag(torch.sqrt(ns[1:]), diagonal=-1).to(dtype)
     a = a_dag.T.conj()
     return 1j * (a_dag - a) / (2.0 ** 0.5)
+
+
+def quadrature_x_squared_matrix(cutoff_dim: int, dtype: torch.dtype = torch.complex128) -> torch.Tensor:
+    """Matrix of x̂² in the Fock basis. ⟨n|x̂²|n⟩ = n + 1/2."""
+    x = quadrature_x_matrix(cutoff_dim, dtype=dtype)
+    return x @ x
+
+
+def quadrature_p_squared_matrix(cutoff_dim: int, dtype: torch.dtype = torch.complex128) -> torch.Tensor:
+    """Matrix of p̂² in the Fock basis. ⟨n|p̂²|n⟩ = n + 1/2."""
+    p = quadrature_p_matrix(cutoff_dim, dtype=dtype)
+    return p @ p

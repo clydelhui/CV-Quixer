@@ -211,3 +211,22 @@ class CVCircuit:
             Real tensor of shape (cutoff_dim,) with non-negative entries.
         """
         return state.photon_number_probabilities(mode)
+
+    def measure_quadrature_x_squared(self, mode: int, state: FockState) -> torch.Tensor:
+        """Compute 〈x̂²〉 for the given mode."""
+        from cv_quixer.quantum.ops import quadrature_x_squared_matrix
+        xx_mat = quadrature_x_squared_matrix(self.cutoff_dim, dtype=state.dtype).to(state.device)
+        rho = state.reduced_density_matrix(mode)
+        return torch.trace(rho @ xx_mat).real
+
+    def measure_quadrature_p_squared(self, mode: int, state: FockState) -> torch.Tensor:
+        """Compute 〈p̂²〉 for the given mode."""
+        from cv_quixer.quantum.ops import quadrature_p_squared_matrix
+        pp_mat = quadrature_p_squared_matrix(self.cutoff_dim, dtype=state.dtype).to(state.device)
+        rho = state.reduced_density_matrix(mode)
+        return torch.trace(rho @ pp_mat).real
+
+    def measure_prob_n_photons(self, mode: int, n: int, state: FockState) -> torch.Tensor:
+        """Compute P(n_mode = n) for a single Fock occupancy in one mode."""
+        rho = state.reduced_density_matrix(mode)
+        return rho.diagonal()[n].real.clamp(min=0.0)
