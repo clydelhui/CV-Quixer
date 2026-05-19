@@ -25,22 +25,60 @@ uv run python experiments/mini_experiment.py
 uv run python experiments/mini_experiment.py \
     --resume results/checkpoints/mini_experiment/checkpoint_epoch_0050.pt
 
-# Full training runs (YAML-driven)
-uv run python experiments/train_quantum.py --config configs/cv_quixer.yaml
-uv run python experiments/train_classical.py --config configs/classical_vit.yaml
+# Full FashionMNIST experiment — same quantum config as mini_experiment but
+# 60k train / 10k test. Default 3 epochs. Self-contained run directory under
+# results/runs/. Use fractions for a local smoke run.
+uv run python experiments/full_experiment.py \
+    --epochs 1 --train-fraction 0.1 --test-fraction 0.1
 
-# Quick ablation without editing YAML
-uv run python experiments/train_quantum.py --config configs/cv_quixer.yaml \
-    --overrides training.lr=5e-4 quantum.num_modes=4
+# Resume a full run (continues writing into the same run directory)
+uv run python experiments/full_experiment.py \
+    --resume results/runs/full_fashionmnist_<ts>/checkpoints/latest.pt
 
-# Compare results after both runs
-uv run python experiments/compare_models.py \
-    --classical results/checkpoints/classical_vit_baseline/history.json \
-    --quantum   results/checkpoints/cv_quixer_baseline/history.json
+# Cutoff-dim sweep — re-evaluate a trained checkpoint at larger Fock cutoffs
+uv run python experiments/eval_cutoff_sweep.py \
+    --checkpoint results/runs/full_fashionmnist_<ts>/checkpoints/final_model.pt \
+    --cutoffs 6 8 10 12
+
+# Post-hoc thesis figures from a completed full_experiment run
+uv run python experiments/report_diagnostics.py \
+    --run-dir results/runs/full_fashionmnist_<ts>/ --epoch best
 
 # Run tests
 uv run pytest tests/
 ```
+
+`report_diagnostics.py` is the primary thesis-figure tool. It runs *after* a
+`full_experiment.py` run, reading that run's saved artefacts (`config.json`,
+`history.json`, `checkpoints/`, `predictions/`, `diagnostics/`) and writing the
+qualitative + quantum-specific figures the training loop deliberately skips.
+Heavy torch/model imports are deferred, so the default path is fast and runs
+without a configured PyTorch backend.
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--run-dir` | (required unless `--multi-run`) | the `results/runs/full_fashionmnist_<ts>/` dir to report on |
+| `--epoch` | `best` | `best` \| `final` \| integer epoch checkpoint to load |
+| `--multi-run` | off | scan sibling `results/runs/full_fashionmnist_*` dirs, emit cross-run `sample_efficiency.png` (no `--run-dir` needed) |
+| `--full-inference` | off | rebuild model from checkpoint + run full test-set inference instead of reading saved npz (slow; for old runs lacking artefacts, or as a cross-check) |
+| `--check-parity` | off | compare saved-file predictions vs a fresh inference pass, print max/mean \|Δ y_probs\| + agreement, then exit |
+
+Figures written into the run's figure dir (each wrapped in try/except — a
+failed figure warns but does not abort the rest; `sanity_checks` runs first):
+
+- *Fast* (history.json / npz only): `confusion_matrix_evolution`,
+  `per_class_metrics_table`, `top_k_accuracy`, `calibration_reliability`,
+  `hypernet_gate_param_histograms`, `photon_number_per_mode`,
+  `state_norm_histogram`, `lcu_coefficients_heatmap`,
+  `polynomial_coefficients_trajectory`.
+- *Slow* (need readouts/test images — from saved npz, or `--full-inference`):
+  `misclassification_gallery`, `embedding_tsne`.
+
+This is complementary to, not a superset of, the figures `full_experiment.py`
+itself re-renders every epoch (loss/accuracy/trunc/per-batch curves, per-class
+accuracy curve, latest-epoch confusion matrix). The only overlap is the
+confusion matrix (latest-epoch in the training loop vs full epoch-by-epoch
+evolution here).
 
 ### SLURM cluster (SoC Compute Cluster)
 
@@ -54,6 +92,29 @@ cat slurm-cv_quixer_mini-<JOBID>.out      # view output
 
 To resume from a checkpoint, edit `run_mini_experiment.sh` and add `--resume <path>`
 to the `mini_experiment.py` invocation at the bottom.
+
+#### Batch jobs
+
+| Script | Job name | Wall | GPU / mem / cpus | Runs |
+|---|---|---|---|---|
+| `run_mini_experiment.sh` | `cv_quixer_mini` | `02:00:00` | `gpu:nv:1` / 16G / 4 | `mini_experiment.py` (200/50, 100 epochs) |
+| `run_full_experiment.sh` | `cv_quixer_full` | `03:00:00` | `gpu:a100-40:1` / 32G / 4 | `full_experiment.py --train-fraction 0.1 --test-fraction 0.1` (3 epochs on a 10% subset; edit the script to resume or change fractions) |
+| `run_eval_cutoff_sweep.sh` | `cv_quixer_eval` | `12:00:00` | `gpu:a100-40:1` / 32G / 4 | `eval_cutoff_sweep.py` — takes a checkpoint as `$1`, extra flags passed through |
+| `triage_cuda.sh` | `cuda_triage` | — | `gpu:nv:1` | CUDA/GPU sanity diagnostics |
+
+```bash
+# Full experiment (edit the script to resume / change fractions)
+sbatch scripts/run_full_experiment.sh
+
+# Cutoff sweep — checkpoint is positional $1, remaining args forwarded
+sbatch scripts/run_eval_cutoff_sweep.sh \
+    results/runs/full_fashionmnist_<ts>/checkpoints/final_model.pt \
+    --test-fraction 0.5 --cutoffs 8 10 12
+```
+
+All cluster scripts reuse the dedicated `$HOME/.venvs/cv-quixer-cuda` venv
+(`run_full_experiment.sh` rebuilds it fresh; `run_eval_cutoff_sweep.sh` reuses
+it) and `cd "$HOME/CV-Quixer"` before running.
 
 #### SLURM job config (`run_mini_experiment.sh`)
 
@@ -116,14 +177,14 @@ cat slurm-cuda_triage-<JOBID>.out   # view triage output
 
 ```
 cv_quixer/
-├── config/         ExperimentConfig dataclasses + YAML loader
+├── config/         schema.py: ExperimentConfig/Quantum/Data/Training dataclasses
+│                   + ObservableSpec. utils.py: load_config() YAML→config (LEGACY,
+│                   see below) and save_config() config→JSON
 ├── data/           MNIST/FashionMNIST download, patch extraction, DataLoader
 ├── models/
 │   ├── base.py         BaseVisionTransformer (shared interface)
 │   ├── classical/      Classical ViT wrapper
 │   └── quantum/        CV quantum model (core thesis contribution)
-│       ├── cv_encoding.py   DisplacementEncoding (legacy, unused in main model)
-│       ├── cv_layers.py     CVLayer stub + interferometer_param_count re-export
 │       ├── cv_attention.py  CNNHypernetwork, LCUSumCoefficients,
 │       │                    PolynomialCoefficients, HyperCVAttentionHead,
 │       │                    HyperCVAttention + truncation loss helpers
@@ -135,30 +196,32 @@ cv_quixer/
 │   ├── gates/
 │   │   ├── gaussian.py      Squeeze, beamsplitter, rotation, displacement
 │   │   └── non_gaussian.py  Kerr (kerr_phases diagonal phases), cubic phase (matrix_exp)
-│   ├── interferometer.py  Clements rectangular beamsplitter mesh
+│   ├── interferometer.py  Clements rectangular beamsplitter mesh +
+│   │                      interferometer_param_count
 │   ├── grad.py         ParameterShiftFunction (torch.autograd.Function, deferred)
-│   └── ops.py          Observable matrices (QuadX, QuadP, number operator)
-├── training/       Model-agnostic Trainer
-├── evaluation/     Metrics + classical vs quantum comparison utilities
-└── utils/          Parameter counting, logging (wandb), seeding, matplotlib
+│   └── ops.py          Observable matrices: number, QuadX, QuadP,
+│                       quadrature_x_squared, quadrature_p_squared
+├── evaluation/     metrics.py only (classical-vs-quantum compare.py removed)
+└── utils/          params (parameter counting), logging (wandb), reproducibility (seeding)
 
 experiments/
-├── mini_experiment.py   200 train / 50 test, 100 epochs, periodic checkpointing
-├── smoke_test.py        Fast forward-pass + gradient check (no MNIST, < 1 min)
-├── train_quantum.py     Full YAML-driven training (quantum)
-├── train_classical.py   Full YAML-driven training (classical ViT)
-├── compare_models.py    Plot classical vs quantum training curves
-└── demo_hybrid.py       Hybrid model demo (no MNIST)
+├── smoke_test.py          Fast forward-pass + gradient check (no MNIST, < 1 min)
+├── mini_experiment.py     200 train / 50 test, 100 epochs, periodic checkpointing
+├── full_experiment.py     60k/10k FashionMNIST, self-contained results/runs/<ts>/ dir
+├── eval_cutoff_sweep.py   Re-evaluate a trained checkpoint at larger Fock cutoffs
+└── report_diagnostics.py  Post-hoc thesis figures from a full_experiment run
 
 scripts/
-├── run_mini_experiment.sh   SLURM batch job for mini_experiment
-├── triage_cuda.sh           SLURM GPU/CUDA diagnostic job
-└── debug_imports.py         Sequential import diagnostics with tracebacks
+├── run_mini_experiment.sh     SLURM batch job for mini_experiment
+├── run_full_experiment.sh     SLURM batch job for full_experiment (A100, 3 h)
+├── run_eval_cutoff_sweep.sh   SLURM batch job for eval_cutoff_sweep (A100, 12 h)
+├── triage_cuda.sh             SLURM GPU/CUDA diagnostic job
+└── debug_imports.py           Sequential import diagnostics with tracebacks
 
-configs/
-├── defaults.yaml            Base defaults for all config dataclasses
-├── cv_quixer.yaml           CV-Quixer baseline (30 epochs, backprop)
-├── classical_vit.yaml       Classical ViT baseline
+configs/                 LEGACY — not loaded by any current experiment script.
+├── defaults.yaml         Kept deliberately (intend to revive YAML-driven runs).
+├── cv_quixer.yaml        Experiment scripts now build ExperimentConfig directly
+├── classical_vit.yaml    in Python; load_config() in config/utils.py is unused.
 └── ablations/
     ├── quixer_fewer_modes.yaml        num_modes=4
     └── quixer_gaussian_backend.yaml   cutoff_dim=6 near-Gaussian regime
@@ -181,22 +244,39 @@ HyperCVAttention  (num_heads independent heads, batched with vmap):
           # = 8m−2 (linear) or 8m (ring), where m = num_modes
         Apply Killoran gate sequence (per mode):
           Squeeze(r, φ) → Beamsplitter mesh(θ, φ) → Rotate(φ) → Displace(α) → Kerr(κ)
-    readout ← [⟨x̂_i⟩ for each mode]                        # (num_modes,)
-  Concatenate heads → (B, num_heads × num_modes)
+    readout ← configurable observables per `readout_observables`     # (R,)
+             # each spec → x | p | x² | p² | n | prob_n on mode(s)
+             # default (no config): ⟨x̂⟩ per mode → R = num_modes
+  Concatenate heads → (B, num_heads × R)
   ↓
-CVDecoder: Linear(num_heads×num_modes → H_d) → ReLU → Linear(H_d → num_classes)
+CVDecoder: Linear(num_heads×R → H_d) → ReLU → Linear(H_d → num_classes)
   ↓
 Logits: (B, num_classes)
 ```
 
+`R` = length of the expanded observable plan (`schema._expand_observable_specs`):
+spec list order → mode order → n order (for `prob_n`). It is `num_modes` only in
+the default ⟨x̂⟩-per-mode case; e.g. a `prob_n` PNR spec over all modes gives
+`R = num_modes × len(n)`. The decoder input dim is derived from this plan, not
+hard-wired to `num_modes`. See `QuantumConfig.readout_observables` /
+`readout_observable` in the config reference below.
+
 ## Key design decisions
 
-- **Shared interface**: Both models inherit `BaseVisionTransformer` — Trainer and
-  evaluation code never import from `models/quantum` or `models/classical` directly.
+- **Shared interface**: Both models inherit `BaseVisionTransformer`. There is no
+  longer a model-agnostic `Trainer` class — each experiment script
+  (`mini_experiment.py`, `full_experiment.py`) owns its own training loop and
+  drives the model only through the `BaseVisionTransformer` interface, never
+  importing from `models/quantum` or `models/classical` directly.
 - **Model factory**: `cv_quixer.models.build_model(config)` is the only place `"quantum"`
   / `"classical"` is resolved to a class.
-- **Config system**: YAML files override Python dataclass defaults via `dacite`.
-  Full resolved config is saved as JSON alongside every checkpoint.
+- **Config system**: Experiment scripts construct the `ExperimentConfig`
+  dataclasses directly in Python (no YAML at runtime). `full_experiment.py`
+  writes the fully resolved config to `config.json` in its run directory;
+  `eval_cutoff_sweep.py` and `report_diagnostics.py` reconstruct
+  `ExperimentConfig` from that saved `config.json` via `dacite`. The
+  `load_config()` YAML loader and `configs/*.yaml` are kept but currently
+  unused (intended for a future revival of YAML-driven runs).
 - **Pure PyTorch simulation**: `cv_quixer/quantum/` is a standalone Fock-basis circuit
   simulator. Gaussian gates (rotation, displacement, squeezing, beamsplitter) use exact
   analytic Fock-basis formulas (true sub-isometries: column norms ≤ 1); only cubic phase
@@ -221,10 +301,11 @@ Logits: (B, num_classes)
 
 | Field | Default | Description |
 |---|---|---|
-| `num_modes` | 8 | Number of bosonic modes |
-| `num_layers` | 4 | Reserved (not yet implemented) |
-| `cutoff_dim` | 10 | Fock space truncation D |
+| `num_modes` | 4 | Number of bosonic modes |
+| `num_layers` | 4 | Reserved — not read until multi-layer stacking is implemented |
+| `cutoff_dim` | 6 | Fock space truncation D |
 | `grad_mode` | `"backprop"` | `"backprop"` or `"parameter_shift"` (PSR deferred) |
+| `param_shift_shift` | 1.5708 | PSR shift `s` (π/2); only used when `grad_mode="parameter_shift"` |
 | `bs_topology` | `"linear"` | Beamsplitter mesh: `"linear"` or `"ring"` |
 | `dtype` | `"complex128"` | `"complex64"` or `"complex128"` |
 | `num_heads` | 4 | Parallel CV attention heads |
@@ -236,12 +317,23 @@ Logits: (B, num_classes)
 | `target_params` | -1 | If > 0, binary-search `cnn_channels_2` to hit this count (±5%) |
 | `trunc_penalty` | `"none"` | `"none"`, `"norm"`, or `"photon_number"` |
 | `trunc_lambda` | 0.01 | Truncation penalty loss weight |
+| `readout_observable` | `None` | Legacy single-string selector: `"quadrature_x"`, `"photon_number"`, or `"pnr_distribution"`. Mutually exclusive with `readout_observables` |
+| `readout_observables` | `None` | Canonical `list[ObservableSpec]`. Mutually exclusive with `readout_observable`. Both `None` → default ⟨x̂⟩ per mode |
+
+`ObservableSpec(type, mode="all", n=None)`: `type` ∈ `{"x","p","x_squared",
+"p_squared","n","prob_n"}`; `mode` is an int, list of ints, or `"all"`; `n` is
+required iff `type=="prob_n"` (int or list of ints in `[0, cutoff_dim)`) and
+forbidden otherwise. The expanded plan order (spec → mode → n) fixes the readout
+vector layout and the decoder input dim. Validated/expanded in
+`QuantumConfig.__post_init__` (raises on invalid combos, e.g. both readout
+fields set, unknown type, out-of-range mode/n).
 
 ### DataConfig
 
 | Field | Default | Description |
 |---|---|---|
 | `dataset` | `"fashionmnist"` | `"fashionmnist"` or `"mnist"` |
+| `normalize` | `True` | Compute & cache dataset mean/std on first load; `False` → `ToTensor` only |
 | `image_size` | 28 | Input image side length |
 | `patch_size` | 4 | Patch side length (must divide `image_size`) |
 | `num_classes` | 10 | Output classes |
@@ -258,6 +350,12 @@ Logits: (B, num_classes)
 | `optimizer` | `"adam"` | `"adam"` or `"sgd"` |
 | `weight_decay` | 1e-4 | L2 regularisation |
 | `seed` | 42 | Random seed |
+| `checkpoint_dir` | `"results/checkpoints/"` | Default checkpoint root |
+| `log_dir` | `"results/logs/"` | Default per-run log root |
+| `log_interval` | 10 | Log every N batches |
+
+Note: `mini_experiment.py` / `full_experiment.py` set their own constants and
+output paths (see below) rather than reading every `TrainingConfig` field.
 
 ### mini_experiment.py constants
 
@@ -269,6 +367,21 @@ Logits: (B, num_classes)
 | `BATCH_SIZE` | 32 | Batch size |
 | `TARGET_PARAMS` | 13,760 | Parameter budget (auto-scales `cnn_channels_2`) |
 | `CHECKPOINT_INTERVAL` | 10 | Save checkpoint every N epochs |
+
+### full_experiment.py constants
+
+Same quantum config as `mini_experiment.py` (num_modes=2, cutoff_dim=6,
+num_heads=4, poly_degree=2, ~13.7k params) but trained on the full 60k/10k
+split. CLI-overridable: `--epochs`, `--train-fraction`, `--test-fraction`,
+`--resume`.
+
+| Constant | Value | Description |
+|---|---|---|
+| `EPOCHS` | 3 | Default epochs (~75-90 min/epoch V100, ~30-45 min/epoch A100) |
+| `BATCH_SIZE` | 64 | Batch size |
+| `TARGET_PARAMS` | 13,760 | Parameter budget (auto-scales `cnn_channels_2`) |
+| `CHECKPOINT_INTERVAL` | 1 | Versioned `epoch_NNNN.pt` every N epochs |
+| `MA_WINDOW` | 50 | Moving-average window for per-batch plots |
 
 ## Simulation notes
 
@@ -287,8 +400,27 @@ Use `model.forward(patches, return_trunc_loss=True)` to get `(logits, trunc_loss
 
 ## Results
 
-| Path | Git-tracked | Contents |
-|---|---|---|
-| `results/checkpoints/<name>/` | No | `final_model.pt`, `checkpoint_epoch_NNNN.pt` |
-| `results/logs/<name>/` | No | `history.json` per-epoch metrics |
-| `results/figures/` | Yes | Thesis-quality training curve PNGs |
+Output layout differs per script (none of `results/` is git-tracked):
+
+**`mini_experiment.py`** (split across fixed roots):
+
+| Path | Contents |
+|---|---|
+| `results/checkpoints/mini_experiment/` | `final_model.pt`, `checkpoint_epoch_NNNN.pt` |
+| `results/logs/mini_experiment/history.json` | Per-epoch metrics |
+| `results/figures/mini_experiment_curve.png` | Two-panel training curve |
+
+**`full_experiment.py`** (one self-contained directory per run,
+`results/runs/full_fashionmnist_<YYYY-MM-DD_HH-MM-SS>/`):
+
+| Entry | Contents |
+|---|---|
+| `config.json` | Full resolved `ExperimentConfig` (read back by eval/diagnostics) |
+| `history.json` | Per-epoch + per-batch + meta metrics — plot source of truth |
+| `parameter_table.txt` | Snapshot of `print_parameter_table()` |
+| `checkpoints/` | `latest.pt` (every epoch), `best.pt` (best test acc), `final_model.pt`, `epoch_NNNN.pt` |
+| `figures/` | Training-loop PNGs re-rendered every epoch; `report_diagnostics.py` writes its figures here too |
+| `predictions/`, `diagnostics/`, `logs/` | Saved test images / readouts / quantum diagnostics consumed by `report_diagnostics.py` |
+
+**`eval_cutoff_sweep.py`**: writes `<run_dir>/eval/cutoff_sweep_<timestamp>/`
+containing `results.json`, `results.csv`, and per-metric plots.

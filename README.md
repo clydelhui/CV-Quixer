@@ -8,10 +8,11 @@ The CV quantum head encodes each image patch into a parametric Gaussian +
 Kerr unitary (Killoran et al. 2019 ansatz: `S → BS → R → D → K`) emitted by
 a CNN hypernetwork. Across the patch sequence the head implements a linear
 combination of unitaries (LCU) and a real-coefficient matrix polynomial
-`P(M) = Σ_j c_j Mʲ`, producing per-mode quadrature `⟨x̂⟩` readouts that feed
-a small classical MLP decoder. All Fock-basis simulation is **pure PyTorch**
-(no PennyLane at training time), so gradients flow through standard
-`torch.autograd`.
+`P(M) = Σ_j c_j Mʲ`, producing configurable per-mode observable readouts
+(`x`, `p`, `x²`, `p²`, `n`, or photon-number-resolving `prob_n`; default ⟨x̂⟩
+per mode) that feed a small classical MLP decoder. All Fock-basis simulation is
+**pure PyTorch** (no PennyLane at training time), so gradients flow through
+standard `torch.autograd`.
 
 ## Quick start
 
@@ -31,14 +32,17 @@ uv run python experiments/mini_experiment.py --epochs 10
 uv run python experiments/mini_experiment.py \
     --resume results/checkpoints/mini_experiment/checkpoint_epoch_0050.pt
 
-# Full YAML-driven training (quantum and classical baselines)
-uv run python experiments/train_quantum.py --config configs/cv_quixer.yaml
-uv run python experiments/train_classical.py --config configs/classical_vit.yaml
+# Full FashionMNIST (60k/10k), self-contained results/runs/<ts>/ dir.
+# Default 3 epochs; use fractions for a quick local run.
+uv run python experiments/full_experiment.py \
+    --epochs 1 --train-fraction 0.1 --test-fraction 0.1
 
-# Compare results after both runs
-uv run python experiments/compare_models.py \
-    --classical results/checkpoints/classical_vit_baseline/history.json \
-    --quantum   results/checkpoints/cv_quixer_baseline/history.json
+# Re-evaluate a trained checkpoint at larger Fock cutoffs
+uv run python experiments/eval_cutoff_sweep.py \
+    --checkpoint results/runs/<ts>/checkpoints/final_model.pt --cutoffs 6 8 10 12
+
+# Post-hoc thesis figures from a completed full_experiment run
+uv run python experiments/report_diagnostics.py --run-dir results/runs/<ts>/
 ```
 
 ## Repo layout
@@ -50,28 +54,29 @@ cv_quixer/
 │   ├── circuit.py      einsum-based gate application
 │   ├── gates/          Gaussian (S, BS, R, D) + non-Gaussian (Kerr, cubic) factories
 │   ├── interferometer.py   Clements rectangular mesh
-│   ├── ops.py          Observable matrices (x̂, p̂, n̂)
+│   ├── ops.py          Observable matrices (x̂, p̂, n̂, x̂², p̂²)
 │   └── grad.py         Parameter-shift rule (deferred)
 ├── models/
 │   ├── base.py         BaseVisionTransformer (shared interface)
 │   ├── classical/      Classical ViT wrapper
 │   └── quantum/        CV-Quixer (CNN hypernet, LCU, polynomial, multi-head)
-├── config/         ExperimentConfig dataclasses + YAML loader
+├── config/         schema.py: ExperimentConfig dataclasses + ObservableSpec
+│                   (utils.py load_config() YAML loader — legacy, unused)
 ├── data/           MNIST / FashionMNIST + patch extraction
-├── training/       Model-agnostic Trainer
-├── evaluation/     Metrics + classical vs quantum comparison utilities
-└── utils/          Parameter counting, logging (wandb), seeding, matplotlib
+├── evaluation/     metrics.py (compare.py removed)
+└── utils/          Parameter counting, logging (wandb), seeding
 
 experiments/
 ├── smoke_test.py            Fast forward+gradient check
 ├── mini_experiment.py       200/50 subset, 100 epochs (override with --epochs)
-├── train_quantum.py         Full YAML-driven training
-├── train_classical.py       Classical-ViT baseline
-└── compare_models.py        Training-curve overlays
+├── full_experiment.py       60k/10k FashionMNIST, self-contained results/runs/<ts>/
+├── eval_cutoff_sweep.py     Re-evaluate a checkpoint at larger Fock cutoffs
+└── report_diagnostics.py    Post-hoc thesis figures from a full_experiment run
 
-configs/                  Defaults + per-experiment YAML overrides
+configs/                  LEGACY — YAML overrides, not loaded by any current
+                          script; kept for a planned YAML-workflow revival
 tests/                    Project unit tests
-scripts/                  SLURM batch jobs + CUDA diagnostics
+scripts/                  SLURM batch jobs (mini/full/eval) + CUDA diagnostics
 ```
 
 ## Testing
@@ -93,3 +98,12 @@ uv run pytest tests/
   patches, same normalisation, same DataLoader output.
 * **Auto-scaling** — `QuantumConfig.target_params > 0` binary-searches
   `cnn_channels_2` to land within 5 % of the target parameter count.
+* **Configurable readout** — `QuantumConfig.readout_observables` selects any
+  mix of `x`, `p`, `x²`, `p²`, `n`, and photon-number-resolving `prob_n`
+  observables per mode (defaults to ⟨x̂⟩ per mode).
+* **No Trainer class** — each experiment script owns its training loop and
+  drives models only through `BaseVisionTransformer`; `build_model(config)`
+  is the only model factory.
+* **Configs built in Python** — scripts construct `ExperimentConfig`
+  directly; `full_experiment.py` writes `config.json` per run, which
+  `eval_cutoff_sweep.py` / `report_diagnostics.py` reload via `dacite`.

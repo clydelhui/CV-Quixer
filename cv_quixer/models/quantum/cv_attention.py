@@ -46,6 +46,14 @@ from cv_quixer.quantum import (
 )
 
 
+# Post-selection floor. When ‖P(M)|ψ⟩‖² drops at/below this, the QSVT
+# post-selection is treated as failed: the renormalised state is forced to
+# exactly zero so the failing batch element contributes a zero (not exploded)
+# gradient. Shared by the renormalisation and the diagnostic warning so the
+# two thresholds can never drift apart.
+_SUCCESS_PROB_FLOOR = 1e-6
+
+
 # ---------------------------------------------------------------------------
 # Gate-set helpers
 # ---------------------------------------------------------------------------
@@ -410,6 +418,14 @@ class HyperCVAttentionHead(nn.Module):
         self.torch_dtype = (
             torch.complex128 if config.dtype == "complex128" else torch.complex64
         )
+        # Trace-time constants for the truncation-loss path. Branching on these
+        # under torch.func.vmap is safe (resolved once at trace time). The real
+        # dtype is the avg_trunc_loss slot dtype in *every* forward branch so
+        # the vmapped 4-tuple return signature stays invariant.
+        self._trunc_enabled: bool = config.trunc_penalty != "none"
+        self._real_dtype = (
+            torch.float64 if config.dtype == "complex128" else torch.float32
+        )
 
         m = config.num_modes
         if m <= 1:
@@ -484,7 +500,9 @@ class HyperCVAttentionHead(nn.Module):
         v: torch.Tensor,
         device: torch.device,
         dtype: torch.dtype,
-    ) -> torch.Tensor:
+        *,
+        accumulate_norm_sq: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Compute M|v⟩ = Σ_i b_i (U_i|v⟩) without building M explicitly.
 
         Args:
@@ -492,18 +510,33 @@ class HyperCVAttentionHead(nn.Module):
             v:       Complex flat tensor of shape (D^num_modes,). Need not be normalised.
             device:  Target device.
             dtype:   Complex dtype.
+            accumulate_norm_sq: If True, also accumulate Σ_i ‖U_i|v⟩‖² over all
+                         patches and return it alongside the LCU result. Used by
+                         the polynomial's first (vacuum) pass to derive the
+                         truncation loss for free (see _apply_polynomial_iterative).
+                         This kwarg is a trace-time constant resolved per call
+                         site, so the dual return type is vmap-safe.
 
         Returns:
-            Complex flat tensor of shape (D^num_modes,).
+            If ``accumulate_norm_sq`` is False: complex flat tensor of shape
+            (D^num_modes,). If True: a tuple ``(result, norm_sq_sum)`` where
+            ``norm_sq_sum`` is a real 0-dim tensor equal to Σ_i ‖U_i|v⟩‖².
         """
         D, m = self.cutoff_dim, self.num_modes
         b = self.lcu_coeffs().to(device)   # (N,) complex — move to quantum device
         result = torch.zeros_like(v)
+        norm_sq_sum = torch.zeros((), device=device, dtype=self._real_dtype)
         for i in range(patches.shape[0]):
             params = self.hypernetwork(patches[i], i).to(device)  # classical → quantum device
             state_i = FockState(v.reshape((D,) * m), m, D)
             out_i = self._apply_patch_gates_to_state(params, state_i, device, dtype)
+            if accumulate_norm_sq:
+                # Same out_i.data used to build `result`; reusing it keeps the
+                # trunc-loss autograd graph identical to _compute_patch_trunc_loss.
+                norm_sq_sum = norm_sq_sum + (out_i.data.abs() ** 2).sum()
             result = result + b[i].to(dtype) * out_i.data.reshape(-1)
+        if accumulate_norm_sq:
+            return result, norm_sq_sum
         return result
 
     def _compute_patch_trunc_loss(
@@ -520,6 +553,13 @@ class HyperCVAttentionHead(nn.Module):
         infinite-dimensional state has amplitude at photon number ≥ cutoff_dim.
         This is non-zero because analytic Fock-basis gate matrices are true
         sub-isometries (column norms ≤ 1).
+
+        Not on the primary hot path: ``forward`` fuses this computation into the
+        first LCU pass for poly_degree ≥ 1 (audit M1/M2). This standalone method
+        is retained as (a) the isolated oracle for the direct unit tests in
+        ``tests/test_cv_quixer.py::TestPatchTruncLoss`` and (b) the
+        poly_degree == 0 fallback (no LCU pass exists to fuse into). Do not
+        delete without migrating both.
 
         Args:
             patches: Real tensor of shape (N, embed_dim).
@@ -545,7 +585,9 @@ class HyperCVAttentionHead(nn.Module):
         state_flat: torch.Tensor,
         device: torch.device,
         dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        *,
+        want_trunc: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute P(M)|ψ⟩ = Σ_j c_j M^j|ψ⟩ without materialising M or M^j.
 
         Each M^j|ψ⟩ is derived from M^{j-1}|ψ⟩ via _apply_lcu_to_vector.
@@ -558,19 +600,38 @@ class HyperCVAttentionHead(nn.Module):
             state_flat: Complex flat tensor of shape (D^num_modes,) — input statevector.
             device:     Target device.
             dtype:      Complex dtype.
+            want_trunc: If True, also return the mean norm-based truncation loss
+                        1 − Σ_i ‖U_i|ψ⟩‖² / N. This is computed for free from the
+                        *first* LCU pass only (j == 0), where v is still the input
+                        vacuum — exactly where the truncation loss is defined.
+                        Requires len(poly_coeffs) ≥ 2 so that first pass exists;
+                        the caller guarantees this (poly_degree == 0 uses the
+                        standalone _compute_patch_trunc_loss fallback instead).
 
         Returns:
             out_unnorm:   Complex (D^num_modes,) — unnormalised output state.
             success_prob: Scalar — ‖P(M)|ψ⟩‖² (QSVT post-selection probability).
+            avg_trunc_loss: Scalar in [0, 1] — only when ``want_trunc`` is True.
         """
         c = self.poly_coeffs().to(device)   # (d+1,) real — move to quantum device
         result = torch.zeros_like(state_flat)
+        vacuum_norm_sq = torch.zeros((), device=device, dtype=self._real_dtype)
         v = state_flat
         for j in range(len(c)):
             result = result + c[j].to(dtype) * v
             if j < len(c) - 1:
-                v = self._apply_lcu_to_vector(patches, v, device, dtype)
+                if want_trunc and j == 0:
+                    # First pass: v is the vacuum. Fuse the trunc summary here
+                    # so U_i|0⟩ is computed once, not twice (audit M2).
+                    v, vacuum_norm_sq = self._apply_lcu_to_vector(
+                        patches, v, device, dtype, accumulate_norm_sq=True
+                    )
+                else:
+                    v = self._apply_lcu_to_vector(patches, v, device, dtype)
         success_prob = (result.abs() ** 2).sum()
+        if want_trunc:
+            avg_trunc_loss = 1.0 - vacuum_norm_sq / float(patches.shape[0])
+            return result, success_prob, avg_trunc_loss
         return result, success_prob
 
     # ------------------------------------------------------------------
@@ -617,21 +678,49 @@ class HyperCVAttentionHead(nn.Module):
             state = input_state
         state_flat = state.data.reshape(-1)   # (D^n,)
 
-        # 2. Norm-based truncation loss per patch on the vacuum.
-        # Analytic gate matrices are true sub-isometries; 1 - ‖U|ψ⟩‖² is non-zero.
-        avg_trunc_loss = self._compute_patch_trunc_loss(
-            patches, state_flat, quantum_device, dtype
-        )
-
-        # 3. LCU + polynomial (iterative — no matrix materialised).
-        # Intermediate states are not renormalised; this preserves the QSVT polynomial structure.
-        out_unnorm, success_prob = self._apply_polynomial_iterative(
-            patches, state_flat, quantum_device, dtype
-        )
+        # 2-3. LCU + polynomial (iterative — no matrix materialised), plus the
+        # norm-based truncation loss. Both branch variables are trace-time
+        # constants so exactly one branch is traced under vmap; avg_trunc_loss
+        # is always a real 0-dim tensor (self._real_dtype, quantum_device).
+        #   - trunc disabled: skip all per-patch vacuum work entirely (M1).
+        #   - poly_degree ≥ 1: fuse the trunc summary into the first (vacuum)
+        #     LCU pass so U_i|0⟩ is computed once, not twice (M2).
+        #   - poly_degree == 0: no LCU pass exists, so fall back to the
+        #     standalone per-patch vacuum pass (preserves prior behaviour).
+        if not self._trunc_enabled:
+            out_unnorm, success_prob = self._apply_polynomial_iterative(
+                patches, state_flat, quantum_device, dtype
+            )
+            avg_trunc_loss = torch.zeros(
+                (), device=quantum_device, dtype=self._real_dtype
+            )
+        elif len(self.poly_coeffs()) >= 2:
+            out_unnorm, success_prob, avg_trunc_loss = self._apply_polynomial_iterative(
+                patches, state_flat, quantum_device, dtype, want_trunc=True
+            )
+        else:
+            avg_trunc_loss = self._compute_patch_trunc_loss(
+                patches, state_flat, quantum_device, dtype
+            )
+            out_unnorm, success_prob = self._apply_polynomial_iterative(
+                patches, state_flat, quantum_device, dtype
+            )
 
         # 4. Post-selection renormalisation: divide by ‖P(M)|ψ⟩‖ to give a unit-norm state.
         # success_prob = ‖out_unnorm‖²; deviation from 1 is the QSVT post-selection cost.
-        out_norm = out_unnorm / success_prob.sqrt().clamp(min=1e-8)
+        # Clamp the *divisor* (not the result) so the division is always finite —
+        # this keeps out_scaled's gradient finite even when success_prob is
+        # exactly 0 (0/0). torch.where then forces a failed post-selection to an
+        # exactly-zero state; because out_scaled is finite, the where-branch
+        # gradient is 0·grad = 0 (not 0·NaN), so a near-zero-norm batch element
+        # contributes a zero gradient instead of a ~1/√ε explosion.
+        safe_sp = success_prob.clamp(min=_SUCCESS_PROB_FLOOR)
+        out_scaled = out_unnorm / safe_sp.sqrt()
+        out_norm = torch.where(
+            success_prob > _SUCCESS_PROB_FLOOR,
+            out_scaled,
+            torch.zeros_like(out_unnorm),
+        )
 
         # 5. Wrap as FockState
         output_state = FockState(out_norm.reshape((D,) * n), n, D)
@@ -737,13 +826,14 @@ class HyperCVAttention(nn.Module):
             # sp_b      : (B,)
             # tl_b      : (B,)
 
-            if (sp_b < 1e-6).any().item():
+            if (sp_b < _SUCCESS_PROB_FLOOR).any().item():
                 import warnings
-                bad = sp_b[sp_b < 1e-6]
+                bad = sp_b[sp_b < _SUCCESS_PROB_FLOOR]
                 warnings.warn(
                     f"HyperCVAttention: {len(bad)} batch element(s) have "
-                    f"success_prob < 1e-6 (min={bad.min().item():.2e}); "
-                    "post-selection clamp active — polynomial output has near-zero norm.",
+                    f"success_prob < {_SUCCESS_PROB_FLOOR:.0e} "
+                    f"(min={bad.min().item():.2e}); post-selection failed — "
+                    "those elements forced to a zero state (zero gradient).",
                     RuntimeWarning, stacklevel=2,
                 )
 
