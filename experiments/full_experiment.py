@@ -534,7 +534,7 @@ def _quantum_diagnostics(model, loader) -> tuple[dict, np.ndarray, dict]:
             gate_outs[h_idx].append(torch.stack(outs_bn).reshape(B, N, -1))
 
         out = model(patches, return_states=True)
-        states_list = out[1]
+        states_list = out.states
         for h_idx, state_batch in enumerate(states_list):
             circuit = attn.heads[h_idx].circuit
             for b in range(B):
@@ -594,7 +594,8 @@ def train_epoch(epoch: int) -> float:
     ):
         patches, labels = patches.to(device), labels.to(device)
         optimizer.zero_grad()
-        logits, trunc_loss = model(patches, return_trunc_loss=True)
+        out = model(patches, return_trunc_loss=True)
+        logits, trunc_loss = out.logits, out.trunc_loss
         ce_loss = F.cross_entropy(logits, labels)
         loss = ce_loss + quantum_cfg.trunc_lambda * trunc_loss
         loss.backward()
@@ -647,13 +648,10 @@ def evaluate(loader, num_classes: int = 10) -> dict:
     for patches, labels in loader:
         patches, labels = patches.to(device), labels.to(device)
         out = model(patches, return_trunc_loss=True, return_readouts=True)
-        # Forward returns (logits, [trunc_loss], readouts); trunc_loss is omitted
-        # when quantum_cfg.trunc_penalty == "none", so unpack defensively.
-        if len(out) == 3:
-            logits, trunc_loss, readouts = out
-            total_trunc += trunc_loss.item() * labels.size(0)
-        else:
-            logits, readouts = out
+        # out.trunc_loss is None when quantum_cfg.trunc_penalty == "none".
+        logits, readouts = out.logits, out.readouts
+        if out.trunc_loss is not None:
+            total_trunc += out.trunc_loss.item() * labels.size(0)
         total_loss += F.cross_entropy(logits, labels).item() * labels.size(0)
         preds = logits.argmax(dim=-1)
         correct += (preds == labels).sum().item()

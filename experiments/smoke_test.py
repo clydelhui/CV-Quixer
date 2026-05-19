@@ -88,7 +88,8 @@ def run_one(readout_observable: str) -> None:
         patches, labels = next(iter(train_loader))
         optimizer.zero_grad()
 
-        logits, trunc_loss = model(patches, return_trunc_loss=True)
+        out = model(patches, return_trunc_loss=True)
+        logits, trunc_loss = out.logits, out.trunc_loss
         ce_loss = F.cross_entropy(logits, labels)
         total_loss = ce_loss + quantum_cfg.trunc_lambda * trunc_loss
 

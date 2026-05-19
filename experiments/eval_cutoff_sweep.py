@@ -303,7 +303,8 @@ def evaluate_at_cutoff(D_new: int, split: str, loader: DataLoader) -> dict:
     ):
         patches = patches.to(device)
         labels = labels.to(device)
-        logits, trunc_loss = model(patches, return_trunc_loss=True)
+        out = model(patches, return_trunc_loss=True)
+        logits, trunc_loss = out.logits, out.trunc_loss
         n = labels.size(0)
         ce_sum    += F.cross_entropy(logits, labels, reduction="sum").item()
         trunc_sum += float(trunc_loss.item()) * n

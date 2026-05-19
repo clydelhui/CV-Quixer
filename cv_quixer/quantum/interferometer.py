@@ -26,10 +26,6 @@ def interferometer_param_count(num_modes: int) -> int:
         - N per-mode phase shifts → N params
     Total: N*(N-1) + N = N²
 
-    This matches the existing cv_layers.py convention and is re-exported here
-    so that the old import path (from cv_quixer.models.quantum.cv_layers import
-    interferometer_param_count) continues to work after that file is refactored.
-
     Args:
         num_modes: Number of bosonic modes N.
 

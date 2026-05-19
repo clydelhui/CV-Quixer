@@ -170,7 +170,8 @@ def train_epoch(epoch: int) -> tuple[float, float, float]:
     ):
         patches, labels = patches.to(device), labels.to(device)
         optimizer.zero_grad()
-        logits, trunc_loss = model(patches, return_trunc_loss=True)
+        out = model(patches, return_trunc_loss=True)
+        logits, trunc_loss = out.logits, out.trunc_loss
         ce_loss = F.cross_entropy(logits, labels)
         loss = ce_loss + quantum_cfg.trunc_lambda * trunc_loss
         loss.backward()

@@ -19,6 +19,8 @@ target.
 
 from __future__ import annotations
 
+from typing import NamedTuple, Optional
+
 import torch
 import torch.nn as nn
 
@@ -32,6 +34,21 @@ from cv_quixer.models.quantum.cv_attention import (
     photon_number_penalty,
 )
 from cv_quixer.quantum import CVCircuit
+
+
+class CVQuixerOut(NamedTuple):
+    """Structured return for ``CVQuixer.forward`` when any ``return_*`` flag
+    is set. Fields not requested are ``None``. Name-based access means adding
+    or reordering optional outputs can never silently mis-bind a caller
+    (audit M5). With no flags set, ``forward`` returns a plain ``logits``
+    tensor instead — preserving the ``BaseVisionTransformer`` contract.
+    """
+
+    logits: torch.Tensor
+    trunc_loss: Optional[torch.Tensor] = None
+    readouts: Optional[torch.Tensor] = None
+    states: Optional[list[torch.Tensor]] = None
+    success_probs: Optional[list[torch.Tensor]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -176,8 +193,10 @@ class CVQuixer(BaseVisionTransformer):
     should be added (scaled by trunc_lambda) to the cross-entropy loss during
     training:
 
-        logits, trunc = model(patches, return_trunc_loss=True)
-        loss = F.cross_entropy(logits, labels) + config.trunc_lambda * trunc
+        out = model(patches, return_trunc_loss=True)
+        loss = F.cross_entropy(out.logits, labels)
+        if out.trunc_loss is not None:
+            loss = loss + config.trunc_lambda * out.trunc_loss
 
     Args:
         quantum_config: QuantumConfig — circuit and architecture hyperparameters.
@@ -221,7 +240,7 @@ class CVQuixer(BaseVisionTransformer):
         return_success_prob: bool = False,
         return_states: bool = False,
         return_readouts: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    ) -> torch.Tensor | CVQuixerOut:
         """Run the full CV-Quixer model.
 
         Args:
@@ -241,13 +260,18 @@ class CVQuixer(BaseVisionTransformer):
                                 ``(B, num_heads * len(observable_plan))``.
 
         Returns:
-            logits:        (B, num_classes) — always returned.
-            trunc_loss:    scalar — appended when return_trunc_loss=True and
-                           trunc_penalty != "none".
-            readouts:      (B, num_heads * len(observable_plan)) — appended
-                           when return_readouts=True.
-            states:        list[Tensor] — appended when return_states=True.
-            success_probs: list[Tensor] — appended when return_states=True.
+            With no return_* flag set: the plain ``logits`` tensor of shape
+            ``(B, num_classes)`` (preserves the BaseVisionTransformer
+            contract). With any flag set: a ``CVQuixerOut`` namedtuple whose
+            fields are ``None`` unless requested —
+
+              logits:        (B, num_classes) — always populated.
+              trunc_loss:    scalar — populated when return_trunc_loss=True
+                             and trunc_penalty != "none" (else None).
+              readouts:      (B, num_heads * len(observable_plan)) — populated
+                             when return_readouts=True.
+              states:        list[Tensor] — populated when return_states=True.
+              success_probs: list[Tensor] — populated when return_states=True.
         """
         if return_success_prob:
             raise NotImplementedError(
@@ -260,15 +284,17 @@ class CVQuixer(BaseVisionTransformer):
         readouts, states, success_probs, trunc_loss = self.cv_attention(patches)
         logits = self.decoder(readouts)                           # (B, num_classes)
 
-        extras: list = []
-        if return_trunc_loss and self.trunc_penalty != "none":
-            extras.append(trunc_loss.to(logits.device))
-        if return_readouts:
-            extras.append(readouts)
-        if return_states:
-            extras.append(states)
-            extras.append(success_probs)
-
-        if not extras:
+        if not (return_trunc_loss or return_readouts or return_states):
             return logits
-        return (logits, *extras)
+
+        return CVQuixerOut(
+            logits=logits,
+            trunc_loss=(
+                trunc_loss.to(logits.device)
+                if return_trunc_loss and self.trunc_penalty != "none"
+                else None
+            ),
+            readouts=readouts if return_readouts else None,
+            states=states if return_states else None,
+            success_probs=success_probs if return_states else None,
+        )

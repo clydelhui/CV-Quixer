@@ -225,7 +225,8 @@ def _load_model_and_run_inference(run: dict) -> dict:
     with torch.no_grad():
         for patches, labels in test_loader:
             patches_d = patches.to(device)
-            logits, readouts = model(patches_d, return_readouts=True)
+            out = model(patches_d, return_readouts=True)
+            logits, readouts = out.logits, out.readouts
             probs = F.softmax(logits, dim=-1)
             preds = logits.argmax(dim=-1)
             images_chunks.append(patches.detach().cpu())
@@ -258,6 +259,39 @@ def _load_model_and_run_inference(run: dict) -> dict:
         "y_probs":  torch.cat(probs_chunks).numpy().astype(np.float32),
         "readouts": torch.cat(readout_chunks).numpy().astype(np.float32),
     }
+
+
+def _check_parity(run: dict) -> None:
+    """Audit M10: assert the file-only and full-inference prediction paths
+    agree. Loads both, compares softmax probabilities row-by-row, and prints
+    a one-line PASS/WARN summary. Manual safety net — no CI plumbing.
+    """
+    file = _load_artefacts_recomputed(run)
+    if file is None:
+        print("check-parity: file-only artefacts unavailable — nothing to "
+              "compare (run full_experiment.py to populate predictions/*.npz).")
+        return
+    try:
+        fresh = _load_model_and_run_inference(run)
+    except Exception as e:
+        print(f"check-parity: full-inference failed "
+              f"({type(e).__name__}: {e}) — cannot compare.")
+        return
+
+    fp, xp = file["y_probs"], fresh["y_probs"]
+    if fp.shape != xp.shape:
+        print(f"check-parity: shape mismatch file={fp.shape} "
+              f"full-inference={xp.shape} — likely missing subset_indices.npz "
+              "so the two paths ran on different sample sets; cannot compare.")
+        return
+
+    d = np.abs(fp - xp)
+    max_d, mean_d = float(d.max()), float(d.mean())
+    pred_agree = float((file["y_pred"] == fresh["y_pred"]).mean())
+    verdict = "PASS" if max_d < 1e-5 else "WARN"
+    print(f"check-parity [{verdict}]: max|Δp|={max_d:.2e} "
+          f"mean|Δp|={mean_d:.2e} pred-agreement={pred_agree:.4f} "
+          f"(N={fp.shape[0]})")
 
 
 # ---------------------------------------------------------------------------
@@ -758,6 +792,11 @@ def main() -> None:
                              "saved predictions/readouts/test_images from disk. "
                              "Slow — use this for older runs that don't have the "
                              "saved artefacts, or to sanity-check the saved data.")
+    parser.add_argument("--check-parity", action="store_true",
+                        help="Load both the saved-file predictions and a fresh "
+                             "full-inference pass, print max/mean |Δ y_probs| "
+                             "and prediction agreement, then exit. Safety net "
+                             "to verify the two paths agree.")
     args = parser.parse_args()
 
     if args.multi_run and not args.run_dir:
@@ -773,6 +812,10 @@ def main() -> None:
     print(f"  config: {run['config'].name}  |  epoch: {run['epoch']}  "
           f"|  mode: {mode}")
     sanity_checks(run)
+
+    if args.check_parity:
+        _check_parity(run)
+        return
 
     # Figures that only need history.json / .npz files
     fast_plots = [
