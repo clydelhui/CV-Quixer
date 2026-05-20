@@ -314,6 +314,27 @@ class CNNHypernetwork(nn.Module):
         x = x.flatten(start_dim=1).squeeze(0) + self.pos_enc[patch_idx]
         return self.linear(x)
 
+    def forward_all(self, patches: torch.Tensor) -> torch.Tensor:
+        """Map a full patch sequence to gate parameters in one batched call.
+
+        Equivalent to stacking ``forward(patches[i], i)`` for i in 0..N-1, but
+        runs the conv stack and final linear in a single batched call instead
+        of N Python iterations.
+
+        Args:
+            patches: Real tensor of shape (N, patch_size²) — flattened patches
+                     in positional order (row-major over the patch grid).
+
+        Returns:
+            Tensor of shape (N, _gate_param_count(num_modes, bs_topology)).
+        """
+        N = patches.shape[0]
+        x = patches.reshape(N, 1, self.patch_size, self.patch_size)
+        x = torch.tanh(self.conv1(x))
+        x = torch.tanh(self.conv2(x))
+        x = x.flatten(start_dim=1) + self.pos_enc   # (N, feature_dim)
+        return self.linear(x)                       # (N, gate_params)
+
 
 # ---------------------------------------------------------------------------
 # LCUSumCoefficients
@@ -494,6 +515,34 @@ class HyperCVAttentionHead(nn.Module):
 
         return state
 
+    def _apply_patch_gates_to_data(
+        self,
+        params: torch.Tensor,
+        state_data: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Tensor-in / tensor-out wrapper around ``_apply_patch_gates_to_state``.
+
+        ``torch.func.vmap`` cannot trace a function whose return type is the
+        custom ``FockState`` dataclass, so the LCU and truncation-loss paths
+        go through this helper instead. The wrapped FockState is constructed
+        on the fly using static ``num_modes`` / ``cutoff_dim`` (trace-time
+        constants under vmap) and immediately unwrapped on return.
+
+        Args:
+            params:     Real tensor of shape (_gate_param_count(num_modes, topology),).
+            state_data: Complex tensor of shape (D,)*num_modes.
+            device:     Target device.
+            dtype:      Complex dtype.
+
+        Returns:
+            Complex tensor of shape (D,)*num_modes after U_i applied.
+        """
+        state = FockState(state_data, self.num_modes, self.cutoff_dim)
+        out = self._apply_patch_gates_to_state(params, state, device, dtype)
+        return out.data
+
     def _apply_lcu_to_vector(
         self,
         patches: torch.Tensor,
@@ -523,19 +572,27 @@ class HyperCVAttentionHead(nn.Module):
             ``norm_sq_sum`` is a real 0-dim tensor equal to Σ_i ‖U_i|v⟩‖².
         """
         D, m = self.cutoff_dim, self.num_modes
-        b = self.lcu_coeffs().to(device)   # (N,) complex — move to quantum device
-        result = torch.zeros_like(v)
-        norm_sq_sum = torch.zeros((), device=device, dtype=self._real_dtype)
-        for i in range(patches.shape[0]):
-            params = self.hypernetwork(patches[i], i).to(device)  # classical → quantum device
-            state_i = FockState(v.reshape((D,) * m), m, D)
-            out_i = self._apply_patch_gates_to_state(params, state_i, device, dtype)
-            if accumulate_norm_sq:
-                # Same out_i.data used to build `result`; reusing it keeps the
-                # trunc-loss autograd graph identical to _compute_patch_trunc_loss.
-                norm_sq_sum = norm_sq_sum + (out_i.data.abs() ** 2).sum()
-            result = result + b[i].to(dtype) * out_i.data.reshape(-1)
+        N = patches.shape[0]
+        b = self.lcu_coeffs().to(device)                       # (N,) complex
+
+        # 1. Batched hypernetwork — all N patches in one call.
+        all_params = self.hypernetwork.forward_all(patches).to(device)  # (N, gp)
+
+        # 2. Vmap per-patch gate application over N. The shared input vector
+        #    `v_data` is broadcast (in_dims=None); device/dtype are trace-time
+        #    constants. Nests with the outer batch vmap in HyperCVAttention.
+        v_data = v.reshape((D,) * m)
+        apply_one = lambda p: self._apply_patch_gates_to_data(
+            p, v_data, device, dtype
+        )
+        out_data_N = vmap(apply_one)(all_params)               # (N, D, ..., D)
+
+        # 3. Reduce to M|v⟩ = Σ_i b_i U_i|v⟩.
+        out_flat_N = out_data_N.reshape(N, -1)                 # (N, D^m)
+        result = (b.to(dtype).unsqueeze(-1) * out_flat_N).sum(dim=0)  # (D^m,)
+
         if accumulate_norm_sq:
+            norm_sq_sum = (out_flat_N.abs() ** 2).sum()
             return result, norm_sq_sum
         return result
 
@@ -571,13 +628,20 @@ class HyperCVAttentionHead(nn.Module):
             Scalar tensor in [0, 1] — mean truncation loss over i = 0..N-1.
         """
         D, m = self.cutoff_dim, self.num_modes
-        losses: list[torch.Tensor] = []
-        for i in range(patches.shape[0]):
-            params = self.hypernetwork(patches[i], i).to(device)
-            state_i = FockState(v.reshape((D,) * m), m, D)
-            out_i = self._apply_patch_gates_to_state(params, state_i, device, dtype)
-            losses.append(1.0 - (out_i.data.abs() ** 2).sum())
-        return torch.stack(losses).mean()
+        N = patches.shape[0]
+
+        all_params = self.hypernetwork.forward_all(patches).to(device)  # (N, gp)
+        v_data = v.reshape((D,) * m)
+        apply_one = lambda p: self._apply_patch_gates_to_data(
+            p, v_data, device, dtype
+        )
+        out_data_N = vmap(apply_one)(all_params)                # (N, D, ..., D)
+
+        # Mean over patches of 1 − ‖U_i|v⟩‖². Equivalent to
+        # 1 − Σ_i ‖U_i|v⟩‖² / N once expanded, matching the LCU fused path
+        # in _apply_polynomial_iterative (want_trunc=True).
+        norm_sq_per_patch = (out_data_N.reshape(N, -1).abs() ** 2).sum(dim=-1)
+        return (1.0 - norm_sq_per_patch).mean()
 
     def _apply_polynomial_iterative(
         self,

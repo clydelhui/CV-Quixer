@@ -194,13 +194,15 @@ class TestPatchTruncLoss:
         loss 1 - ‖U|v⟩‖² > 0.5 for D=4, α=2 applied to both modes."""
         m, offset, total = self._M, self._DISP_RE_OFFSET, self._TOTAL_PARAMS
 
-        def _large_disp(patch, idx):
+        def _large_disp_all(patches):
             p = torch.zeros(total)
             p[offset:offset + m] = 2.0
-            return p
+            return p.unsqueeze(0).expand(patches.shape[0], -1).clone()
 
+        mock_hn = MagicMock()
+        mock_hn.forward_all = MagicMock(side_effect=_large_disp_all)
         # object.__setattr__ bypasses nn.Module's __setattr__, which rejects non-Module values
-        object.__setattr__(head, 'hypernetwork', MagicMock(side_effect=_large_disp))
+        object.__setattr__(head, 'hypernetwork', mock_hn)
         state_flat = self._vacuum_flat()
         patches = torch.zeros(16, 49)
         device = torch.device("cpu")
@@ -215,7 +217,9 @@ class TestPatchTruncLoss:
         1 - ‖U|v⟩‖² = 0 since the state is still unit-norm."""
         total = self._TOTAL_PARAMS
 
-        object.__setattr__(head, 'hypernetwork', MagicMock(side_effect=lambda p, i: torch.zeros(total)))
+        mock_hn = MagicMock()
+        mock_hn.forward_all = MagicMock(side_effect=lambda patches: torch.zeros(patches.shape[0], total))
+        object.__setattr__(head, 'hypernetwork', mock_hn)
         state_flat = self._vacuum_flat()
         patches = torch.zeros(16, 49)
         device = torch.device("cpu")
@@ -223,6 +227,99 @@ class TestPatchTruncLoss:
         loss = head._compute_patch_trunc_loss(patches, state_flat, device, torch.complex64)
 
         assert loss.item() == pytest.approx(0.0, abs=1e-5)
+
+
+class TestPatchParallelEquivalence:
+    """Locks the patch-parallel (vmap-over-N) LCU / trunc-loss path against a
+    pinned sequential reference. Reduction order changes when summing
+    ``Σ_i b_i U_i|v⟩`` as a batched dot product instead of a Python loop, so
+    use a tight-but-not-zero tolerance.
+    """
+
+    @pytest.fixture
+    def head(self):
+        config = QuantumConfig(
+            num_modes=2,
+            cutoff_dim=4,
+            num_heads=1,
+            cnn_channels_1=4,
+            cnn_channels_2=8,
+            cnn_kernel_size=3,
+            decoder_hidden_dim=16,
+            poly_degree=2,
+            dtype="complex64",
+            bs_topology="linear",
+        )
+        torch.manual_seed(0)
+        return HyperCVAttentionHead(patch_size=7, num_patches=16, config=config)
+
+    @staticmethod
+    def _sequential_lcu(head, patches, v, device, dtype):
+        """Original sequential reference for _apply_lcu_to_vector — pinned for parity."""
+        D, m = head.cutoff_dim, head.num_modes
+        b = head.lcu_coeffs().to(device)
+        result = torch.zeros_like(v)
+        norm_sq_sum = torch.zeros((), device=device, dtype=head._real_dtype)
+        for i in range(patches.shape[0]):
+            params = head.hypernetwork(patches[i], i).to(device)
+            state_i = FockState(v.reshape((D,) * m), m, D)
+            out_i = head._apply_patch_gates_to_state(params, state_i, device, dtype)
+            norm_sq_sum = norm_sq_sum + (out_i.data.abs() ** 2).sum()
+            result = result + b[i].to(dtype) * out_i.data.reshape(-1)
+        return result, norm_sq_sum
+
+    def test_lcu_matches_sequential(self, head):
+        """``_apply_lcu_to_vector`` matches the pinned sequential reference."""
+        torch.manual_seed(1)
+        patches = torch.randn(16, 49)
+        v = FockState.vacuum(head.num_modes, head.cutoff_dim,
+                             torch.device("cpu"), torch.complex64).data.reshape(-1)
+        device, dtype = torch.device("cpu"), torch.complex64
+
+        ref_result, ref_norm = self._sequential_lcu(head, patches, v, device, dtype)
+        new_result, new_norm = head._apply_lcu_to_vector(
+            patches, v, device, dtype, accumulate_norm_sq=True
+        )
+
+        assert torch.allclose(new_result, ref_result, atol=1e-5, rtol=1e-5)
+        assert torch.allclose(new_norm, ref_norm, atol=1e-5, rtol=1e-5)
+
+    def test_trunc_loss_matches_sequential_mean(self, head):
+        """``_compute_patch_trunc_loss`` matches the sequential 1 − Σ‖U_i|v⟩‖²/N."""
+        torch.manual_seed(2)
+        patches = torch.randn(16, 49)
+        v = FockState.vacuum(head.num_modes, head.cutoff_dim,
+                             torch.device("cpu"), torch.complex64).data.reshape(-1)
+        device, dtype = torch.device("cpu"), torch.complex64
+
+        # Reference: per-patch sequential loop equivalent to the old impl.
+        D, m = head.cutoff_dim, head.num_modes
+        ref_losses = []
+        for i in range(patches.shape[0]):
+            params = head.hypernetwork(patches[i], i).to(device)
+            state_i = FockState(v.reshape((D,) * m), m, D)
+            out_i = head._apply_patch_gates_to_state(params, state_i, device, dtype)
+            ref_losses.append(1.0 - (out_i.data.abs() ** 2).sum())
+        ref_loss = torch.stack(ref_losses).mean()
+
+        new_loss = head._compute_patch_trunc_loss(patches, v, device, dtype)
+
+        assert torch.allclose(new_loss, ref_loss, atol=1e-5, rtol=1e-5)
+
+    def test_lcu_backward_finite(self, head):
+        """Gradient flows through the vmapped LCU path without producing NaNs."""
+        torch.manual_seed(3)
+        patches = torch.randn(16, 49, requires_grad=False)
+        v = FockState.vacuum(head.num_modes, head.cutoff_dim,
+                             torch.device("cpu"), torch.complex64).data.reshape(-1)
+
+        out = head._apply_lcu_to_vector(patches, v, torch.device("cpu"), torch.complex64)
+        loss = (out.abs() ** 2).sum()
+        loss.backward()
+
+        for name, p in head.named_parameters():
+            if p.grad is not None:
+                assert torch.isfinite(p.grad).all(), f"non-finite grad in {name}"
 
 
 class TestTruncationHelpers:
