@@ -2,10 +2,21 @@
 # -----------------------------------------------------------------------
 # SLURM directives — A100 (40 GB), 12 h wall time.
 #
-# Default sweep [6,8,10,12] on the full 10k test set is ~4.5 h on A100-40
-# (dominated by D=12 at ~2.5 h). 12 h covers extended cutoff lists like
-# [6,8,10,12,14] and complex128 reruns. With --test-fraction 0.5 or 0.25
-# expect ~2.25 h / ~1.1 h respectively.
+# Prerequisite: the checkpoint must come from a recent
+# experiments/full_experiment.py run that wrote subset_indices.npz to its
+# run directory. The sweep mandatorily reuses subset_indices.npz's
+# test_indices and diag_indices so per-cutoff numbers are apples-to-apples
+# with the trained run; older runs without that file will fail at startup.
+#
+# Wall time is dominated by the per-cutoff test-set evaluation and scales
+# linearly with the parent run's saved test-subset size (NOT the eval
+# flags). For reference: sweep of [6,8,10,12] on a 10k-sample reused test
+# set ≈ 4.5 h on A100-40 (D=12 dominates at ~2.5 h); on a 1k subset (e.g.
+# parent run trained with --test-fraction 0.1) it's ~25-30 min. The 12 h
+# wall covers extended cutoff lists like [6,8,10,12,14] and complex128
+# reruns at full scale. The sweep also runs a fixed 512-sample quantum-
+# diagnostic pass per cutoff (~tens of seconds each), independent of the
+# test-set size.
 #
 # V100 fallback: change to `--gres=gpu:nv:1` if A100 queues are congested.
 # Keep the 12 h time — V100 is slower.
@@ -14,16 +25,30 @@
 #   sbatch scripts/run_eval_cutoff_sweep.sh <checkpoint.pt> [extra args]
 #
 # Examples:
+#   # Default sweep [6,8,10,12], reusing the trained run's test subset
 #   sbatch scripts/run_eval_cutoff_sweep.sh \
 #       results/runs/full_fashionmnist_2026-05-15_.../checkpoints/final_model.pt
 #
+#   # Custom cutoff list
 #   sbatch scripts/run_eval_cutoff_sweep.sh \
 #       results/runs/<run>/checkpoints/final_model.pt \
-#       --test-fraction 0.5 --cutoffs 8 10
+#       --cutoffs 8 10
 #
+#   # Higher-precision sweep at extended cutoffs
 #   sbatch scripts/run_eval_cutoff_sweep.sh \
 #       results/runs/<run>/checkpoints/final_model.pt \
-#       --test-fraction 0.25 --cutoffs 6 8 10 12 14 --dtype complex128
+#       --cutoffs 6 8 10 12 14 --dtype complex128
+#
+# To shrink the eval pass below the parent run's saved subset, point at a
+# checkpoint from a smaller-fraction parent run (preferred), or pass
+# --test-fraction X / --test-limit N as an override — those override flags
+# print a loud warning that the resulting numbers will NOT match the
+# trained run.
+#
+# After the sweep completes, each cutoff has a self-contained sub-run dir
+# at <run>/eval/cutoff_sweep_<ts>/D{NN}/ that report_diagnostics.py
+# consumes directly to render the full thesis figure suite at that cutoff:
+#   uv run python experiments/report_diagnostics.py --run-dir <...>/D{NN}
 # -----------------------------------------------------------------------
 #SBATCH --job-name=cv_quixer_eval
 #SBATCH --output=slurm-%x-%j.out

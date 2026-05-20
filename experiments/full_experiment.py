@@ -63,6 +63,15 @@ from cv_quixer.config.schema import (
     TrainingConfig,
 )
 from cv_quixer.data.mnist import PatchedDataset
+from cv_quixer.evaluation.diagnostics import (
+    ensure_history_schema,
+    evaluate,
+    new_history,
+    quantum_diagnostics,
+    save_test_images_once,
+    snapshot_coefficients,
+)
+from cv_quixer.evaluation.labels import class_names
 from cv_quixer.models import build_model
 from cv_quixer.utils import print_parameter_table
 
@@ -258,41 +267,7 @@ train_eval_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=False)
 test_loader       = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False)
 
 
-def _save_test_images_once(loader, image_size: int, patch_size: int,
-                           out_path: Path) -> None:
-    """Reassemble the patches of every test sample into a (N, H, W) array and
-    write it once. Idempotent: skip the work if the file already exists with
-    a matching N. Used by experiments/report_diagnostics.py's default
-    file-only mode to draw the misclassification gallery without re-running
-    the model.
-    """
-    n_total = len(loader.dataset)
-    if out_path.is_file():
-        with np.load(out_path) as existing:
-            if existing["images"].shape[0] == n_total:
-                return
-    grid = image_size // patch_size
-    images = np.zeros((n_total, image_size, image_size), dtype=np.float32)
-    labels = np.zeros(n_total, dtype=np.int64)
-    idx = 0
-    for patches, lbls in loader:
-        # patches: (B, N_patches, patch_dim)
-        bs = patches.shape[0]
-        p_np = patches.numpy().astype(np.float32)
-        for b in range(bs):
-            for k in range(p_np.shape[1]):
-                r, c = divmod(k, grid)
-                images[idx + b,
-                       r*patch_size:(r+1)*patch_size,
-                       c*patch_size:(c+1)*patch_size] = (
-                    p_np[b, k].reshape(patch_size, patch_size)
-                )
-        labels[idx:idx + bs] = lbls.numpy().astype(np.int64)
-        idx += bs
-    np.savez_compressed(out_path, images=images, labels=labels)
-
-
-_save_test_images_once(
+save_test_images_once(
     test_loader, data_cfg.image_size, data_cfg.patch_size,
     preds_dir / "test_images.npz",
 )
@@ -375,42 +350,7 @@ print(f"Forward shape OK — logits: {tuple(_logits.shape)}\n")
 
 optimizer = torch.optim.Adam(model.parameters(), lr=config.training.lr)
 
-_EPOCH_KEYS_NEW: tuple[str, ...] = (
-    "train_per_class_acc", "test_per_class_acc",
-    "train_confusion",     "test_confusion",
-    "test_trunc_loss",
-    "lcu_coeffs", "poly_coeffs",
-    "hypernet_stats", "mean_photon_number",
-)
-
-
-def _ensure_history_schema(h: dict) -> None:
-    """Idempotently add any missing diagnostic fields to a (possibly resumed) history dict."""
-    h.setdefault("epoch", {})
-    for k in _EPOCH_KEYS_NEW:
-        h["epoch"].setdefault(k, [])
-
-
-history: dict = {
-    "epoch": {
-        "train_loss": [], "train_acc": [],
-        "test_loss":  [], "test_acc":  [],
-        "trunc_loss": [], "elapsed_sec": [],
-    },
-    "batch": {
-        "step":       [], "epoch":      [],
-        "train_loss": [], "trunc_loss": [], "total_loss": [],
-        "batch_acc":  [], "grad_norm":  [],
-    },
-    "meta": {
-        "best_test_acc": None, "best_epoch": None,
-        "total_runtime_sec": None, "n_params": int(n_params),
-        "device": str(device),
-        "started_at": datetime.now().isoformat(timespec="seconds"),
-        "completed_at": None,
-    },
-}
-_ensure_history_schema(history)
+history: dict = new_history(int(n_params), str(device))
 
 start_epoch = 1
 global_step = 0
@@ -419,7 +359,7 @@ if args.resume:
     model.load_state_dict(ckpt["model_state_dict"])
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     history = ckpt["history"]
-    _ensure_history_schema(history)
+    ensure_history_schema(history)
     start_epoch = ckpt["epoch"] + 1
     global_step = len(history["batch"]["step"])
     print(f"Resumed from {args.resume}")
@@ -451,126 +391,6 @@ def _grad_l2_norm(parameters) -> float:
     if not norms:
         return 0.0
     return float(torch.norm(torch.stack(norms), 2).item())
-
-
-def _gate_param_layout(num_modes: int, n_bs: int) -> list[tuple[str, int, int]]:
-    """Slice layout for hypernetwork gate-parameter outputs.
-
-    Derived from cv_attention._GATE_SEQUENCE — single source of truth for
-    the gate set. Each op contributes one (name, start, count) entry per
-    parameter name; slice keys are f"{op.name}_{param_name}" to match the
-    legacy names (squeeze_r, squeeze_phi, bs_theta, bs_phi, rot_phi,
-    disp_re, disp_im, kerr_kappa).
-
-    Returns list of (name, start, count); count==0 means the gate is absent.
-    """
-    from cv_quixer.models.quantum.cv_attention import _GATE_SEQUENCE
-
-    layout: list[tuple[str, int, int]] = []
-    offset = 0
-    for op in _GATE_SEQUENCE:
-        n_sites = num_modes if op.site_kind == "mode" else n_bs
-        for p in op.param_names:
-            layout.append((f"{op.name}_{p}", offset, n_sites))
-            offset += n_sites
-    return layout
-
-
-@torch.no_grad()
-def _snapshot_coefficients(model) -> tuple[np.ndarray, np.ndarray]:
-    """LCU (real, imag) and polynomial coefficients per head — JSON-friendly arrays.
-
-    Returns:
-        lcu:  (num_heads, num_patches, 2) float32 — last dim = [real, imag]
-        poly: (num_heads, poly_degree+1) float32
-    """
-    lcu_chunks, poly_chunks = [], []
-    for head in model.cv_attention.heads:
-        b = head.lcu_coeffs().detach().cpu()
-        lcu_chunks.append(torch.stack([b.real, b.imag], dim=-1))
-        poly_chunks.append(head.poly_coeffs().detach().cpu())
-    lcu = torch.stack(lcu_chunks).numpy().astype(np.float32)
-    poly = torch.stack(poly_chunks).numpy().astype(np.float32)
-    return lcu, poly
-
-
-@torch.no_grad()
-def _quantum_diagnostics(model, loader) -> tuple[dict, np.ndarray, dict]:
-    """Capture hypernetwork gate-parameter distributions, state norms, and
-    per-mode photon numbers on a fixed diagnostic subset.
-
-    Returns:
-        stats_summary:  JSON-friendly dict (mean/std/min/max per head per gate type).
-        mean_photon:    (num_heads, num_modes) float32 — ⟨n̂_k⟩.
-        raw:            dict of large numpy arrays (gate-param samples + state norms)
-                        to be saved as an .npz alongside the run directory.
-    """
-    from cv_quixer.quantum import FockState  # local import to avoid top-level cycles
-
-    model.eval()
-    attn = model.cv_attention
-    num_heads = len(attn.heads)
-    num_modes = attn.num_modes
-    cutoff = attn.cutoff_dim
-    head0 = attn.heads[0]
-    n_bs = len(head0._bs_pairs)
-    layout = _gate_param_layout(num_modes, n_bs)
-
-    gate_outs: list[list[torch.Tensor]] = [[] for _ in range(num_heads)]
-    state_norm_chunks: list[list[float]] = [[] for _ in range(num_heads)]
-    photon_sums = np.zeros((num_heads, num_modes), dtype=np.float64)
-    n_processed = 0
-
-    for patches, _ in loader:
-        patches = patches.to(device)
-        B, N, _ = patches.shape
-        n_processed += B
-
-        for h_idx, head in enumerate(attn.heads):
-            outs_bn: list[torch.Tensor] = []
-            for b in range(B):
-                for i in range(N):
-                    outs_bn.append(head.hypernetwork(patches[b, i], i).detach().cpu())
-            gate_outs[h_idx].append(torch.stack(outs_bn).reshape(B, N, -1))
-
-        out = model(patches, return_states=True)
-        states_list = out.states
-        for h_idx, state_batch in enumerate(states_list):
-            circuit = attn.heads[h_idx].circuit
-            for b in range(B):
-                fs = FockState(state_batch[b], num_modes, cutoff)
-                for k in range(num_modes):
-                    photon_sums[h_idx, k] += float(
-                        circuit.measure_photon_number(k, fs).item()
-                    )
-                state_norm_chunks[h_idx].append(float(fs.norm().item()))
-
-    mean_photon = (photon_sums / max(n_processed, 1)).astype(np.float32)
-
-    stats_summary: dict = {"per_head": [], "gate_layout": layout}
-    raw: dict = {}
-    for h_idx in range(num_heads):
-        flat = torch.cat(gate_outs[h_idx], dim=0).numpy()  # (S, N, P)
-        flat2d = flat.reshape(-1, flat.shape[-1])           # (S*N, P)
-        gate_stats: dict = {}
-        for name, start, count in layout:
-            if count == 0:
-                gate_stats[name] = {"mean": [], "std": [], "min": [], "max": []}
-                continue
-            sl = flat2d[:, start:start + count]
-            gate_stats[name] = {
-                "mean": sl.mean(axis=0).astype(float).tolist(),
-                "std":  sl.std(axis=0).astype(float).tolist(),
-                "min":  sl.min(axis=0).astype(float).tolist(),
-                "max":  sl.max(axis=0).astype(float).tolist(),
-            }
-            raw[f"head{h_idx}_{name}"] = sl.astype(np.float32)
-        stats_summary["per_head"].append(gate_stats)
-        raw[f"head{h_idx}_state_norms"] = np.asarray(
-            state_norm_chunks[h_idx], dtype=np.float32
-        )
-    raw["mean_photon_number"] = mean_photon
-    return stats_summary, mean_photon, raw
 
 
 def train_epoch(epoch: int) -> float:
@@ -622,74 +442,6 @@ def train_epoch(epoch: int) -> float:
     return total_trunc / total
 
 
-@torch.no_grad()
-def evaluate(loader, num_classes: int = 10) -> dict:
-    """Run one evaluation pass; return loss / accuracy plus per-sample and
-    per-class diagnostics.
-
-    Returns a dict with keys:
-        loss           — mean cross-entropy
-        acc            — overall accuracy
-        trunc_loss     — mean per-sample truncation loss (eval-time)
-        y_true         — int64 (N,) ground-truth labels
-        y_pred         — int64 (N,) argmax predictions
-        y_probs        — float32 (N, num_classes) softmax probabilities
-        per_class_acc  — float32 (num_classes,) recall per class
-        confusion      — int64 (num_classes, num_classes) — rows true, cols pred
-        readouts       — float32 (N, num_heads * readout_per_head) pre-decoder
-                         activations (used for the post-hoc t-SNE plot)
-    """
-    model.eval()
-    total_loss, total_trunc, correct, total = 0.0, 0.0, 0, 0
-    y_true_chunks: list[torch.Tensor] = []
-    y_pred_chunks: list[torch.Tensor] = []
-    y_prob_chunks: list[torch.Tensor] = []
-    readout_chunks: list[torch.Tensor] = []
-    for patches, labels in loader:
-        patches, labels = patches.to(device), labels.to(device)
-        out = model(patches, return_trunc_loss=True, return_readouts=True)
-        # out.trunc_loss is None when quantum_cfg.trunc_penalty == "none".
-        logits, readouts = out.logits, out.readouts
-        if out.trunc_loss is not None:
-            total_trunc += out.trunc_loss.item() * labels.size(0)
-        total_loss += F.cross_entropy(logits, labels).item() * labels.size(0)
-        preds = logits.argmax(dim=-1)
-        correct += (preds == labels).sum().item()
-        total   += labels.size(0)
-        y_true_chunks.append(labels.detach().cpu())
-        y_pred_chunks.append(preds.detach().cpu())
-        y_prob_chunks.append(F.softmax(logits, dim=-1).detach().cpu().float())
-        readout_chunks.append(readouts.detach().cpu().float())
-
-    y_true = torch.cat(y_true_chunks).numpy().astype(np.int64)
-    y_pred = torch.cat(y_pred_chunks).numpy().astype(np.int64)
-    y_probs = torch.cat(y_prob_chunks).numpy().astype(np.float32)
-    readouts_np = torch.cat(readout_chunks).numpy().astype(np.float32)
-
-    flat = y_true.astype(np.int64) * num_classes + y_pred.astype(np.int64)
-    confusion = np.bincount(flat, minlength=num_classes * num_classes).reshape(
-        num_classes, num_classes
-    ).astype(np.int64)
-    class_totals = confusion.sum(axis=1)
-    per_class_acc = np.where(
-        class_totals > 0,
-        confusion.diagonal() / np.maximum(class_totals, 1),
-        0.0,
-    ).astype(np.float32)
-
-    return {
-        "loss":          total_loss / total,
-        "acc":           correct / total,
-        "trunc_loss":    total_trunc / total,
-        "y_true":        y_true,
-        "y_pred":        y_pred,
-        "y_probs":       y_probs,
-        "per_class_acc": per_class_acc,
-        "confusion":     confusion,
-        "readouts":      readouts_np,
-    }
-
-
 # ---------------------------------------------------------------------------
 # Plotting (re-rendered after every epoch so a SLURM kill mid-run still
 # leaves usable figures)
@@ -717,23 +469,11 @@ def _epoch_boundary_steps() -> list[int]:
     return boundaries[:-1]  # don't draw a line at the final step
 
 
-_FASHIONMNIST_CLASSES = (
-    "T-shirt/top", "Trouser", "Pullover", "Dress", "Coat",
-    "Sandal", "Shirt", "Sneaker", "Bag", "Ankle boot",
-)
-_MNIST_CLASSES = tuple(str(d) for d in range(10))
-
-
-def _class_names() -> tuple[str, ...]:
-    return (_MNIST_CLASSES if data_cfg.dataset == "mnist"
-            else _FASHIONMNIST_CLASSES)
-
-
 def save_figures() -> None:
     epoch_x = list(range(1, len(history["epoch"]["train_loss"]) + 1))
     eh = history["epoch"]
     bh = history["batch"]
-    classes = _class_names()
+    classes = class_names(config)
     num_classes = len(classes)
 
     # Per-epoch loss
@@ -862,8 +602,8 @@ best_epoch    = (history["epoch"]["test_acc"].index(best_test_acc) + 1
 for epoch in range(start_epoch, EPOCHS + 1):
     t0 = time.time()
     trunc_loss = train_epoch(epoch)
-    train_eval = evaluate(train_eval_loader)
-    test_eval  = evaluate(test_loader)
+    train_eval = evaluate(model, train_eval_loader, device)
+    test_eval  = evaluate(model, test_loader, device)
     elapsed_train_eval = time.time() - t0
 
     train_loss, train_acc = train_eval["loss"], train_eval["acc"]
@@ -892,13 +632,13 @@ for epoch in range(start_epoch, EPOCHS + 1):
         readouts=test_eval["readouts"],
     )
 
-    lcu_snap, poly_snap = _snapshot_coefficients(model)
+    lcu_snap, poly_snap = snapshot_coefficients(model)
     history["epoch"]["lcu_coeffs"].append(lcu_snap.tolist())
     history["epoch"]["poly_coeffs"].append(poly_snap.tolist())
 
     t_diag = time.time()
     try:
-        stats_summary, mean_photon, diag_raw = _quantum_diagnostics(model, diag_loader)
+        stats_summary, mean_photon, diag_raw = quantum_diagnostics(model, diag_loader, device)
         history["epoch"]["hypernet_stats"].append(stats_summary)
         history["epoch"]["mean_photon_number"].append(mean_photon.tolist())
         np.savez_compressed(diag_dir / f"epoch_{epoch:04d}.npz", **diag_raw)
@@ -907,7 +647,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
         # Don't let a diagnostic-pass failure kill a multi-hour training run.
         import warnings
         warnings.warn(
-            f"_quantum_diagnostics failed at epoch {epoch}: {type(e).__name__}: {e}. "
+            f"quantum_diagnostics failed at epoch {epoch}: {type(e).__name__}: {e}. "
             "Skipping diagnostic outputs for this epoch.",
             RuntimeWarning,
         )

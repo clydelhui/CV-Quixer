@@ -28,27 +28,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from cv_quixer.config.schema import ExperimentConfig
+from cv_quixer.evaluation.labels import class_names
 
 # Heavy / torch-dependent imports (build_model, PatchedDataset, DataLoader,
 # torch itself) are intentionally moved into _load_model_and_run_inference()
 # below so the default --no-flag path stays fast and works on machines without
-# a configured PyTorch backend.
-
-
-_FASHIONMNIST_CLASSES = (
-    "T-shirt/top", "Trouser", "Pullover", "Dress", "Coat",
-    "Sandal", "Shirt", "Sneaker", "Bag", "Ankle boot",
-)
-_MNIST_CLASSES = tuple(str(d) for d in range(10))
+# a configured PyTorch backend. cv_quixer.evaluation.labels is torch-free so
+# importing class_names at module scope is safe.
 
 
 # ---------------------------------------------------------------------------
 # Loading + helpers
 # ---------------------------------------------------------------------------
-
-
-def _class_names(config: ExperimentConfig) -> tuple[str, ...]:
-    return _MNIST_CLASSES if config.data.dataset == "mnist" else _FASHIONMNIST_CLASSES
 
 
 def _resolve_epoch(history: dict, epoch_arg: str) -> int:
@@ -305,7 +296,7 @@ def plot_confusion_matrix_evolution(run: dict) -> None:
     if not cms:
         print("  - test_confusion missing → skipping confusion_matrix_evolution")
         return
-    classes = _class_names(run["config"])
+    classes = class_names(run["config"])
     n_epochs = len(cms)
     cols = min(4, n_epochs)
     rows = (n_epochs + cols - 1) // cols
@@ -336,7 +327,7 @@ def write_per_class_metrics_table(run: dict) -> None:
         return
     y_true = run["predictions"]["y_true"]
     y_pred = run["predictions"]["y_pred"]
-    classes = _class_names(run["config"])
+    classes = class_names(run["config"])
     report = classification_report(
         y_true, y_pred,
         target_names=classes,
@@ -397,7 +388,7 @@ def plot_misclassification_gallery(run: dict, recomputed: dict | None) -> None:
     y_pred = recomputed["y_pred"]
     y_probs = recomputed["y_probs"]
     images = recomputed["patches"]    # in this refactor, already (N, H, W)
-    classes = _class_names(run["config"])
+    classes = class_names(run["config"])
 
     wrong = np.where(y_true != y_pred)[0]
     if len(wrong) == 0:
@@ -482,7 +473,7 @@ def plot_embedding_tsne(run: dict, recomputed: dict | None) -> None:
         return
     readouts = recomputed["readouts"]
     y_true = recomputed["y_true"]
-    classes = _class_names(run["config"])
+    classes = class_names(run["config"])
     # Sub-sample if very large (TSNE is O(n^2))
     n_max = 5000
     if len(readouts) > n_max:
