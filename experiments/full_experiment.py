@@ -48,6 +48,7 @@ from datetime import datetime
 from pathlib import Path
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
@@ -59,6 +60,7 @@ from tqdm import tqdm
 from cv_quixer.config.schema import (
     DataConfig,
     ExperimentConfig,
+    ObservableSpec,
     QuantumConfig,
     TrainingConfig,
 )
@@ -82,8 +84,8 @@ from cv_quixer.utils import print_parameter_table
 EPOCHS = 3
 BATCH_SIZE = 64
 TARGET_PARAMS = 13_760
-CHECKPOINT_INTERVAL = 1   # versioned epoch_NNNN.pt every N epochs
-MA_WINDOW = 50            # moving-average window for per-batch plots
+CHECKPOINT_INTERVAL = 1  # versioned epoch_NNNN.pt every N epochs
+MA_WINDOW = 50  # moving-average window for per-batch plots
 
 
 # ---------------------------------------------------------------------------
@@ -91,27 +93,51 @@ MA_WINDOW = 50            # moving-average window for per-batch plots
 # ---------------------------------------------------------------------------
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--resume", type=str, default=None,
-                    help="path to checkpoint .pt file to resume from. The "
-                         "parent run directory is reused so the run continues "
-                         "writing into the same folder.")
-parser.add_argument("--epochs", type=int, default=None,
-                    help=f"override the default EPOCHS={EPOCHS}")
-parser.add_argument("--train-limit", type=int, default=None,
-                    help="cap training set to first N samples (deterministic, "
-                         "smoke-test only). Mutually exclusive with --train-fraction.")
-parser.add_argument("--test-limit", type=int, default=None,
-                    help="cap test set to first N samples (deterministic, "
-                         "smoke-test only). Mutually exclusive with --test-fraction.")
-parser.add_argument("--train-fraction", type=float, default=None,
-                    help="random subset of the train set (0 < x <= 1). "
-                         "Mutually exclusive with --train-limit.")
-parser.add_argument("--test-fraction", type=float, default=None,
-                    help="random subset of the test set (0 < x <= 1). "
-                         "Mutually exclusive with --test-limit.")
-parser.add_argument("--subset-seed", type=int, default=42,
-                    help="seed shared by --train-fraction and --test-fraction "
-                         "random subsets")
+parser.add_argument(
+    "--resume",
+    type=str,
+    default=None,
+    help="path to checkpoint .pt file to resume from. The "
+    "parent run directory is reused so the run continues "
+    "writing into the same folder.",
+)
+parser.add_argument(
+    "--epochs", type=int, default=None, help=f"override the default EPOCHS={EPOCHS}"
+)
+parser.add_argument(
+    "--train-limit",
+    type=int,
+    default=None,
+    help="cap training set to first N samples (deterministic, "
+    "smoke-test only). Mutually exclusive with --train-fraction.",
+)
+parser.add_argument(
+    "--test-limit",
+    type=int,
+    default=None,
+    help="cap test set to first N samples (deterministic, "
+    "smoke-test only). Mutually exclusive with --test-fraction.",
+)
+parser.add_argument(
+    "--train-fraction",
+    type=float,
+    default=None,
+    help="random subset of the train set (0 < x <= 1). "
+    "Mutually exclusive with --train-limit.",
+)
+parser.add_argument(
+    "--test-fraction",
+    type=float,
+    default=None,
+    help="random subset of the test set (0 < x <= 1). "
+    "Mutually exclusive with --test-limit.",
+)
+parser.add_argument(
+    "--subset-seed",
+    type=int,
+    default=42,
+    help="seed shared by --train-fraction and --test-fraction random subsets",
+)
 args = parser.parse_args()
 
 if args.train_fraction is not None and args.train_limit is not None:
@@ -144,14 +170,20 @@ quantum_cfg = QuantumConfig(
     cutoff_dim=6,
     num_heads=4,
     cnn_channels_1=8,
-    cnn_channels_2=16,          # overridden by target_params auto-scaling
+    cnn_channels_2=16,  # overridden by target_params auto-scaling
     cnn_kernel_size=3,
     decoder_hidden_dim=32,
-    poly_degree=2,
+    poly_degree=3,
     dtype="complex64",
     trunc_penalty="norm",
     trunc_lambda=0.01,
     target_params=TARGET_PARAMS,
+    readout_observables=[
+        ObservableSpec(type="x", mode="all"),
+        ObservableSpec(type="p", mode="all"),
+        ObservableSpec(type="x_squared", mode="all"),
+        ObservableSpec(type="p_squared", mode="all"),
+    ],
 )
 config = ExperimentConfig(
     name="full_fashionmnist",
@@ -180,10 +212,10 @@ else:
     print(f"Fresh run directory: {run_dir}")
 
 ckpt_dir = run_dir / "checkpoints"
-fig_dir  = run_dir / "figures"
-log_dir  = run_dir / "logs"
+fig_dir = run_dir / "figures"
+log_dir = run_dir / "logs"
 preds_dir = run_dir / "predictions"
-diag_dir  = run_dir / "diagnostics"
+diag_dir = run_dir / "diagnostics"
 for d in (run_dir, ckpt_dir, fig_dir, log_dir, preds_dir, diag_dir):
     d.mkdir(parents=True, exist_ok=True)
 
@@ -230,7 +262,7 @@ torch.manual_seed(config.training.seed)
 # ---------------------------------------------------------------------------
 
 train_ds_full = PatchedDataset(data_cfg, train=True)
-test_ds_full  = PatchedDataset(data_cfg, train=False)
+test_ds_full = PatchedDataset(data_cfg, train=False)
 
 if args.train_limit is not None:
     n = min(args.train_limit, len(train_ds_full))
@@ -241,8 +273,10 @@ elif args.train_fraction is not None and args.train_fraction < 1.0:
     g = torch.Generator().manual_seed(args.subset_seed)
     perm = torch.randperm(len(train_ds_full), generator=g)[:n].tolist()
     train_ds = Subset(train_ds_full, indices=perm)
-    print(f"Train subset:  random {len(train_ds):,} / {len(train_ds_full):,} "
-          f"samples (--train-fraction {args.train_fraction}, seed {args.subset_seed})")
+    print(
+        f"Train subset:  random {len(train_ds):,} / {len(train_ds_full):,} "
+        f"samples (--train-fraction {args.train_fraction}, seed {args.subset_seed})"
+    )
 else:
     train_ds = train_ds_full
     print(f"Train set:     full {len(train_ds):,} samples")
@@ -256,19 +290,23 @@ elif args.test_fraction is not None and args.test_fraction < 1.0:
     g = torch.Generator().manual_seed(args.subset_seed)
     perm = torch.randperm(len(test_ds_full), generator=g)[:n].tolist()
     test_ds = Subset(test_ds_full, indices=perm)
-    print(f"Test subset:   random {len(test_ds):,} / {len(test_ds_full):,} "
-          f"samples (--test-fraction {args.test_fraction}, seed {args.subset_seed})")
+    print(
+        f"Test subset:   random {len(test_ds):,} / {len(test_ds_full):,} "
+        f"samples (--test-fraction {args.test_fraction}, seed {args.subset_seed})"
+    )
 else:
     test_ds = test_ds_full
     print(f"Test set:      full {len(test_ds):,} samples")
 
-train_loader      = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
 train_eval_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=False)
-test_loader       = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False)
+test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
 
 
 save_test_images_once(
-    test_loader, data_cfg.image_size, data_cfg.patch_size,
+    test_loader,
+    data_cfg.image_size,
+    data_cfg.patch_size,
     preds_dir / "test_images.npz",
 )
 
@@ -276,13 +314,19 @@ save_test_images_once(
 # across resumes thanks to the fixed seed).
 DIAG_SIZE = min(512, len(test_ds))
 _diag_g = torch.Generator().manual_seed(args.subset_seed + 1)
-diag_indices_in_test = torch.randperm(len(test_ds), generator=_diag_g)[:DIAG_SIZE].tolist()
+diag_indices_in_test = torch.randperm(len(test_ds), generator=_diag_g)[
+    :DIAG_SIZE
+].tolist()
 diag_ds = Subset(test_ds, indices=diag_indices_in_test)
 diag_loader = DataLoader(diag_ds, batch_size=BATCH_SIZE, shuffle=False)
 
-print(f"Train samples: {len(train_ds):,} | test samples: {len(test_ds):,} "
-      f"| diagnostic subset: {len(diag_ds):,}")
-print(f"Train batches/epoch: {len(train_loader):,} | test batches: {len(test_loader):,}\n")
+print(
+    f"Train samples: {len(train_ds):,} | test samples: {len(test_ds):,} "
+    f"| diagnostic subset: {len(diag_ds):,}"
+)
+print(
+    f"Train batches/epoch: {len(train_loader):,} | test batches: {len(test_loader):,}\n"
+)
 
 
 def _absolute_indices(ds, full_len: int) -> np.ndarray:
@@ -301,13 +345,15 @@ def _save_subset_indices_once(out_path: Path) -> None:
     Idempotent: skip if the file already exists with matching sizes.
     """
     train_abs = _absolute_indices(train_ds, len(train_ds_full))
-    test_abs  = _absolute_indices(test_ds,  len(test_ds_full))
-    diag_abs  = test_abs[diag_indices_in_test]
+    test_abs = _absolute_indices(test_ds, len(test_ds_full))
+    diag_abs = test_abs[diag_indices_in_test]
     if out_path.is_file():
         with np.load(out_path) as existing:
-            if (existing["train_indices"].size == train_abs.size
+            if (
+                existing["train_indices"].size == train_abs.size
                 and existing["test_indices"].size == test_abs.size
-                and existing["diag_indices"].size == diag_abs.size):
+                and existing["diag_indices"].size == diag_abs.size
+            ):
                 return
     np.savez_compressed(
         out_path,
@@ -428,7 +474,7 @@ def train_epoch(epoch: int) -> float:
         batch_acc = (preds == labels).sum().item() / n
 
         total_trunc += trunc_loss.item() * n
-        total       += n
+        total += n
 
         global_step += 1
         history["batch"]["step"].append(global_step)
@@ -460,7 +506,7 @@ def _moving_average(x: list[float], window: int) -> np.ndarray:
 def _epoch_boundary_steps() -> list[int]:
     """Global step at which each epoch ended (used for vertical markers)."""
     epochs_arr = np.asarray(history["batch"]["epoch"])
-    steps_arr  = np.asarray(history["batch"]["step"])
+    steps_arr = np.asarray(history["batch"]["step"])
     boundaries = []
     for e in sorted(set(epochs_arr.tolist())):
         mask = epochs_arr == e
@@ -479,42 +525,74 @@ def save_figures() -> None:
     # Per-epoch loss
     fig, ax = plt.subplots(figsize=(7, 4.5))
     ax.plot(epoch_x, eh["train_loss"], label="train loss", marker="o")
-    ax.plot(epoch_x, eh["test_loss"],  label="test loss",  marker="s")
-    ax.set_xlabel("Epoch"); ax.set_ylabel("Cross-entropy loss")
-    ax.set_title("Loss (per epoch)"); ax.legend(); ax.grid(alpha=0.3)
-    fig.tight_layout(); fig.savefig(fig_dir / "loss_curve.png", dpi=150); plt.close(fig)
+    ax.plot(epoch_x, eh["test_loss"], label="test loss", marker="s")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Cross-entropy loss")
+    ax.set_title("Loss (per epoch)")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(fig_dir / "loss_curve.png", dpi=150)
+    plt.close(fig)
 
     # Per-epoch accuracy
     fig, ax = plt.subplots(figsize=(7, 4.5))
     ax.plot(epoch_x, eh["train_acc"], label="train acc", marker="o")
-    ax.plot(epoch_x, eh["test_acc"],  label="test acc",  marker="s")
-    ax.set_xlabel("Epoch"); ax.set_ylabel("Accuracy")
-    ax.set_title("Accuracy (per epoch)"); ax.legend(); ax.grid(alpha=0.3)
-    fig.tight_layout(); fig.savefig(fig_dir / "accuracy_curve.png", dpi=150); plt.close(fig)
+    ax.plot(epoch_x, eh["test_acc"], label="test acc", marker="s")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Accuracy")
+    ax.set_title("Accuracy (per epoch)")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(fig_dir / "accuracy_curve.png", dpi=150)
+    plt.close(fig)
 
     # Per-epoch trunc loss (train + test side-by-side if test is available)
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    ax.plot(epoch_x, eh["trunc_loss"], label="train trunc loss",
-            color="tab:orange", marker="o")
+    ax.plot(
+        epoch_x,
+        eh["trunc_loss"],
+        label="train trunc loss",
+        color="tab:orange",
+        marker="o",
+    )
     if eh.get("test_trunc_loss"):
-        ax.plot(epoch_x[:len(eh["test_trunc_loss"])], eh["test_trunc_loss"],
-                label="test trunc loss", color="tab:blue", marker="s")
-    ax.set_xlabel("Epoch"); ax.set_ylabel("Mean per-patch truncation loss")
-    ax.set_title("Truncation loss (per epoch)"); ax.legend(); ax.grid(alpha=0.3)
-    fig.tight_layout(); fig.savefig(fig_dir / "trunc_loss_curve.png", dpi=150); plt.close(fig)
+        ax.plot(
+            epoch_x[: len(eh["test_trunc_loss"])],
+            eh["test_trunc_loss"],
+            label="test trunc loss",
+            color="tab:blue",
+            marker="s",
+        )
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Mean per-patch truncation loss")
+    ax.set_title("Truncation loss (per epoch)")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(fig_dir / "trunc_loss_curve.png", dpi=150)
+    plt.close(fig)
 
     # Per-class accuracy curve (test)
     if eh.get("test_per_class_acc"):
         fig, ax = plt.subplots(figsize=(9, 5.5))
-        per_class = np.asarray(eh["test_per_class_acc"])    # (n_epochs, C)
+        per_class = np.asarray(eh["test_per_class_acc"])  # (n_epochs, C)
         ep_x = list(range(1, per_class.shape[0] + 1))
         cmap = matplotlib.colormaps.get_cmap("tab10").resampled(num_classes)
         for c in range(per_class.shape[1]):
-            ax.plot(ep_x, per_class[:, c], marker="o", color=cmap(c),
-                    label=f"{c}: {classes[c]}")
-        ax.set_xlabel("Epoch"); ax.set_ylabel("Test accuracy (recall)")
+            ax.plot(
+                ep_x,
+                per_class[:, c],
+                marker="o",
+                color=cmap(c),
+                label=f"{c}: {classes[c]}",
+            )
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Test accuracy (recall)")
         ax.set_title("Per-class test accuracy across epochs")
-        ax.set_ylim(-0.02, 1.02); ax.grid(alpha=0.3)
+        ax.set_ylim(-0.02, 1.02)
+        ax.grid(alpha=0.3)
         ax.legend(loc="lower right", fontsize=8, ncol=2)
         fig.tight_layout()
         fig.savefig(fig_dir / "per_class_accuracy_curve.png", dpi=150)
@@ -526,8 +604,8 @@ def save_figures() -> None:
         cm_row = cm / np.maximum(cm.sum(axis=1, keepdims=True), 1)
         fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
         for ax_, mat, title, fmt, cmap_name in (
-            (axes[0], cm,     "Counts",          "d",   "Blues"),
-            (axes[1], cm_row, "Row-normalised",  ".2f", "Blues"),
+            (axes[0], cm, "Counts", "d", "Blues"),
+            (axes[1], cm_row, "Row-normalised", ".2f", "Blues"),
         ):
             im = ax_.imshow(mat, cmap=cmap_name)
             ax_.set_title(f"{title} (epoch {len(eh['test_confusion'])})")
@@ -535,14 +613,16 @@ def save_figures() -> None:
             ax_.set_yticks(range(num_classes))
             ax_.set_xticklabels(classes, rotation=45, ha="right", fontsize=8)
             ax_.set_yticklabels(classes, fontsize=8)
-            ax_.set_xlabel("Predicted"); ax_.set_ylabel("True")
+            ax_.set_xlabel("Predicted")
+            ax_.set_ylabel("True")
             for i in range(num_classes):
                 for j in range(num_classes):
                     val = mat[i, j]
                     txt = format(val, fmt)
                     colour = "white" if (val > mat.max() * 0.6) else "black"
-                    ax_.text(j, i, txt, ha="center", va="center",
-                             color=colour, fontsize=7)
+                    ax_.text(
+                        j, i, txt, ha="center", va="center", color=colour, fontsize=7
+                    )
             fig.colorbar(im, ax=ax_, fraction=0.046, pad=0.04)
         fig.suptitle("Test confusion matrix")
         fig.tight_layout()
@@ -555,8 +635,9 @@ def save_figures() -> None:
     steps = bh["step"]
     boundaries = _epoch_boundary_steps()
 
-    def _per_batch_plot(values: list[float], ylabel: str, title: str,
-                        fname: str, log_y: bool = False) -> None:
+    def _per_batch_plot(
+        values: list[float], ylabel: str, title: str, fname: str, log_y: bool = False
+    ) -> None:
         fig, ax = plt.subplots(figsize=(10, 4.5))
         ax.plot(steps, values, alpha=0.25, lw=0.7, label="per batch")
         ma = _moving_average(values, MA_WINDOW)
@@ -566,19 +647,40 @@ def save_figures() -> None:
             ax.axvline(b, color="gray", ls="--", alpha=0.4, lw=0.8)
         if log_y:
             ax.set_yscale("log")
-        ax.set_xlabel("Global batch step"); ax.set_ylabel(ylabel)
-        ax.set_title(title); ax.legend(); ax.grid(alpha=0.3)
-        fig.tight_layout(); fig.savefig(fig_dir / fname, dpi=150); plt.close(fig)
+        ax.set_xlabel("Global batch step")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.legend()
+        ax.grid(alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(fig_dir / fname, dpi=150)
+        plt.close(fig)
 
-    _per_batch_plot(bh["train_loss"], "Cross-entropy loss",
-                    "Train CE loss (per batch)", "per_batch_train_loss.png")
-    _per_batch_plot(bh["trunc_loss"], "Truncation loss",
-                    "Truncation loss (per batch)", "per_batch_trunc_loss.png")
-    _per_batch_plot(bh["batch_acc"], "Batch accuracy",
-                    "Train accuracy (per batch)", "per_batch_train_accuracy.png")
-    _per_batch_plot(bh["grad_norm"], "Gradient L2 norm (log scale)",
-                    "Gradient norm (per batch)", "per_batch_grad_norm.png",
-                    log_y=True)
+    _per_batch_plot(
+        bh["train_loss"],
+        "Cross-entropy loss",
+        "Train CE loss (per batch)",
+        "per_batch_train_loss.png",
+    )
+    _per_batch_plot(
+        bh["trunc_loss"],
+        "Truncation loss",
+        "Truncation loss (per batch)",
+        "per_batch_trunc_loss.png",
+    )
+    _per_batch_plot(
+        bh["batch_acc"],
+        "Batch accuracy",
+        "Train accuracy (per batch)",
+        "per_batch_train_accuracy.png",
+    )
+    _per_batch_plot(
+        bh["grad_norm"],
+        "Gradient L2 norm (log scale)",
+        "Gradient norm (per batch)",
+        "per_batch_grad_norm.png",
+        log_y=True,
+    )
 
 
 def save_history() -> None:
@@ -590,24 +692,31 @@ def save_history() -> None:
 # Training loop
 # ---------------------------------------------------------------------------
 
-print(f"{'Epoch':<7} {'Train loss':<12} {'Train acc':<11} "
-      f"{'Test loss':<11} {'Test acc':<11} {'Trunc loss':<12} {'Time'}")
+print(
+    f"{'Epoch':<7} {'Train loss':<12} {'Train acc':<11} "
+    f"{'Test loss':<11} {'Test acc':<11} {'Trunc loss':<12} {'Time'}"
+)
 print("─" * 76)
 
 run_start = time.time()
-best_test_acc = max(history["epoch"]["test_acc"]) if history["epoch"]["test_acc"] else -1.0
-best_epoch    = (history["epoch"]["test_acc"].index(best_test_acc) + 1
-                 if history["epoch"]["test_acc"] else None)
+best_test_acc = (
+    max(history["epoch"]["test_acc"]) if history["epoch"]["test_acc"] else -1.0
+)
+best_epoch = (
+    history["epoch"]["test_acc"].index(best_test_acc) + 1
+    if history["epoch"]["test_acc"]
+    else None
+)
 
 for epoch in range(start_epoch, EPOCHS + 1):
     t0 = time.time()
     trunc_loss = train_epoch(epoch)
     train_eval = evaluate(model, train_eval_loader, device)
-    test_eval  = evaluate(model, test_loader, device)
+    test_eval = evaluate(model, test_loader, device)
     elapsed_train_eval = time.time() - t0
 
     train_loss, train_acc = train_eval["loss"], train_eval["acc"]
-    test_loss,  test_acc  = test_eval["loss"],  test_eval["acc"]
+    test_loss, test_acc = test_eval["loss"], test_eval["acc"]
 
     history["epoch"]["train_loss"].append(train_loss)
     history["epoch"]["train_acc"].append(train_acc)
@@ -615,12 +724,8 @@ for epoch in range(start_epoch, EPOCHS + 1):
     history["epoch"]["test_acc"].append(test_acc)
     history["epoch"]["trunc_loss"].append(trunc_loss)
     history["epoch"]["test_trunc_loss"].append(float(test_eval["trunc_loss"]))
-    history["epoch"]["train_per_class_acc"].append(
-        train_eval["per_class_acc"].tolist()
-    )
-    history["epoch"]["test_per_class_acc"].append(
-        test_eval["per_class_acc"].tolist()
-    )
+    history["epoch"]["train_per_class_acc"].append(train_eval["per_class_acc"].tolist())
+    history["epoch"]["test_per_class_acc"].append(test_eval["per_class_acc"].tolist())
     history["epoch"]["train_confusion"].append(train_eval["confusion"].tolist())
     history["epoch"]["test_confusion"].append(test_eval["confusion"].tolist())
 
@@ -638,7 +743,9 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
     t_diag = time.time()
     try:
-        stats_summary, mean_photon, diag_raw = quantum_diagnostics(model, diag_loader, device)
+        stats_summary, mean_photon, diag_raw = quantum_diagnostics(
+            model, diag_loader, device
+        )
         history["epoch"]["hypernet_stats"].append(stats_summary)
         history["epoch"]["mean_photon_number"].append(mean_photon.tolist())
         np.savez_compressed(diag_dir / f"epoch_{epoch:04d}.npz", **diag_raw)
@@ -646,6 +753,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
     except Exception as e:
         # Don't let a diagnostic-pass failure kill a multi-hour training run.
         import warnings
+
         warnings.warn(
             f"quantum_diagnostics failed at epoch {epoch}: {type(e).__name__}: {e}. "
             "Skipping diagnostic outputs for this epoch.",
@@ -656,9 +764,11 @@ for epoch in range(start_epoch, EPOCHS + 1):
         diag_status = "  (diag skipped)"
 
     elapsed = time.time() - t0
-    print(f"{epoch:<7} {train_loss:<12.4f} {train_acc:<11.3f} "
-          f"{test_loss:<11.4f} {test_acc:<11.3f} {trunc_loss:<12.4f} "
-          f"{elapsed:.1f}s{diag_status}")
+    print(
+        f"{epoch:<7} {train_loss:<12.4f} {train_acc:<11.3f} "
+        f"{test_loss:<11.4f} {test_acc:<11.3f} {trunc_loss:<12.4f} "
+        f"{elapsed:.1f}s{diag_status}"
+    )
 
     # Checkpoints
     ckpt_payload = {
@@ -677,7 +787,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
     # Persist metadata + figures every epoch so a SLURM kill is non-destructive
     history["meta"]["best_test_acc"] = float(best_test_acc)
-    history["meta"]["best_epoch"]    = int(best_epoch) if best_epoch is not None else None
+    history["meta"]["best_epoch"] = int(best_epoch) if best_epoch is not None else None
     history["meta"]["total_runtime_sec"] = float(time.time() - run_start)
     save_history()
     save_figures()
@@ -708,4 +818,6 @@ print(f"Run directory:    {run_dir}/")
 print(f"  config         → config.json")
 print(f"  history        → history.json")
 print(f"  figures        → figures/")
-print(f"  checkpoints    → checkpoints/  (latest.pt, best.pt, final_model.pt, epoch_NNNN.pt)")
+print(
+    f"  checkpoints    → checkpoints/  (latest.pt, best.pt, final_model.pt, epoch_NNNN.pt)"
+)
