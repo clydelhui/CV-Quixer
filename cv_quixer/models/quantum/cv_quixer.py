@@ -139,6 +139,14 @@ def _resolve_cnn_channels(
 
     target = config.target_params
 
+    # The 2D sinusoidal PE in CNNHypernetwork requires
+    # feature_dim = cnn_channels_2 * h_out**2 to be even. When h_out is odd
+    # (e.g. patch_size=7, kernel=3 → h_out=3), cnn_channels_2 itself must be
+    # even; otherwise any positive integer is valid. Search over k where
+    # cnn_channels_2 = step * k.
+    h_out = patch_size - 2 * (config.cnn_kernel_size - 1)
+    step = 2 if (h_out * h_out) % 2 == 1 else 1
+
     def count(c2: int) -> int:
         return _param_count_formula(
             patch_size, num_patches,
@@ -150,19 +158,20 @@ def _resolve_cnn_channels(
         )
 
     lo, hi = 1, 4096
-    while count(hi) < target:
+    while count(step * hi) < target:
         hi *= 2
 
     while lo < hi:
         mid = (lo + hi) // 2
-        if count(mid) < target:
+        if count(step * mid) < target:
             lo = mid + 1
         else:
             hi = mid
 
     best = lo
-    if best > 1 and abs(count(best - 1) - target) < abs(count(best) - target):
+    if best > 1 and abs(count(step * (best - 1)) - target) < abs(count(step * best) - target):
         best -= 1
+    best *= step
 
     achieved = count(best)
     if abs(achieved - target) / max(target, 1) > 0.10:
