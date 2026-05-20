@@ -21,20 +21,17 @@
 # and run_eval_cutoff_sweep.sh; reused rather than rebuilt.
 #
 # Usage:
+#   # Backfill the baked-in default run dir below — no arguments needed:
+#   sbatch scripts/run_backfill_artefacts.sh
+#
+#   # Override the run dir via positional arg (and optionally pass extra
+#   # backfill_artefacts.py flags afterwards):
 #   sbatch scripts/run_backfill_artefacts.sh <run-dir> [extra args]
 #
 # Examples:
-#   # Backfill the target older run
-#   sbatch scripts/run_backfill_artefacts.sh \
-#       results/runs/full_fashionmnist_2026-05-15_01-55-34/
-#
-#   # Backfill just one epoch (pass-through arg)
-#   sbatch scripts/run_backfill_artefacts.sh \
-#       results/runs/<run>/ --epochs 3
-#
-#   # Force re-evaluation even if predictions/diagnostics exist
-#   sbatch scripts/run_backfill_artefacts.sh \
-#       results/runs/<run>/ --overwrite
+#   sbatch scripts/run_backfill_artefacts.sh results/runs/<other-run>/
+#   sbatch scripts/run_backfill_artefacts.sh results/runs/<run>/ --epochs 3
+#   sbatch scripts/run_backfill_artefacts.sh results/runs/<run>/ --overwrite
 # -----------------------------------------------------------------------
 #SBATCH --job-name=cv_quixer_backfill
 #SBATCH --output=slurm-%x-%j.out
@@ -46,8 +43,16 @@
 
 set -euo pipefail
 
-RUN_DIR="${1:?Usage: sbatch $0 <run-dir> [extra args]}"
-shift   # drop $1; "$@" now holds any extra backfill_artefacts.py flags
+# Default run dir to backfill — edit this to target a different run, or
+# override on the command line (sbatch scripts/run_backfill_artefacts.sh <run-dir>).
+DEFAULT_RUN_DIR="results/runs/full_fashionmnist_2026-05-15_01-55-34/"
+
+if [[ $# -gt 0 ]]; then
+    RUN_DIR="$1"
+    shift   # drop $1; "$@" now holds any extra backfill_artefacts.py flags
+else
+    RUN_DIR="$DEFAULT_RUN_DIR"
+fi
 
 echo "Job ID:   $SLURM_JOB_ID"
 echo "Node:     $SLURMD_NODENAME"
