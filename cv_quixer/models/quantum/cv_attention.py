@@ -335,6 +335,29 @@ class CNNHypernetwork(nn.Module):
         x = x.flatten(start_dim=1) + self.pos_enc   # (N, feature_dim)
         return self.linear(x)                       # (N, gate_params)
 
+    def forward_grid(self, patches: torch.Tensor) -> torch.Tensor:
+        """Map a batch of patch sequences to gate parameters in one call.
+
+        Equivalent to running ``forward(patches[b, i], i)`` for every
+        (b, i), but uses a single batched Conv2d pass and broadcasts the
+        positional encoding over the batch axis.
+
+        Args:
+            patches: Real tensor of shape (B, N, patch_size²).
+
+        Returns:
+            Tensor of shape (B, N, _gate_param_count(num_modes, bs_topology)).
+        """
+        B, N, _ = patches.shape
+        x = patches.reshape(B * N, 1, self.patch_size, self.patch_size)
+        x = torch.tanh(self.conv1(x))
+        x = torch.tanh(self.conv2(x))
+        # Flatten conv output then add the (N, feature_dim) PE broadcast
+        # across the batch axis. The PE is per patch-position, identical
+        # for every batch element.
+        x = x.flatten(start_dim=1).reshape(B, N, -1) + self.pos_enc
+        return self.linear(x)                       # (B, N, gate_params)
+
 
 # ---------------------------------------------------------------------------
 # LCUSumCoefficients

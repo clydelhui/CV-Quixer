@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 from cv_quixer.config.schema import QuantumConfig
 from cv_quixer.models.base import BaseVisionTransformer
 from cv_quixer.models.quantum.cv_attention import (
+    CNNHypernetwork,
     HyperCVAttention,
     HyperCVAttentionHead,
     LCUSumCoefficients,
@@ -320,6 +321,87 @@ class TestPatchParallelEquivalence:
         for name, p in head.named_parameters():
             if p.grad is not None:
                 assert torch.isfinite(p.grad).all(), f"non-finite grad in {name}"
+
+
+class TestDiagnosticsParallelEquivalence:
+    """Locks the two vectorised paths inside `quantum_diagnostics` against
+    the original Python-loop references — pinned to catch regressions.
+    """
+
+    def test_forward_grid_matches_single_patch_forward(self):
+        """``CNNHypernetwork.forward_grid`` matches the (B, N) Python loop
+        of ``forward(patches[b, i], i)``."""
+        torch.manual_seed(0)
+        patch_size, num_patches, num_modes = 7, 16, 2
+        hn = CNNHypernetwork(
+            patch_size=patch_size,
+            num_patches=num_patches,
+            num_modes=num_modes,
+            cnn_channels_1=4,
+            cnn_channels_2=8,
+            cnn_kernel_size=3,
+            bs_topology="linear",
+        )
+        hn.eval()
+
+        torch.manual_seed(1)
+        B = 5
+        patches = torch.randn(B, num_patches, patch_size * patch_size)
+
+        with torch.no_grad():
+            ref = torch.stack([
+                torch.stack([hn.forward(patches[b, i], i) for i in range(num_patches)])
+                for b in range(B)
+            ])                                              # (B, N, gate_params)
+            new = hn.forward_grid(patches)                  # (B, N, gate_params)
+
+        assert ref.shape == new.shape
+        assert torch.allclose(new, ref, atol=1e-6, rtol=1e-6)
+
+    def test_photon_number_and_state_norm_tensor_path(self):
+        """The (B, D, ..., D) tensor reductions match the per-element
+        ``circuit.measure_photon_number`` / ``FockState.norm()`` triple loop.
+        """
+        torch.manual_seed(2)
+        num_modes, cutoff = 2, 6
+        B = 7
+        # Random complex128 batched state — not normalised; the diagnostics
+        # path is supposed to report whatever norm the model produced.
+        state_batch = (
+            torch.randn(B, cutoff, cutoff, dtype=torch.complex128)
+        )
+        circuit = CVCircuit(num_modes=num_modes, cutoff_dim=cutoff)
+
+        # Reference: original triple loop.
+        ref_photon = [0.0] * num_modes
+        ref_norms: list[float] = []
+        for b in range(B):
+            fs = FockState(state_batch[b], num_modes, cutoff)
+            for k in range(num_modes):
+                ref_photon[k] += float(circuit.measure_photon_number(k, fs).item())
+            ref_norms.append(float(fs.norm().item()))
+
+        # New tensor path (matches diagnostics.py implementation).
+        probs = state_batch.abs() ** 2
+        ns = torch.arange(cutoff, dtype=probs.dtype)
+        new_photon = [0.0] * num_modes
+        for k in range(num_modes):
+            other_axes = tuple(
+                ax for ax in range(1, num_modes + 1) if ax != k + 1
+            )
+            p_k = probs.sum(dim=other_axes) if other_axes else probs
+            mean_n_per_b = (p_k * ns).sum(dim=-1)
+            new_photon[k] = float(mean_n_per_b.sum().item())
+        new_norms = probs.flatten(start_dim=1).sum(dim=-1).tolist()
+
+        assert torch.allclose(
+            torch.tensor(new_photon), torch.tensor(ref_photon),
+            atol=1e-10, rtol=1e-10,
+        )
+        assert torch.allclose(
+            torch.tensor(new_norms), torch.tensor(ref_norms),
+            atol=1e-10, rtol=1e-10,
+        )
 
 
 class TestTruncationHelpers:

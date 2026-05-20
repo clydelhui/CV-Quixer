@@ -201,8 +201,6 @@ def quantum_diagnostics(model, loader, device) -> tuple[dict, np.ndarray, dict]:
                         + mean_photon_number) to be saved as an .npz under
                         diagnostics/epoch_NNNN.npz.
     """
-    from cv_quixer.quantum import FockState  # local import to avoid top-level cycles
-
     model.eval()
     attn = model.cv_attention
     num_heads = len(attn.heads)
@@ -222,24 +220,34 @@ def quantum_diagnostics(model, loader, device) -> tuple[dict, np.ndarray, dict]:
         B, N, _ = patches.shape
         n_processed += B
 
+        # Hypernetwork gate-parameter samples: one batched call per head
+        # over the full (B, N, patch_dim) tensor.
         for h_idx, head in enumerate(attn.heads):
-            outs_bn: list[torch.Tensor] = []
-            for b in range(B):
-                for i in range(N):
-                    outs_bn.append(head.hypernetwork(patches[b, i], i).detach().cpu())
-            gate_outs[h_idx].append(torch.stack(outs_bn).reshape(B, N, -1))
+            gate_outs[h_idx].append(
+                head.hypernetwork.forward_grid(patches).detach().cpu()
+            )
 
         out = model(patches, return_states=True)
         states_list = out.states
+        # Photon number per mode and per-element state norm, computed
+        # directly from the batched state tensor (no per-element FockState
+        # construction, no reduced-density-matrix build).
         for h_idx, state_batch in enumerate(states_list):
-            circuit = attn.heads[h_idx].circuit
-            for b in range(B):
-                fs = FockState(state_batch[b], num_modes, cutoff)
-                for k in range(num_modes):
-                    photon_sums[h_idx, k] += float(
-                        circuit.measure_photon_number(k, fs).item()
-                    )
-                state_norm_chunks[h_idx].append(float(fs.norm().item()))
+            probs = state_batch.abs() ** 2                # (B, D, ..., D), real
+            ns = torch.arange(
+                cutoff, device=state_batch.device, dtype=probs.dtype,
+            )
+            for k in range(num_modes):
+                other_axes = tuple(
+                    ax for ax in range(1, num_modes + 1) if ax != k + 1
+                )
+                p_k = probs.sum(dim=other_axes) if other_axes else probs  # (B, D)
+                mean_n_per_b = (p_k * ns).sum(dim=-1)                     # (B,)
+                photon_sums[h_idx, k] += float(mean_n_per_b.sum().item())
+            norms = probs.flatten(start_dim=1).sum(dim=-1)               # (B,)
+            state_norm_chunks[h_idx].extend(
+                float(v) for v in norms.detach().cpu().tolist()
+            )
 
     mean_photon = (photon_sums / max(n_processed, 1)).astype(np.float32)
 
