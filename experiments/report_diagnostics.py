@@ -26,6 +26,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from tqdm import tqdm
 
 from cv_quixer.config.schema import ExperimentConfig
 from cv_quixer.evaluation.labels import class_names
@@ -214,7 +215,9 @@ def _load_model_and_run_inference(run: dict) -> dict:
         [], [], [], [], []
     )
     with torch.no_grad():
-        for patches, labels in test_loader:
+        for patches, labels in tqdm(test_loader, desc="full inference",
+                                    leave=False, unit="batch",
+                                    mininterval=5.0):
             patches_d = patches.to(device)
             out = model(patches_d, return_readouts=True)
             logits, readouts = out.logits, out.readouts

@@ -107,11 +107,16 @@ def load_subset_indices(run_dir: Path) -> dict[str, np.ndarray]:
 
 
 def save_test_images_once(loader, image_size: int, patch_size: int,
-                          out_path: Path) -> None:
+                          out_path: Path,
+                          *, progress: bool | str = False) -> None:
     """Reassemble the patches of every sample in `loader` into a (N, H, W) array
     and write it once. Idempotent: skip the work if the file already exists with
     a matching N. Used by experiments/report_diagnostics.py's default file-only
     mode to draw the misclassification gallery without re-running the model.
+
+    Pass ``progress=True`` (or a string label) to wrap the loader iteration in
+    a tqdm bar — useful when the loader has the full 10k+ test set and the
+    function is otherwise silent.
     """
     n_total = len(loader.dataset)
     if out_path.is_file():
@@ -122,7 +127,13 @@ def save_test_images_once(loader, image_size: int, patch_size: int,
     images = np.zeros((n_total, image_size, image_size), dtype=np.float32)
     labels = np.zeros(n_total, dtype=np.int64)
     idx = 0
-    for patches, lbls in loader:
+    iterator = loader
+    if progress:
+        from tqdm import tqdm
+        desc = progress if isinstance(progress, str) else "reassembling images"
+        iterator = tqdm(loader, desc=desc, leave=False, unit="batch",
+                        mininterval=5.0)
+    for patches, lbls in iterator:
         bs = patches.shape[0]
         p_np = patches.numpy().astype(np.float32)
         for b in range(bs):
@@ -190,9 +201,13 @@ def snapshot_coefficients(model) -> tuple[np.ndarray, np.ndarray]:
 
 
 @torch.no_grad()
-def quantum_diagnostics(model, loader, device) -> tuple[dict, np.ndarray, dict]:
+def quantum_diagnostics(model, loader, device,
+                        *, progress: bool | str = False) -> tuple[dict, np.ndarray, dict]:
     """Capture hypernetwork gate-parameter distributions, state norms, and
     per-mode photon numbers on the diagnostic subset carried by `loader`.
+
+    Pass ``progress=True`` or a string label to wrap the outer loader loop
+    in a tqdm bar.
 
     Returns:
         stats_summary:  JSON-friendly dict (mean/std/min/max per head per gate type).
@@ -215,7 +230,13 @@ def quantum_diagnostics(model, loader, device) -> tuple[dict, np.ndarray, dict]:
     photon_sums = np.zeros((num_heads, num_modes), dtype=np.float64)
     n_processed = 0
 
-    for patches, _ in loader:
+    iterator = loader
+    if progress:
+        from tqdm import tqdm
+        desc = progress if isinstance(progress, str) else "diagnostics"
+        iterator = tqdm(loader, desc=desc, leave=False, unit="batch",
+                        mininterval=5.0)
+    for patches, _ in iterator:
         patches = patches.to(device)
         B, N, _ = patches.shape
         n_processed += B
@@ -283,9 +304,13 @@ def quantum_diagnostics(model, loader, device) -> tuple[dict, np.ndarray, dict]:
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, num_classes: int = 10) -> dict:
+def evaluate(model, loader, device, num_classes: int = 10,
+             *, progress: bool | str = False) -> dict:
     """Run one evaluation pass; return loss / accuracy plus per-sample and
     per-class diagnostics.
+
+    Pass ``progress=True`` or a string label to wrap the loader iteration in
+    a tqdm bar.
 
     Returns a dict with keys:
         loss           — mean cross-entropy
@@ -306,7 +331,13 @@ def evaluate(model, loader, device, num_classes: int = 10) -> dict:
     y_pred_chunks: list[torch.Tensor] = []
     y_prob_chunks: list[torch.Tensor] = []
     readout_chunks: list[torch.Tensor] = []
-    for patches, labels in loader:
+    iterator = loader
+    if progress:
+        from tqdm import tqdm
+        desc = progress if isinstance(progress, str) else "eval"
+        iterator = tqdm(loader, desc=desc, leave=False, unit="batch",
+                        mininterval=5.0)
+    for patches, labels in iterator:
         patches, labels = patches.to(device), labels.to(device)
         out = model(patches, return_trunc_loss=True, return_readouts=True)
         # out.trunc_loss is None when the model's trunc_penalty == "none".

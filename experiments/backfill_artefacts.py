@@ -49,6 +49,7 @@ import dacite
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
+from tqdm import tqdm
 
 from cv_quixer.config.schema import ExperimentConfig
 from cv_quixer.data.mnist import PatchedDataset
@@ -136,6 +137,11 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
 
 
 def main() -> None:
+    # Line-buffer stdout so per-epoch print() lines stream in SLURM .out files
+    # rather than waiting on block-buffer flushes. tqdm bars (via stderr) are
+    # unaffected.
+    sys.stdout.reconfigure(line_buffering=True)
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", required=True, type=str,
                         help="Path to a results/runs/full_fashionmnist_<ts>/ "
@@ -242,6 +248,7 @@ def main() -> None:
         config.data.image_size,
         config.data.patch_size,
         preds_dir / "test_images.npz",
+        progress="reassembling test images",
     )
 
     # ------------------------------------------------------------------
@@ -265,7 +272,7 @@ def main() -> None:
     print(f"Backfilling {len(available)} epoch(s): "
           f"{[e for e, _ in available]}")
 
-    for epoch, ckpt_path in available:
+    for epoch, ckpt_path in tqdm(available, desc="epochs", unit="epoch"):
         pred_path = preds_dir / f"epoch_{epoch:04d}.npz"
         diag_path = diag_dir / f"epoch_{epoch:04d}.npz"
         if (pred_path.is_file() and diag_path.is_file() and not args.overwrite):
@@ -280,7 +287,8 @@ def main() -> None:
 
         # Train eval — populates per-class acc + confusion only (no npz)
         train_eval = evaluate(model, train_eval_loader, device,
-                              num_classes=config.data.num_classes)
+                              num_classes=config.data.num_classes,
+                              progress=f"epoch {epoch} train eval")
         _set_epoch_entry(history, "train_per_class_acc", epoch,
                          train_eval["per_class_acc"].tolist())
         _set_epoch_entry(history, "train_confusion", epoch,
@@ -288,7 +296,8 @@ def main() -> None:
 
         # Test eval — full predictions npz + history entries
         test_eval = evaluate(model, test_loader, device,
-                             num_classes=config.data.num_classes)
+                             num_classes=config.data.num_classes,
+                             progress=f"epoch {epoch} test eval")
         _set_epoch_entry(history, "test_per_class_acc", epoch,
                          test_eval["per_class_acc"].tolist())
         _set_epoch_entry(history, "test_confusion", epoch,
@@ -311,7 +320,8 @@ def main() -> None:
         # Quantum diagnostics — wrap in try/except like full_experiment.py
         try:
             stats_summary, mean_photon, diag_raw = quantum_diagnostics(
-                model, diag_loader, device
+                model, diag_loader, device,
+                progress=f"epoch {epoch} diagnostics",
             )
             _set_epoch_entry(history, "hypernet_stats", epoch, stats_summary)
             _set_epoch_entry(history, "mean_photon_number", epoch,

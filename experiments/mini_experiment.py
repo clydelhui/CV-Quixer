@@ -190,7 +190,8 @@ def train_epoch(epoch: int) -> tuple[float, float, float]:
 def evaluate() -> tuple[float, float]:
     model.eval()
     total_loss, correct, total = 0.0, 0, 0
-    for patches, labels in test_loader:
+    for patches, labels in tqdm(test_loader, desc="test eval",
+                                leave=False, unit="batch", mininterval=5.0):
         patches, labels = patches.to(device), labels.to(device)
         logits = model(patches)
         total_loss += F.cross_entropy(logits, labels).item() * labels.size(0)

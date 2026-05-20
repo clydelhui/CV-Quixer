@@ -308,6 +308,7 @@ save_test_images_once(
     data_cfg.image_size,
     data_cfg.patch_size,
     preds_dir / "test_images.npz",
+    progress="reassembling test images",
 )
 
 # Fixed diagnostic subset (sampled once at startup, stable across epochs and
@@ -711,8 +712,10 @@ best_epoch = (
 for epoch in range(start_epoch, EPOCHS + 1):
     t0 = time.time()
     trunc_loss = train_epoch(epoch)
-    train_eval = evaluate(model, train_eval_loader, device)
-    test_eval = evaluate(model, test_loader, device)
+    train_eval = evaluate(model, train_eval_loader, device,
+                          progress="train eval")
+    test_eval = evaluate(model, test_loader, device,
+                         progress="test eval")
     elapsed_train_eval = time.time() - t0
 
     train_loss, train_acc = train_eval["loss"], train_eval["acc"]
@@ -744,7 +747,8 @@ for epoch in range(start_epoch, EPOCHS + 1):
     t_diag = time.time()
     try:
         stats_summary, mean_photon, diag_raw = quantum_diagnostics(
-            model, diag_loader, device
+            model, diag_loader, device,
+            progress="diagnostics",
         )
         history["epoch"]["hypernet_stats"].append(stats_summary)
         history["epoch"]["mean_photon_number"].append(mean_photon.tolist())

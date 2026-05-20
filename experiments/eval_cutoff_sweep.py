@@ -417,6 +417,7 @@ def _synthesize_cutoff_rundir(
             ),
             config.data.image_size, config.data.patch_size,
             sub / "predictions" / "test_images.npz",
+            progress="reassembling test images",
         )
 
     _relative_symlink(run_dir / "subset_indices.npz",
@@ -474,7 +475,8 @@ def evaluate_at_cutoff(D_new: int) -> tuple[list[dict], Path | None]:
     rows: list[dict] = []
     for split in args.eval_splits:
         t_split = time.time()
-        evals[split] = evaluate(model, loaders[split], device)
+        evals[split] = evaluate(model, loaders[split], device,
+                                progress=f"D={D_new} {split}")
         elapsed_split = time.time() - t_split
         rows.append({
             "split":        split,
@@ -494,6 +496,7 @@ def evaluate_at_cutoff(D_new: int) -> tuple[list[dict], Path | None]:
         # quantum diagnostics on the reused diag subset (test only)
         stats_summary, mean_photon, diag_raw = quantum_diagnostics(
             model, diag_loader, device,
+            progress=f"D={D_new} diagnostics",
         )
         lcu_snap, poly_snap = snapshot_coefficients(model)
 
