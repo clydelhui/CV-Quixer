@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import dataclasses
+import warnings
+from typing import Callable, TypeVar
+
 import torch.nn as nn
+
+_ConfigT = TypeVar("_ConfigT")
 
 
 def count_parameters(model: nn.Module, trainable_only: bool = True) -> int:
@@ -130,3 +136,92 @@ def print_parameter_table(model: nn.Module, title: str = "") -> None:
     ]
 
     print("\n".join(lines))
+
+
+def autoscale_to_target(
+    build_fn: Callable[[_ConfigT], nn.Module],
+    config: _ConfigT,
+    knob: str,
+    target: int,
+    *,
+    step: int = 1,
+    trigger_field: str = "target_params",
+    hi_cap: int = 2 ** 20,
+    tol: float = 0.10,
+) -> _ConfigT:
+    """Binary-search an integer config field so the built model hits a param budget.
+
+    Model-agnostic: the only thing it knows about the model is how to build one
+    from a config (``build_fn``) and how to count its trainable parameters
+    (``count_parameters``). The parameter count is therefore read off the *real*
+    ``nn.Parameter`` set of a throwaway instance — there is no hand-written
+    formula to drift from the architecture, so any model with a monotonic
+    scaling knob is auto-scalable for free.
+
+    The search varies ``config.<knob> = step * k`` over positive integers ``k``
+    and assumes the trainable-param count is non-decreasing in the knob (true for
+    widths, head counts, mode counts, …).
+
+    Args:
+        build_fn:      ``(config) -> nn.Module``. Must build *without* re-entering
+                       auto-scaling; the search guarantees this by forcing
+                       ``trigger_field = -1`` in every trial config.
+        config:        A (frozen or mutable) dataclass config instance.
+        knob:          Name of the integer dataclass field to scale.
+        target:        Desired trainable-parameter count.
+        step:          Knob granularity. Trials use ``step * k`` so callers can
+                       enforce constraints (e.g. ``step=2`` to keep a derived
+                       dimension even).
+        trigger_field: Field set to ``-1`` in trial configs to prevent recursive
+                       auto-scaling (defaults to the ``target_params`` convention).
+        hi_cap:        Upper bound on the trial knob value. If the count never
+                       reaches ``target`` below this cap the knob cannot satisfy
+                       the budget (e.g. it does not affect the param count) and a
+                       ``ValueError`` is raised instead of looping forever.
+        tol:           Relative tolerance; a warning (not error) is emitted if the
+                       closest achievable count is further than this from target.
+
+    Returns:
+        A copy of ``config`` (via ``dataclasses.replace``) with ``knob`` set to
+        the best-fit value. ``trigger_field`` is left unchanged on the result.
+    """
+
+    def count(value: int) -> int:
+        trial = dataclasses.replace(config, **{trigger_field: -1, knob: value})
+        return count_parameters(build_fn(trial))
+
+    # Expand an upper bound until the budget is reachable (or proven out of reach).
+    hi = 1
+    while count(step * hi) < target:
+        hi *= 2
+        if step * hi > hi_cap:
+            raise ValueError(
+                f"scaling_knob={knob!r} cannot reach target_params={target} "
+                f"(step*{hi} exceeds hi_cap={hi_cap}); the knob may not affect the "
+                "parameter count or is bounded — choose a different scaling_knob."
+            )
+
+    # Smallest k with count(step*k) >= target.
+    lo = 1
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if count(step * mid) < target:
+            lo = mid + 1
+        else:
+            hi = mid
+    best = lo
+
+    # The step below the crossover may be the closer fit (under- vs over-shoot).
+    if best > 1 and abs(count(step * (best - 1)) - target) < abs(count(step * best) - target):
+        best -= 1
+
+    best_value = step * best
+    achieved = count(best_value)
+    if abs(achieved - target) / max(target, 1) > tol:
+        warnings.warn(
+            f"target_params={target} but closest achievable is {achieved} "
+            f"({knob}={best_value}). Adjust other architecture knobs for a tighter match.",
+            stacklevel=2,
+        )
+
+    return dataclasses.replace(config, **{knob: best_value})

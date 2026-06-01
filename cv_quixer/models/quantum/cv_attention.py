@@ -20,7 +20,8 @@ Cost: O(degree × N × (m + n_bs) × D^{m+2}) — no D^{3m} matrix powers.
 Gradients flow through the einsum chain via standard autograd (loop unrolled
 at runtime, analogous to RNN backprop).
 
-Multiple heads run in parallel (HyperCVAttention); readouts concatenated and
+Multiple heads run in parallel (HyperCVAttention) via an outer head-axis
+vmap that nests over the batch and patch vmaps; readouts concatenated and
 passed to CVDecoder in cv_quixer.py.
 """
 
@@ -67,11 +68,12 @@ def _readout_total_dim(observable_plan: list) -> int:
 # ---------------------------------------------------------------------------
 # Declarative gate-op list
 #
-# `_GATE_SEQUENCE` is the single source of truth for the per-patch unitary
-# U_i applied by HyperCVAttentionHead._apply_patch_gates_to_state. Both the
-# hypernetwork output width (_gate_param_count) and the slicing/dispatch
-# logic in _apply_patch_gates_to_state are derived from it, so adding or
-# removing a gate is a one-line edit and the two pieces of code cannot drift.
+# `_GATE_SEQUENCE` is the single source of truth for one layer of the per-patch
+# unitary U_i. For num_layers > 1, `_build_op_plan` interleaves L copies of it
+# with L-1 `_INTERFEROMETER_SEQUENCE` blocks into the head's `_op_plan`. Both the
+# hypernetwork output width (_op_plan_param_count) and the slicing/dispatch logic
+# in _apply_patch_gates_to_state derive from that one plan, so adding or removing
+# a gate is a one-line edit and the two pieces of code cannot drift.
 #
 # Layout convention (parameter-name-major): for each op with k param names
 # and N sites, the hypernetwork output contains N values for param_names[0],
@@ -137,6 +139,45 @@ _GATE_SEQUENCE: tuple[GateOp, ...] = (
 )
 
 
+# Interferometer inserted *between* consecutive layers when num_layers > 1: a
+# beamsplitter column + per-mode rotation (the same `bs`/`rot` ops the in-layer
+# sequence uses — reused here, no new gate code). Layer 1 has no leading
+# interferometer because it would act trivially on the vacuum input state.
+_INTERFEROMETER_SEQUENCE: tuple[GateOp, ...] = (
+    _GATE_SEQUENCE[1],  # bs
+    _GATE_SEQUENCE[2],  # rot
+)
+
+
+def _build_op_plan(num_layers: int) -> tuple[GateOp, ...]:
+    """Ordered gate-op plan for the depth-``num_layers`` per-patch unitary U_i.
+
+    Interleaves ``num_layers`` copies of ``_GATE_SEQUENCE`` (one full Killoran
+    layer each) with ``num_layers - 1`` ``_INTERFEROMETER_SEQUENCE`` blocks:
+
+        layer_1, interferometer_1, layer_2, interferometer_2, ..., layer_L
+
+    At ``num_layers == 1`` this returns exactly ``_GATE_SEQUENCE`` (byte-for-byte
+    identical behaviour to the single-layer model), so existing checkpoints load
+    unchanged. The plan is the single source of truth for both the hypernetwork
+    output width and the slicing/dispatch in ``_apply_patch_gates_to_state``.
+
+    Args:
+        num_layers: Per-patch circuit depth L (number of stacked gate sequences).
+
+    Returns:
+        Flat tuple of GateOps in application order.
+    """
+    if num_layers < 1:
+        raise ValueError(f"num_layers must be >= 1, got {num_layers}")
+    plan: list[GateOp] = []
+    for layer in range(num_layers):
+        plan.extend(_GATE_SEQUENCE)
+        if layer < num_layers - 1:
+            plan.extend(_INTERFEROMETER_SEQUENCE)
+    return tuple(plan)
+
+
 def _bs_pair_count(num_modes: int, bs_topology: str) -> int:
     """Number of beamsplitter pairs given the mode count and topology."""
     if num_modes <= 1:
@@ -156,6 +197,25 @@ def _gate_param_count(num_modes: int, bs_topology: str) -> int:
     return sum(
         len(op.param_names) * (m if op.site_kind == "mode" else n_bs)
         for op in _GATE_SEQUENCE
+    )
+
+
+def _op_plan_param_count(
+    op_plan: tuple[GateOp, ...], num_modes: int, bs_topology: str
+) -> int:
+    """Total hypernetwork output size for an arbitrary op-plan.
+
+    Generalises ``_gate_param_count`` (which is the ``num_layers == 1`` special
+    case, ``op_plan == _GATE_SEQUENCE``) to the interleaved multi-layer plan
+    built by ``_build_op_plan``. Sums ``len(op.param_names) * n_sites`` over the
+    plan, where ``n_sites`` is ``num_modes`` for "mode" gates and the
+    beamsplitter-pair count for "pair" gates.
+    """
+    m = num_modes
+    n_bs = _bs_pair_count(m, bs_topology)
+    return sum(
+        len(op.param_names) * (m if op.site_kind == "mode" else n_bs)
+        for op in op_plan
     )
 
 
@@ -269,6 +329,9 @@ class CNNHypernetwork(nn.Module):
         cnn_channels_2: Output channels of second conv layer.
         cnn_kernel_size: Kernel size for both conv layers.
         bs_topology:   "linear" | "ring".
+        num_layers:    Per-patch circuit depth L. The output width is the full
+                       op-plan size (L gate sequences + L-1 BS->Rot
+                       interferometers); L=1 reproduces the single-layer width.
     """
 
     def __init__(
@@ -280,6 +343,7 @@ class CNNHypernetwork(nn.Module):
         cnn_channels_2: int,
         cnn_kernel_size: int,
         bs_topology: str,
+        num_layers: int = 1,
     ) -> None:
         super().__init__()
         h_out = patch_size - 2 * (cnn_kernel_size - 1)
@@ -289,7 +353,9 @@ class CNNHypernetwork(nn.Module):
         )
         self.patch_size = patch_size
         feature_dim = cnn_channels_2 * h_out * h_out
-        gate_params = _gate_param_count(num_modes, bs_topology)
+        gate_params = _op_plan_param_count(
+            _build_op_plan(num_layers), num_modes, bs_topology
+        )
 
         self.conv1 = nn.Conv2d(1, cnn_channels_1, cnn_kernel_size)
         self.conv2 = nn.Conv2d(cnn_channels_1, cnn_channels_2, cnn_kernel_size)
@@ -306,7 +372,8 @@ class CNNHypernetwork(nn.Module):
             patch_idx: Position index of this patch in the sequence (0-indexed).
 
         Returns:
-            Tensor of shape (_gate_param_count(num_modes, bs_topology),).
+            Tensor of shape (op-plan param count,) — the full depth-L gate-param
+            vector (= _gate_param_count(num_modes, bs_topology) when num_layers==1).
         """
         x = patch.reshape(1, 1, self.patch_size, self.patch_size)
         x = torch.tanh(self.conv1(x))
@@ -326,7 +393,7 @@ class CNNHypernetwork(nn.Module):
                      in positional order (row-major over the patch grid).
 
         Returns:
-            Tensor of shape (N, _gate_param_count(num_modes, bs_topology)).
+            Tensor of shape (N, op-plan param count) — full depth-L gate params.
         """
         N = patches.shape[0]
         x = patches.reshape(N, 1, self.patch_size, self.patch_size)
@@ -346,7 +413,7 @@ class CNNHypernetwork(nn.Module):
             patches: Real tensor of shape (B, N, patch_size²).
 
         Returns:
-            Tensor of shape (B, N, _gate_param_count(num_modes, bs_topology)).
+            Tensor of shape (B, N, op-plan param count) — full depth-L gate params.
         """
         B, N, _ = patches.shape
         x = patches.reshape(B * N, 1, self.patch_size, self.patch_size)
@@ -436,25 +503,27 @@ class PolynomialCoefficients(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class HyperCVAttentionHead(nn.Module):
-    """Single CV attention head: per-patch unitary assembly → LCU → polynomial.
+class _CVHeadBase(nn.Module):
+    """Shared circuit core for a single CV attention head.
 
-    Parameters owned by this module:
-        hypernetwork:  PatchHypernetwork (patch → gate params)
+    Holds the LCU + polynomial machinery and the quantum circuit. Subclasses
+    supply the per-patch input → gate-parameter map via ``_features_to_params``:
+
+      - ``HyperCVAttentionHead`` — a per-head ``CNNHypernetwork`` over raw patches.
+      - ``LinearCVHead``         — a single ``Linear`` over shared patch embeddings.
+
+    Parameters owned here:
         lcu_coeffs:    LCUSumCoefficients (per-position complex b_i)
         poly_coeffs:   PolynomialCoefficients (real c_j)
 
     CVCircuit is stateless — it holds no nn.Parameters.
 
     Args:
-        patch_size:  Side length of each raw image patch in pixels.
-        num_patches: Sequence length N — needed to size LCUSumCoefficients and PE.
+        num_patches: Sequence length N — needed to size LCUSumCoefficients.
         config:      QuantumConfig.
     """
 
-    def __init__(
-        self, patch_size: int, num_patches: int, config: QuantumConfig
-    ) -> None:
+    def __init__(self, num_patches: int, config: QuantumConfig) -> None:
         super().__init__()
         self.num_modes = config.num_modes
         self.cutoff_dim = config.cutoff_dim
@@ -479,14 +548,32 @@ class HyperCVAttentionHead(nn.Module):
         else:
             self._bs_pairs = [(k, k + 1) for k in range(m - 1)]
 
-        self.hypernetwork = CNNHypernetwork(
-            patch_size, num_patches, config.num_modes,
-            config.cnn_channels_1, config.cnn_channels_2, config.cnn_kernel_size,
-            config.bs_topology,
-        )
+        # Per-patch unitary depth: L stacked gate sequences interleaved with
+        # L-1 BS->Rot interferometers. _op_plan is the ordered gate list driving
+        # both _apply_patch_gates_to_state and the hypernetwork output width.
+        self.num_layers = config.num_layers
+        self._op_plan = _build_op_plan(config.num_layers)
+
         self.lcu_coeffs = LCUSumCoefficients(num_patches)
         self.poly_coeffs = PolynomialCoefficients(config.poly_degree)
         self.circuit = CVCircuit(config.num_modes, config.cutoff_dim)
+
+    # ------------------------------------------------------------------
+    # Per-patch input → gate parameters (subclass hook)
+    # ------------------------------------------------------------------
+
+    def _features_to_params(self, features: torch.Tensor) -> torch.Tensor:
+        """Map a per-patch input sequence to gate parameters.
+
+        Args:
+            features: Real tensor of shape (N, in_dim) — one row per patch.
+                      ``in_dim`` is the raw patch dimension for the CNN head or
+                      the shared embedding dimension for the linear head.
+
+        Returns:
+            Tensor of shape (N, _gate_param_count(num_modes, bs_topology)).
+        """
+        raise NotImplementedError
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -499,12 +586,14 @@ class HyperCVAttentionHead(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> FockState:
-        """Apply the configured gate sequence U_i directly to a FockState.
+        """Apply the depth-L per-patch unitary U_i directly to a FockState.
 
-        Iterates over `_GATE_SEQUENCE` (single source of truth for the gate
-        set) and dispatches through each op's apply callback. Parameter
-        slicing follows the parameter-name-major layout: for each op, the
-        full vector for each param name is read in order before iterating
+        Iterates over `self._op_plan` (the ordered op list built by
+        `_build_op_plan` — L stacked `_GATE_SEQUENCE` blocks interleaved with
+        L-1 `_INTERFEROMETER_SEQUENCE` blocks; equals `_GATE_SEQUENCE` when
+        num_layers == 1) and dispatches through each op's apply callback.
+        Parameter slicing follows the parameter-name-major layout: for each op,
+        the full vector for each param name is read in order before iterating
         over sites.
 
         Uses circuit.apply_single_mode_gate / apply_two_mode_gate /
@@ -512,7 +601,8 @@ class HyperCVAttentionHead(nn.Module):
         matrix is ever assembled.
 
         Args:
-            params: Real tensor of shape (_gate_param_count(num_modes, topology),).
+            params: Real tensor of shape
+                    (_op_plan_param_count(self._op_plan, num_modes, topology),).
             state:  Input FockState. Not mutated.
             device: Target device.
             dtype:  Complex dtype.
@@ -525,7 +615,7 @@ class HyperCVAttentionHead(nn.Module):
         bs_pairs = self._bs_pairs
         idx = 0
 
-        for op in _GATE_SEQUENCE:
+        for op in self._op_plan:
             sites = list(range(m)) if op.site_kind == "mode" else bs_pairs
             n_sites = len(sites)
             param_vectors: dict[str, torch.Tensor] = {}
@@ -598,12 +688,13 @@ class HyperCVAttentionHead(nn.Module):
         N = patches.shape[0]
         b = self.lcu_coeffs().to(device)                       # (N,) complex
 
-        # 1. Batched hypernetwork — all N patches in one call.
-        all_params = self.hypernetwork.forward_all(patches).to(device)  # (N, gp)
+        # 1. Batched per-patch param net — all N patches in one call.
+        all_params = self._features_to_params(patches).to(device)  # (N, gp)
 
         # 2. Vmap per-patch gate application over N. The shared input vector
         #    `v_data` is broadcast (in_dims=None); device/dtype are trace-time
-        #    constants. Nests with the outer batch vmap in HyperCVAttention.
+        #    constants. Nests inside the batch vmap, which itself nests inside
+        #    the head vmap in HyperCVAttention (head → batch → patch).
         v_data = v.reshape((D,) * m)
         apply_one = lambda p: self._apply_patch_gates_to_data(
             p, v_data, device, dtype
@@ -653,7 +744,7 @@ class HyperCVAttentionHead(nn.Module):
         D, m = self.cutoff_dim, self.num_modes
         N = patches.shape[0]
 
-        all_params = self.hypernetwork.forward_all(patches).to(device)  # (N, gp)
+        all_params = self._features_to_params(patches).to(device)  # (N, gp)
         v_data = v.reshape((D,) * m)
         apply_one = lambda p: self._apply_patch_gates_to_data(
             p, v_data, device, dtype
@@ -839,6 +930,210 @@ class HyperCVAttentionHead(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Concrete heads
+# ---------------------------------------------------------------------------
+
+
+class HyperCVAttentionHead(_CVHeadBase):
+    """CV attention head driven by a per-head CNN hypernetwork over raw patches.
+
+    The canonical CV-Quixer head: each head owns a full ``CNNHypernetwork`` that
+    maps a raw image patch to gate parameters. Forward input is the raw patch
+    sequence ``(N, patch_size²)``.
+
+    Args:
+        patch_size:  Side length of each raw image patch in pixels.
+        num_patches: Sequence length N — needed to size LCUSumCoefficients and PE.
+        config:      QuantumConfig.
+    """
+
+    def __init__(
+        self, patch_size: int, num_patches: int, config: QuantumConfig
+    ) -> None:
+        super().__init__(num_patches, config)
+        self.hypernetwork = CNNHypernetwork(
+            patch_size, num_patches, config.num_modes,
+            config.cnn_channels_1, config.cnn_channels_2, config.cnn_kernel_size,
+            config.bs_topology, config.num_layers,
+        )
+
+    def _features_to_params(self, features: torch.Tensor) -> torch.Tensor:
+        return self.hypernetwork.forward_all(features)
+
+
+class SharedPatchCNN(nn.Module):
+    """Conv feature extractor shared across all heads (model="quantum_shared").
+
+    Runs once per patch and produces a patch embedding consumed by every head's
+    per-head ``Linear``. Architecture is ``CNNHypernetwork``'s conv path without
+    its final gate-parameter linear — the flattened conv features (+ 2D PE) are
+    the embedding directly:
+
+        Conv2d(1, C1, k) → Tanh → Conv2d(C1, C2, k) → Tanh →
+        flatten → + 2D sinusoidal PE
+
+    The embedding width is ``out_dim = cnn_channels_2 × h_out²`` (= the canonical
+    CNNHypernetwork's final-linear *input* width), so per-head capacity matches
+    the canonical model. The 2D positional encoding is added once here, so all
+    heads see the same PE-augmented embedding.
+
+    Args:
+        patch_size:    Side length of each square patch in pixels.
+        num_patches:   Total number of patches (must be a perfect square).
+        cnn_channels_1: Output channels of first conv layer.
+        cnn_channels_2: Output channels of second conv layer.
+        cnn_kernel_size: Kernel size for both conv layers.
+    """
+
+    def __init__(
+        self,
+        patch_size: int,
+        num_patches: int,
+        cnn_channels_1: int,
+        cnn_channels_2: int,
+        cnn_kernel_size: int,
+    ) -> None:
+        super().__init__()
+        h_out = patch_size - 2 * (cnn_kernel_size - 1)
+        assert h_out > 0, (
+            f"patch_size={patch_size} is too small for cnn_kernel_size={cnn_kernel_size}; "
+            f"need patch_size > {2 * (cnn_kernel_size - 1)}"
+        )
+        self.patch_size = patch_size
+        self.out_dim = cnn_channels_2 * h_out * h_out   # embedding width
+
+        self.conv1 = nn.Conv2d(1, cnn_channels_1, cnn_kernel_size)
+        self.conv2 = nn.Conv2d(cnn_channels_1, cnn_channels_2, cnn_kernel_size)
+
+        pe = _compute_2d_sinusoidal_pe(num_patches, self.out_dim)
+        self.register_buffer('pos_enc', pe)
+
+    def forward_grid(self, patches: torch.Tensor) -> torch.Tensor:
+        """Embed a batch of patch sequences in one batched conv pass.
+
+        Args:
+            patches: Real tensor of shape (B, N, patch_size²).
+
+        Returns:
+            Tensor of shape (B, N, out_dim).
+        """
+        B, N, _ = patches.shape
+        x = patches.reshape(B * N, 1, self.patch_size, self.patch_size)
+        x = torch.tanh(self.conv1(x))
+        x = torch.tanh(self.conv2(x))
+        return x.flatten(start_dim=1).reshape(B, N, -1) + self.pos_enc  # (B,N,out_dim)
+
+
+class LinearCVHead(_CVHeadBase):
+    """CV attention head driven by a single Linear over shared patch embeddings.
+
+    Used by model="quantum_shared". A ``SharedPatchCNN`` (owned by
+    ``SharedCVAttention``) produces patch embeddings once; each head maps them to
+    gate parameters with a single ``Linear(in_dim, gate_params)`` — no
+    activation. Forward input is the embedding sequence ``(N, in_dim)``.
+
+    Args:
+        num_patches: Sequence length N — needed to size LCUSumCoefficients.
+        in_dim:      Width of the shared patch embedding (SharedPatchCNN.out_dim).
+        config:      QuantumConfig.
+    """
+
+    def __init__(
+        self, num_patches: int, in_dim: int, config: QuantumConfig
+    ) -> None:
+        super().__init__(num_patches, config)
+        gate_params = _op_plan_param_count(
+            self._op_plan, config.num_modes, config.bs_topology
+        )
+        self.linear = nn.Linear(in_dim, gate_params)
+
+    def _features_to_params(self, features: torch.Tensor) -> torch.Tensor:
+        return self.linear(features)
+
+
+# ---------------------------------------------------------------------------
+# Multi-head vmap driver (shared by both attention modules)
+# ---------------------------------------------------------------------------
+
+
+def _run_heads_vmap(
+    heads: nn.ModuleList,
+    num_heads: int,
+    readout_total_dim: int,
+    features: torch.Tensor,
+) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], torch.Tensor]:
+    """Run all heads over a batch of per-patch feature sequences via nested vmap.
+
+    The heads are independent, so their params/buffers are stacked along a new
+    leading head axis and vmapped over (head → batch → patch nesting) rather than
+    looped in Python. Plain ``torch.stack`` (NOT ``torch.func.stack_module_state``,
+    which ends in ``.detach()`` and would strand head gradients) keeps the stacked
+    tensors connected to each head's leaf parameter, so gradients flow back through
+    StackBackward into the head parameters the optimizer owns.
+
+    Args:
+        heads:             ModuleList of homogeneous ``_CVHeadBase`` instances.
+        num_heads:         Number of heads (== len(heads)).
+        readout_total_dim: Per-head readout width R.
+        features:          Real tensor of shape (B, N, in_dim) — raw patches for
+                           CNN heads, shared embeddings for linear heads.
+
+    Returns:
+        readouts:      (B, num_heads × R).
+        states:        list[(B, D, ..., D)] — one per head.
+        success_probs: list[(B,)] — one per head.
+        trunc_loss:    scalar — mean per-patch truncation loss over heads × batch.
+    """
+    base = heads[0]
+    per_head_p = [dict(h.named_parameters()) for h in heads]
+    per_head_b = [dict(h.named_buffers()) for h in heads]
+    stacked_p = {
+        n: torch.stack([d[n] for d in per_head_p]) for n in per_head_p[0]
+    }
+    stacked_b = {
+        n: torch.stack([d[n] for d in per_head_b]) for n in per_head_b[0]
+    }
+
+    def _one_element(p, b, single_features):
+        return functional_call(base, (p, b), (single_features,))
+
+    def _one_head(p, b):
+        # Inner vmap over the batch axis of `features` (closed over, so the outer
+        # head vmap treats it as shared — every head sees the full sequence).
+        # This itself nests the patch vmap inside _apply_lcu_to_vector:
+        # head → batch → patch.
+        return vmap(_one_element, in_dims=(None, None, 0))(p, b, features)
+
+    readout_hb, state_hb, sp_hb, tl_hb = vmap(_one_head, in_dims=(0, 0))(
+        stacked_p, stacked_b
+    )
+    # readout_hb   : (num_heads, B, R)
+    # state_hb     : (num_heads, B, cutoff_dim, ..., cutoff_dim)
+    # sp_hb, tl_hb : (num_heads, B)
+
+    if (sp_hb < _SUCCESS_PROB_FLOOR).any().item():
+        import warnings
+        bad = sp_hb[sp_hb < _SUCCESS_PROB_FLOOR]
+        warnings.warn(
+            f"{len(bad)} head×batch element(s) have "
+            f"success_prob < {_SUCCESS_PROB_FLOOR:.0e} "
+            f"(min={bad.min().item():.2e}); post-selection failed — "
+            "those elements forced to a zero state (zero gradient).",
+            RuntimeWarning, stacklevel=2,
+        )
+
+    B = features.shape[0]
+    R = readout_total_dim
+    # permute(1,0,2).reshape reproduces a torch.cat(dim=-1) per-batch layout
+    # [head0_R | head1_R | ...] exactly (pure reshape).
+    readouts = readout_hb.permute(1, 0, 2).reshape(B, num_heads * R)
+    all_states = list(state_hb.unbind(0))          # list[(B, D,...,D)] per head
+    all_success_probs = list(sp_hb.unbind(0))      # list[(B,)] per head
+    trunc_loss = tl_hb.mean()                       # scalar over heads × batch
+    return readouts, all_states, all_success_probs, trunc_loss
+
+
+# ---------------------------------------------------------------------------
 # HyperCVAttention
 # ---------------------------------------------------------------------------
 
@@ -846,10 +1141,12 @@ class HyperCVAttentionHead(nn.Module):
 class HyperCVAttention(nn.Module):
     """Multi-head CV attention with per-head LCU + polynomial circuits.
 
-    Runs num_heads independent HyperCVAttentionHead instances. Each head
-    processes the full patch sequence and produces a (num_modes,) readout.
-    Readouts from all heads are concatenated into a (num_heads × num_modes,)
-    vector per batch element.
+    Runs num_heads independent HyperCVAttentionHead instances. The heads are
+    fully independent, so forward stacks their parameters along a new leading
+    head axis and vmaps over it (head → batch → patch nesting) rather than
+    looping in Python. Each head processes the full patch sequence and produces
+    a (num_modes,) readout. Readouts from all heads are concatenated into a
+    (num_heads × num_modes,) vector per batch element.
 
     Args:
         patch_size:  Side length of each raw image patch in pixels.
@@ -894,41 +1191,102 @@ class HyperCVAttention(nn.Module):
         if input_state is not None:
             raise NotImplementedError("input_state is not supported under vmap")
 
-        all_readouts: list[torch.Tensor] = []
-        all_states: list[torch.Tensor] = []
-        all_success_probs: list[torch.Tensor] = []
-        all_trunc_losses: list[torch.Tensor] = []
+        return _run_heads_vmap(
+            self.heads, self.num_heads, self.readout_total_dim, patches
+        )
 
-        for head in self.heads:
-            params  = dict(head.named_parameters())
-            buffers = dict(head.named_buffers())
+    def gate_params_grid(self, patches: torch.Tensor) -> list[torch.Tensor]:
+        """Per-head gate-parameter samples over a batch (diagnostics accessor).
 
-            def _single(params, buffers, single_patches):
-                return functional_call(head, (params, buffers), (single_patches,))
+        Args:
+            patches: Real tensor of shape (B, N, patch_dim).
 
-            batched = vmap(_single, in_dims=(None, None, 0))
-            readout_b, state_b, sp_b, tl_b = batched(params, buffers, patches)
-            # readout_b : (B, num_modes)
-            # state_b   : (B, cutoff_dim, ..., cutoff_dim)
-            # sp_b      : (B,)
-            # tl_b      : (B,)
+        Returns:
+            list of ``num_heads`` tensors, each (B, N, _gate_param_count).
+        """
+        return [h.hypernetwork.forward_grid(patches) for h in self.heads]
 
-            if (sp_b < _SUCCESS_PROB_FLOOR).any().item():
-                import warnings
-                bad = sp_b[sp_b < _SUCCESS_PROB_FLOOR]
-                warnings.warn(
-                    f"HyperCVAttention: {len(bad)} batch element(s) have "
-                    f"success_prob < {_SUCCESS_PROB_FLOOR:.0e} "
-                    f"(min={bad.min().item():.2e}); post-selection failed — "
-                    "those elements forced to a zero state (zero gradient).",
-                    RuntimeWarning, stacklevel=2,
-                )
 
-            all_readouts.append(readout_b)
-            all_states.append(state_b)
-            all_success_probs.append(sp_b)
-            all_trunc_losses.append(tl_b)
+# ---------------------------------------------------------------------------
+# SharedCVAttention
+# ---------------------------------------------------------------------------
 
-        readouts = torch.cat(all_readouts, dim=-1)   # (B, num_heads * num_modes)
-        trunc_loss = torch.stack(all_trunc_losses).mean()   # scalar over heads × batch
-        return readouts, all_states, all_success_probs, trunc_loss
+
+class SharedCVAttention(nn.Module):
+    """Multi-head CV attention with a shared patch CNN + per-head linear heads.
+
+    Powers model="quantum_shared". A single ``SharedPatchCNN`` embeds every patch
+    once (shared across heads); each ``LinearCVHead`` then maps the embedding to
+    its own gate parameters via a single ``Linear``. The conv stack therefore runs
+    once per forward pass instead of once per head. Head execution reuses the same
+    head → batch → patch vmap driver as ``HyperCVAttention`` (``_run_heads_vmap``),
+    closing over the shared embeddings rather than the raw patches.
+
+    Args:
+        patch_size:  Side length of each raw image patch in pixels.
+        num_patches: Sequence length N.
+        config:      QuantumConfig.
+    """
+
+    def __init__(
+        self,
+        patch_size: int,
+        num_patches: int,
+        config: QuantumConfig,
+    ) -> None:
+        super().__init__()
+        self.num_heads = config.num_heads
+        self.num_modes = config.num_modes
+        self.cutoff_dim = config.cutoff_dim
+        self._observable_plan = config._observable_plan
+        self.readout_total_dim = _readout_total_dim(config._observable_plan)
+
+        self.patch_cnn = SharedPatchCNN(
+            patch_size, num_patches,
+            config.cnn_channels_1, config.cnn_channels_2, config.cnn_kernel_size,
+        )
+        in_dim = self.patch_cnn.out_dim
+        self.heads = nn.ModuleList([
+            LinearCVHead(num_patches, in_dim, config)
+            for _ in range(config.num_heads)
+        ])
+
+    def forward(
+        self,
+        patches: torch.Tensor,
+        input_state: FockState | None = None,
+    ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], torch.Tensor]:
+        """Apply the shared CNN then all heads to a batch of patch sequences.
+
+        Args:
+            patches:     Real tensor of shape (B, N, patch_dim).
+            input_state: Not supported under vmap; must be None.
+
+        Returns:
+            Same 4-tuple as ``HyperCVAttention.forward`` (readouts, states,
+            success_probs, trunc_loss).
+        """
+        if input_state is not None:
+            raise NotImplementedError("input_state is not supported under vmap")
+
+        # Shared conv runs once (outside the head vmap); only the per-head linear
+        # is vmapped over the head axis inside _run_heads_vmap.
+        embeddings = self.patch_cnn.forward_grid(patches)   # (B, N, embed_dim)
+        return _run_heads_vmap(
+            self.heads, self.num_heads, self.readout_total_dim, embeddings
+        )
+
+    def gate_params_grid(self, patches: torch.Tensor) -> list[torch.Tensor]:
+        """Per-head gate-parameter samples over a batch (diagnostics accessor).
+
+        Embeds the patches once via the shared CNN, then applies each head's
+        linear projection.
+
+        Args:
+            patches: Real tensor of shape (B, N, patch_dim).
+
+        Returns:
+            list of ``num_heads`` tensors, each (B, N, _gate_param_count).
+        """
+        embeddings = self.patch_cnn.forward_grid(patches)   # (B, N, embed_dim)
+        return [h.linear(embeddings) for h in self.heads]

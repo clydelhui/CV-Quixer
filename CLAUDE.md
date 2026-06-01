@@ -44,16 +44,47 @@ uv run python experiments/eval_cutoff_sweep.py \
 uv run python experiments/report_diagnostics.py \
     --run-dir results/runs/full_fashionmnist_<ts>/ --epoch best
 
+# Single run with a chosen parameter budget + observable preset
+uv run python experiments/full_experiment.py \
+    --epochs 1 --train-fraction 0.1 --test-fraction 0.1 \
+    --target-params 8000 --observables xp
+
+# Hyperparameter sweep: grid over param budgets × observable presets (× seeds).
+# --dry-run writes the manifest only; --launch local runs sequentially here;
+# --launch slurm submits a job array (see scripts/run_sweep.sh).
+uv run python experiments/sweep.py \
+    --target-params 8000 13760 20000 --observables x xpxsps pnr \
+    --epochs 3 --train-fraction 0.1 --test-fraction 0.1 --dry-run
+
+# Aggregate a finished/partial sweep into a thesis table + comparison plots
+uv run python experiments/report_sweep.py \
+    --sweep-dir results/sweeps/<sweep>_<ts>/
+
 # Run tests
 uv run pytest tests/
 ```
 
-`report_diagnostics.py` is the primary thesis-figure tool. It runs *after* a
-`full_experiment.py` run, reading that run's saved artefacts (`config.json`,
-`history.json`, `checkpoints/`, `predictions/`, `diagnostics/`) and writing the
-qualitative + quantum-specific figures the training loop deliberately skips.
-Heavy torch/model imports are deferred, so the default path is fast and runs
+`report_diagnostics.py` is the single figure-generation tool for the project.
+`full_experiment.py` writes only **raw** data artefacts (`config.json`,
+`history.json`, `predictions/`, `diagnostics/`, `checkpoints/`,
+`subset_indices.npz`); `report_diagnostics.py` consumes those and *derives*
+every metric and figure on demand. `history["epoch"]` carries a training-time
+log of loss/acc values but is **never** treated as canonical for figures —
+`plot_training_curves` derives accuracy/loss from each epoch's predictions
+npz and emits a `RuntimeWarning` if the logged value disagrees with the
+derived one. Run `report_diagnostics.py` ad-hoc to refresh figures from a
+partial or in-progress run (`history.json` is updated every epoch). Heavy
+torch/model imports are deferred, so the default path is fast and runs
 without a configured PyTorch backend.
+
+If you have an older run that lacks the new artefacts (per-epoch
+`epoch_NNNN_train.npz`, or diagnostics npz without `lcu_coeffs` /
+`poly_coeffs` keys), `report_diagnostics.py` fails loudly with a hint to
+run `experiments/backfill_artefacts.py --run-dir <run>` first. Backfill
+replays the post-epoch eval pass from each checkpoint and writes the
+missing artefacts; it also overwrites `history["epoch"]["train_acc"]`
+etc. with the clean post-epoch values (older runs stored a running
+per-batch average for `train_acc` that is *not* comparable to test_acc).
 
 | Flag | Default | Effect |
 |---|---|---|
@@ -66,19 +97,70 @@ without a configured PyTorch backend.
 Figures written into the run's figure dir (each wrapped in try/except — a
 failed figure warns but does not abort the rest; `sanity_checks` runs first):
 
-- *Fast* (history.json / npz only): `confusion_matrix_evolution`,
-  `per_class_metrics_table`, `top_k_accuracy`, `calibration_reliability`,
+- *Fast* (history.json / npz only): training curves —
+  `loss_curve`, `accuracy_curve`, `trunc_loss_curve`,
+  `per_class_accuracy_curve`, `confusion_matrix_test`,
+  `per_batch_train_loss`, `per_batch_trunc_loss`,
+  `per_batch_train_accuracy`, `per_batch_grad_norm` — plus
+  `confusion_matrix_evolution`, `per_class_metrics_table`,
+  `top_k_accuracy`, `calibration_reliability`,
   `hypernet_gate_param_histograms`, `photon_number_per_mode`,
   `state_norm_histogram`, `lcu_coefficients_heatmap`,
   `polynomial_coefficients_trajectory`.
 - *Slow* (need readouts/test images — from saved npz, or `--full-inference`):
   `misclassification_gallery`, `embedding_tsne`.
 
-This is complementary to, not a superset of, the figures `full_experiment.py`
-itself re-renders every epoch (loss/accuracy/trunc/per-batch curves, per-class
-accuracy curve, latest-epoch confusion matrix). The only overlap is the
-confusion matrix (latest-epoch in the training loop vs full epoch-by-epoch
-evolution here).
+#### Hyperparameter sweeps
+
+Two sweep axes are exposed on `full_experiment.py` directly (defaults preserve
+the canonical single-run behaviour exactly):
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--model NAME` | `quantum` | `quantum` \| `quantum_shared` \| `classical`. `quantum_shared` defaults `--scaling-knob` to `num_heads`. |
+| `--target-params N` | 13760 | parameter budget; auto-scales `--scaling-knob` (default `cnn_channels_2`; `num_heads` for `quantum_shared`) |
+| `--num-layers L` | 1 | per-patch circuit depth (L stacked gate sequences + L−1 `BS→Rot` interferometers); can also be a `--scaling-knob` |
+| `--observables NAME` | `xpxsps` | named observable preset (see below) |
+| `--observables-json STR` | — | ad-hoc `ObservableSpec` JSON; requires `--run-name` |
+| `--seed N` | 42 | training seed (vary for repeats / error bars) |
+| `--run-name STR` | `full_fashionmnist_<ts>` | run-dir name |
+| `--runs-root PATH` | `results/runs` | parent dir (sweeps pass `results/sweeps/<sweep>`) |
+| `--wandb` / `--wandb-group` / `--wandb-tags` | off | W&B logging (see below) |
+
+**Observable presets** (`cv_quixer/config/observable_presets.py`,
+`resolve_observables(name, cutoff_dim)`): `x` (⟨x̂⟩/mode), `xp`, `xpxsps`
+(x,p,x²,p² per mode — the `full_experiment.py` default), `n` (⟨n̂⟩/mode),
+`xpn`, `pnr` (P(n=k) for k=0..cutoff-1 per mode). Because `target_params`
+targets the *total* count, the observable choice barely shifts the budget — the
+two axes are cleanly separable.
+
+`experiments/sweep.py` fans a Cartesian grid (`--target-params … --observables …
+--seeds … --num-layers …`) into independent `full_experiment.py` runs, one
+process per grid point. It writes `results/sweeps/<sweep_name>_<ts>/sweep_manifest.json`
+and per-run sub-dirs named `p{params}__obs-{preset}__seed{seed}` (with a
+`__L{n}` suffix when `num_layers > 1`; each a full run dir). All
+runs share `--subset-seed` + fractions so they see the identical data subset.
+`--launch local` runs them sequentially; `--launch slurm` submits
+`scripts/run_sweep.sh` as a job array (`#SBATCH --array`, one task per grid
+point, reusing the shared `cv-quixer-cuda` venv — pre-build it once); `--dry-run`
+writes the manifest only.
+
+`experiments/report_sweep.py --sweep-dir <dir>` scans the sweep (JSON only — no
+torch), emitting `summary.csv` + `summary.md` (one row/run: target/achieved
+params, observable preset, best/final acc, runtime) and `figures/acc_vs_params.png`
++ `figures/acc_by_observable.png`. Per-run figures still come from
+`report_diagnostics.py --run-dir <sweep>/<run>/`.
+
+**Weights & Biases** (optional, opt-in via `--wandb`; off by default). Wired
+through `cv_quixer/utils/logging.py` (`init_logging`/`log_metrics`/
+`finish_logging`, lazy `wandb` import). Per-epoch metrics are logged on an
+`epoch` x-axis; the full run config — including the swept axes (`target_params`,
+the observable specs, `seed`) — is captured for cross-run views (the *achieved*
+param count lands in `history["meta"].achieved_params` / `config.json`, not the
+wandb config); sweep runs are grouped under the sweep name with
+`params=`/`obs=`/`seed=` tags. On
+cluster nodes without outbound network use `WANDB_MODE=offline` and `wandb sync`
+later. Not wandb-Sweeps: the grid/orchestration stays in `sweep.py`.
 
 ### SLURM cluster (SoC Compute Cluster)
 
@@ -100,6 +182,7 @@ to the `mini_experiment.py` invocation at the bottom.
 | `run_mini_experiment.sh` | `cv_quixer_mini` | `02:00:00` | `gpu:nv:1` / 16G / 4 | `mini_experiment.py` (200/50, 100 epochs) |
 | `run_full_experiment.sh` | `cv_quixer_full` | `03:00:00` | `gpu:a100-40:1` / 32G / 4 | `full_experiment.py --train-fraction 0.1 --test-fraction 0.1` (3 epochs on a 10% subset; edit the script to resume or change fractions) |
 | `run_eval_cutoff_sweep.sh` | `cv_quixer_eval` | `12:00:00` | `gpu:a100-40:1` / 32G / 4 | `eval_cutoff_sweep.py` — takes a checkpoint as `$1`, extra flags passed through |
+| `run_sweep.sh` | `cv_quixer_sweep` | `03:00:00` | `gpu:a100-40:1` / 32G / 4 | job ARRAY — takes a `sweep_manifest.json` as `$1`, runs the `full_experiment.py` entry for `$SLURM_ARRAY_TASK_ID` |
 | `triage_cuda.sh` | `cuda_triage` | — | `gpu:nv:1` | CUDA/GPU sanity diagnostics |
 
 ```bash
@@ -110,11 +193,19 @@ sbatch scripts/run_full_experiment.sh
 sbatch scripts/run_eval_cutoff_sweep.sh \
     results/runs/full_fashionmnist_<ts>/checkpoints/final_model.pt \
     --test-fraction 0.5 --cutoffs 8 10 12
+
+# Hyperparameter sweep — sweep.py writes the manifest and prints the exact
+# `sbatch --array=0-<N-1> scripts/run_sweep.sh <manifest>` command (or pass
+# --launch slurm to submit it directly). Pre-build the venv once first.
+uv run python experiments/sweep.py \
+    --target-params 8000 13760 20000 --observables x xp xpxsps pnr \
+    --epochs 3 --train-fraction 0.1 --test-fraction 0.1 --launch slurm
 ```
 
 All cluster scripts reuse the dedicated `$HOME/.venvs/cv-quixer-cuda` venv
-(`run_full_experiment.sh` rebuilds it fresh; `run_eval_cutoff_sweep.sh` reuses
-it) and `cd "$HOME/CV-Quixer"` before running.
+(`run_full_experiment.sh` rebuilds it fresh; `run_eval_cutoff_sweep.sh` and
+`run_sweep.sh` reuse it — for the array, pre-build the venv once so concurrent
+tasks don't race) and `cd "$HOME/CV-Quixer"` before running.
 
 #### SLURM job config (`run_mini_experiment.sh`)
 
@@ -178,8 +269,9 @@ cat slurm-cuda_triage-<JOBID>.out   # view triage output
 ```
 cv_quixer/
 ├── config/         schema.py: ExperimentConfig/Quantum/Data/Training dataclasses
-│                   + ObservableSpec. utils.py: load_config() YAML→config (LEGACY,
-│                   see below) and save_config() config→JSON
+│                   + ObservableSpec. observable_presets.py: named ObservableSpec
+│                   sets + resolve_observables(). utils.py: load_config() YAML→config
+│                   (LEGACY, see below) and save_config() config→JSON
 ├── data/           MNIST/FashionMNIST download, patch extraction, DataLoader
 ├── models/
 │   ├── base.py         BaseVisionTransformer (shared interface)
@@ -189,7 +281,7 @@ cv_quixer/
 │       │                    PolynomialCoefficients, HyperCVAttentionHead,
 │       │                    HyperCVAttention + truncation loss helpers
 │       └── cv_quixer.py     CVDecoder, CVQuixer (main model),
-│                            _param_count_formula, _resolve_cnn_channels
+│                            param-count auto-scaling → utils.params.autoscale_to_target
 ├── quantum/        Pure PyTorch CV simulation engine (no PennyLane)
 │   ├── state.py        FockState — N-mode Fock statevector container
 │   ├── circuit.py      CVCircuit — einsum-based gate application
@@ -209,12 +301,15 @@ experiments/
 ├── mini_experiment.py     200 train / 50 test, 100 epochs, periodic checkpointing
 ├── full_experiment.py     60k/10k FashionMNIST, self-contained results/runs/<ts>/ dir
 ├── eval_cutoff_sweep.py   Re-evaluate a trained checkpoint at larger Fock cutoffs
-└── report_diagnostics.py  Post-hoc thesis figures from a full_experiment run
+├── sweep.py               Fan a (param × observable × seed) grid into full_experiment runs
+├── report_sweep.py        Cross-run sweep table (summary.csv/md) + comparison plots
+└── report_diagnostics.py  All figures (training curves + diagnostics) from a full_experiment run
 
 scripts/
 ├── run_mini_experiment.sh     SLURM batch job for mini_experiment
 ├── run_full_experiment.sh     SLURM batch job for full_experiment (A100, 3 h)
 ├── run_eval_cutoff_sweep.sh   SLURM batch job for eval_cutoff_sweep (A100, 12 h)
+├── run_sweep.sh               SLURM job ARRAY for sweep.py manifests (A100, one task/run)
 ├── triage_cuda.sh             SLURM GPU/CUDA diagnostic job
 └── debug_imports.py           Sequential import diagnostics with tracebacks
 
@@ -240,10 +335,11 @@ HyperCVAttention  (num_heads independent heads, batched with vmap):
       For each patch i:
         gate_params ← CNNHypernetwork(patch_i, patch_idx=i)
           # Conv2d(1,C1,k)→Tanh→Conv2d(C1,C2,k)→Tanh→flatten+2D_PE→Linear
-          # output dim: _gate_param_count(num_modes, bs_topology)
-          # = 8m−2 (linear) or 8m (ring), where m = num_modes
-        Apply Killoran gate sequence (per mode):
-          Squeeze(r, φ) → Beamsplitter mesh(θ, φ) → Rotate(φ) → Displace(α) → Kerr(κ)
+          # output dim: _op_plan_param_count(_build_op_plan(num_layers), m, topology)
+          # = L·(8m−2) + (L−1)·(3m−2) linear  [= 8m−2 when num_layers L=1]
+        Apply depth-L unitary U_i (L stacked layers, L−1 interferometers between):
+          [ Squeeze(r,φ) → Beamsplitter mesh(θ,φ) → Rotate(φ) → Displace(α) → Kerr(κ) ]   ×L
+          interleaved with  [ Beamsplitter mesh(θ,φ) → Rotate(φ) ]   ×(L−1)
     readout ← configurable observables per `readout_observables`     # (R,)
              # each spec → x | p | x² | p² | n | prob_n on mode(s)
              # default (no config): ⟨x̂⟩ per mode → R = num_modes
@@ -268,8 +364,21 @@ hard-wired to `num_modes`. See `QuantumConfig.readout_observables` /
   (`mini_experiment.py`, `full_experiment.py`) owns its own training loop and
   drives the model only through the `BaseVisionTransformer` interface, never
   importing from `models/quantum` or `models/classical` directly.
-- **Model factory**: `cv_quixer.models.build_model(config)` is the only place `"quantum"`
-  / `"classical"` is resolved to a class.
+- **Model factory**: `cv_quixer.models.build_model(config)` is the only place the model
+  string is resolved to a class: `"quantum"` → `CVQuixer` (per-head CNN hypernetworks),
+  `"quantum_shared"` → `SharedCVQuixer` (one shared patch CNN + per-head linears),
+  `"classical"` → `ClassicalViT`.
+- **Shared-CNN variant** (`model="quantum_shared"`, `SharedCVQuixer`): a single
+  `SharedPatchCNN` embeds each patch once (`Conv→Conv→flatten→+2D-PE`, shared across heads);
+  it emits the flattened conv features directly (width `cnn_channels_2 × h_out²`, **no
+  projection layer**). Each head is then just `Linear(feature_dim → gate_params)` feeding its
+  quantum circuit (`LinearCVHead`). The conv stack runs once per forward, not once per head.
+  LCU/poly coefficients stay per-head. The circuit core (`_apply_lcu_to_vector`,
+  `_apply_polynomial_iterative`, readout, etc.) is shared with the canonical head via
+  `_CVHeadBase`, and the model `forward` via `_CVQuixerBase`, so `CVQuixer` is unchanged.
+  Selected via `full_experiment.py --model quantum_shared` (which also defaults
+  `scaling_knob` to `num_heads`; `num_heads` then auto-scales to ~5 heads at the 13,760
+  budget). **Not checkpoint-compatible with `quantum`** — different parameter structure.
 - **Config system**: Experiment scripts construct the `ExperimentConfig`
   dataclasses directly in Python (no YAML at runtime). `full_experiment.py`
   writes the fully resolved config to `config.json` in its run directory;
@@ -284,11 +393,16 @@ hard-wired to `num_modes`. See `QuantumConfig.readout_observables` /
   `kerr_phases`) return `(D,)` phase vectors applied via `apply_single_mode_phases`
   (O(D) vs O(D³) matrix-exp). No PennyLane at training time. Gradient mode is `backprop`
   (autograd through einsum chain) or `parameter_shift` (PSR, deferred).
-- **vmap batch parallelism**: `HyperCVAttention.forward` uses `torch.func.vmap` +
-  `functional_call` to batch across B elements per head, replacing a sequential Python
-  `for b in range(B)` loop. All inner ops are out-of-place. `FockState.vacuum` uses
-  `index_put` (not in-place setitem); diagonal gates use `apply_single_mode_phases` with
-  broadcasting (not `torch.diag` + einsum) for vmap compatibility.
+- **vmap head/batch parallelism**: `HyperCVAttention.forward` uses nested
+  `torch.func.vmap` + `functional_call` — an outer vmap over the head axis nests
+  over the batch vmap, which nests over the patch vmap (head → batch → patch),
+  replacing the former sequential Python `for head in self.heads` and `for b in
+  range(B)` loops. Heads are stacked with plain differentiable `torch.stack`
+  (not `stack_module_state`, which detaches and would strand head gradients), so
+  the `nn.ModuleList` and checkpoint keys are unchanged. All inner ops are
+  out-of-place. `FockState.vacuum` uses `index_put` (not in-place setitem);
+  diagonal gates use `apply_single_mode_phases` with broadcasting (not
+  `torch.diag` + einsum) for vmap compatibility.
 - **CNN hypernetwork**: Each patch's gate parameters come from a 2-layer CNN
   (`CNNHypernetwork`) with 2D sinusoidal positional encodings injected before the linear
   projection. The circuit is input-dependent — every token sees a different unitary.
@@ -302,7 +416,7 @@ hard-wired to `num_modes`. See `QuantumConfig.readout_observables` /
 | Field | Default | Description |
 |---|---|---|
 | `num_modes` | 4 | Number of bosonic modes |
-| `num_layers` | 4 | Reserved — not read until multi-layer stacking is implemented |
+| `num_layers` | 1 | Per-patch circuit depth L: each token's unitary U_i is L stacked Killoran gate sequences with L−1 `BS→Rot` interferometers interleaved between them (layer 1 has no leading interferometer — it acts trivially on the vacuum). L=1 reproduces the single-layer model exactly (checkpoint-compatible). Params are hypernetwork-emitted, so larger L widens the hypernet output linear → more params |
 | `cutoff_dim` | 6 | Fock space truncation D |
 | `grad_mode` | `"backprop"` | `"backprop"` or `"parameter_shift"` (PSR deferred) |
 | `param_shift_shift` | 1.5708 | PSR shift `s` (π/2); only used when `grad_mode="parameter_shift"` |
@@ -311,10 +425,11 @@ hard-wired to `num_modes`. See `QuantumConfig.readout_observables` /
 | `num_heads` | 4 | Parallel CV attention heads |
 | `decoder_hidden_dim` | 64 | CVDecoder hidden layer width |
 | `cnn_channels_1` | 8 | CNNHypernetwork first conv output channels |
-| `cnn_channels_2` | 16 | CNNHypernetwork second conv output channels (auto-scaled if `target_params > 0`) |
+| `cnn_channels_2` | 16 | CNNHypernetwork second conv output channels (default `scaling_knob`; auto-scaled when `target_params > 0`) |
 | `cnn_kernel_size` | 3 | Conv kernel size |
 | `poly_degree` | 2 | Matrix polynomial degree (keep ≤ 4) |
-| `target_params` | -1 | If > 0, binary-search `cnn_channels_2` to hit this count (±5%) |
+| `target_params` | -1 | If > 0, binary-search the configured `scaling_knob` (build-and-count) to hit this count (±5%) |
+| `scaling_knob` | `"cnn_channels_2"` | Integer QuantumConfig field auto-scaled toward `target_params` (e.g. `cnn_channels_2`, `num_heads`, `num_modes`, `num_layers` — all monotonic in param count) |
 | `trunc_penalty` | `"none"` | `"none"`, `"norm"`, or `"photon_number"` |
 | `trunc_lambda` | 0.01 | Truncation penalty loss weight |
 | `readout_observable` | `None` | Legacy single-string selector: `"quadrature_x"`, `"photon_number"`, or `"pnr_distribution"`. Mutually exclusive with `readout_observables` |
@@ -416,11 +531,26 @@ Output layout differs per script (none of `results/` is git-tracked):
 | Entry | Contents |
 |---|---|
 | `config.json` | Full resolved `ExperimentConfig` (read back by eval/diagnostics) |
-| `history.json` | Per-epoch + per-batch + meta metrics — plot source of truth |
+| `history.json` | Training-time log only — per-epoch `train_loss`, `train_acc`, `test_loss`, `test_acc`, `trunc_loss`, `test_trunc_loss`, `elapsed_sec`, plus `history["batch"]` (per-minibatch arrays) and `history["meta"]` (best_epoch, runtime, plus sweep coordinates `target_params`/`achieved_params`/`observables_name`/`seed`). Never the canonical source for figures. |
 | `parameter_table.txt` | Snapshot of `print_parameter_table()` |
 | `checkpoints/` | `latest.pt` (every epoch), `best.pt` (best test acc), `final_model.pt`, `epoch_NNNN.pt` |
-| `figures/` | Training-loop PNGs re-rendered every epoch; `report_diagnostics.py` writes its figures here too |
-| `predictions/`, `diagnostics/`, `logs/` | Saved test images / readouts / quantum diagnostics consumed by `report_diagnostics.py` |
+| `figures/` | Populated by `report_diagnostics.py` (run post-hoc or partway through). Not written by `full_experiment.py` itself. |
+| `predictions/epoch_NNNN.npz` | Test side per epoch: `y_true`, `y_pred`, `y_probs`, `readouts`. Canonical source for accuracy/loss/per-class/confusion/calibration figures. |
+| `predictions/epoch_NNNN_train.npz` | Train side per epoch: same four keys, from the clean post-epoch train eval. Enables train-side per-class/confusion/embedding figures. |
+| `predictions/test_images.npz` | One-time, reassembled `(N, H, W)` test images for the misclassification gallery. |
+| `diagnostics/epoch_NNNN.npz` | Per-epoch raw quantum diagnostics: gate-param samples (`head{h}_{gate}`), state norms (`head{h}_state_norms`), `mean_photon_number`, `lcu_coeffs`, `poly_coeffs`. |
+| `subset_indices.npz` | Absolute train/test/diag indices into the full PatchedDataset, written once. |
+| `logs/train.log` | Tee'd stdout from the training process. |
 
 **`eval_cutoff_sweep.py`**: writes `<run_dir>/eval/cutoff_sweep_<timestamp>/`
 containing `results.json`, `results.csv`, and per-metric plots.
+
+**`sweep.py`** (one directory per sweep,
+`results/sweeps/<sweep_name>_<YYYY-MM-DD_HH-MM-SS>/`):
+
+| Entry | Contents |
+|---|---|
+| `sweep_manifest.json` | Grid axes, per-run `run_name`, and the exact `full_experiment.py` argv for each grid point (consumed by `run_sweep.sh`). |
+| `p{params}__obs-{preset}__seed{seed}/` | One full `full_experiment.py` run dir per grid point (same layout as above). |
+| `summary.csv` / `summary.md` | Written by `report_sweep.py` — one row per run (target/achieved params, observable preset, best/final acc, runtime). |
+| `figures/acc_vs_params.png`, `figures/acc_by_observable.png` | Written by `report_sweep.py` — cross-run comparison plots. |

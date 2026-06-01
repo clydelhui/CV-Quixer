@@ -8,19 +8,20 @@ the modern training loop performs, writing:
 
     <run-dir>/subset_indices.npz                # full-test indices + diag perm
     <run-dir>/predictions/test_images.npz       # reassembled (N, H, W) images
-    <run-dir>/predictions/epoch_NNNN.npz        # y_true, y_pred, y_probs, readouts
-    <run-dir>/diagnostics/epoch_NNNN.npz       # gate-param samples, state norms,
-                                                # mean photon number
-    <run-dir>/history.json                      # patched in-place with the
-                                                # missing per-epoch diagnostic
-                                                # series (train/test per-class
-                                                # acc, confusion, test trunc
-                                                # loss, lcu/poly coeffs,
-                                                # hypernet stats, mean photon).
+    <run-dir>/predictions/epoch_NNNN.npz        # test: y_true,y_pred,y_probs,readouts
+    <run-dir>/predictions/epoch_NNNN_train.npz  # train: y_true,y_pred,y_probs,readouts
+    <run-dir>/diagnostics/epoch_NNNN.npz        # gate-param samples, state norms,
+                                                # mean_photon_number, lcu_coeffs,
+                                                # poly_coeffs
+    <run-dir>/history.json                      # patched in-place: legacy derived
+                                                # keys dropped; train/test
+                                                # loss+acc and test_trunc_loss
+                                                # overwritten with the clean
+                                                # post-epoch eval values.
 
-The base series already in ``history.json`` (train/test loss+acc, trunc_loss,
-elapsed_sec) are preserved untouched — they reflect training-time state that
-cannot be replayed.
+`trunc_loss` (per-epoch running mean during training) and `elapsed_sec` cannot
+be replayed and are preserved untouched. Per-batch arrays in `history["batch"]`
+are likewise preserved.
 
 Usage:
     uv run python experiments/backfill_artefacts.py \\
@@ -272,12 +273,33 @@ def main() -> None:
     print(f"Backfilling {len(available)} epoch(s): "
           f"{[e for e, _ in available]}")
 
+    # Drop any legacy derived keys from history.epoch — predictions/diagnostics
+    # npz files are canonical going forward. Done once at the top so a partial
+    # backfill (with --epochs) still produces a clean schema.
+    for legacy_key in ("train_per_class_acc", "test_per_class_acc",
+                       "train_confusion", "test_confusion",
+                       "lcu_coeffs", "poly_coeffs",
+                       "hypernet_stats", "mean_photon_number"):
+        history["epoch"].pop(legacy_key, None)
+
+    def _diag_has_coeffs(p: Path) -> bool:
+        if not p.is_file():
+            return False
+        with np.load(p) as d:
+            return "lcu_coeffs" in d.files and "poly_coeffs" in d.files
+
     for epoch, ckpt_path in tqdm(available, desc="epochs", unit="epoch"):
         pred_path = preds_dir / f"epoch_{epoch:04d}.npz"
+        pred_train_path = preds_dir / f"epoch_{epoch:04d}_train.npz"
         diag_path = diag_dir / f"epoch_{epoch:04d}.npz"
-        if (pred_path.is_file() and diag_path.is_file() and not args.overwrite):
-            print(f"  epoch {epoch}: predictions + diagnostics already exist → "
-                  f"skipping (pass --overwrite to redo)")
+        if (
+            pred_path.is_file()
+            and pred_train_path.is_file()
+            and _diag_has_coeffs(diag_path)
+            and not args.overwrite
+        ):
+            print(f"  epoch {epoch}: predictions (test+train) + diagnostics "
+                  f"(with lcu/poly) already exist → skipping (pass --overwrite to redo)")
             continue
 
         print(f"  epoch {epoch}: loading {ckpt_path.name}")
@@ -285,25 +307,27 @@ def main() -> None:
         model.load_state_dict(ckpt["model_state_dict"])
         model.eval()
 
-        # Train eval — populates per-class acc + confusion only (no npz)
+        # Train eval — write predictions npz (raw artefact) + overwrite the
+        # training-log acc/loss in history with the clean post-epoch values
+        # (the pre-refactor full_experiment.py wrote a running per-batch
+        # average for train_acc; backfill replaces it with a clean eval).
         train_eval = evaluate(model, train_eval_loader, device,
                               num_classes=config.data.num_classes,
                               progress=f"epoch {epoch} train eval")
-        _set_epoch_entry(history, "train_per_class_acc", epoch,
-                         train_eval["per_class_acc"].tolist())
-        _set_epoch_entry(history, "train_confusion", epoch,
-                         train_eval["confusion"].tolist())
+        np.savez_compressed(
+            pred_train_path,
+            y_true=train_eval["y_true"],
+            y_pred=train_eval["y_pred"],
+            y_probs=train_eval["y_probs"],
+            readouts=train_eval["readouts"],
+        )
+        _set_epoch_entry(history, "train_loss", epoch, float(train_eval["loss"]))
+        _set_epoch_entry(history, "train_acc",  epoch, float(train_eval["acc"]))
 
         # Test eval — full predictions npz + history entries
         test_eval = evaluate(model, test_loader, device,
                              num_classes=config.data.num_classes,
                              progress=f"epoch {epoch} test eval")
-        _set_epoch_entry(history, "test_per_class_acc", epoch,
-                         test_eval["per_class_acc"].tolist())
-        _set_epoch_entry(history, "test_confusion", epoch,
-                         test_eval["confusion"].tolist())
-        _set_epoch_entry(history, "test_trunc_loss", epoch,
-                         float(test_eval["trunc_loss"]))
         np.savez_compressed(
             pred_path,
             y_true=test_eval["y_true"],
@@ -311,30 +335,32 @@ def main() -> None:
             y_probs=test_eval["y_probs"],
             readouts=test_eval["readouts"],
         )
+        _set_epoch_entry(history, "test_loss",       epoch, float(test_eval["loss"]))
+        _set_epoch_entry(history, "test_acc",        epoch, float(test_eval["acc"]))
+        _set_epoch_entry(history, "test_trunc_loss", epoch,
+                         float(test_eval["trunc_loss"]))
 
-        # LCU + polynomial coefficient snapshot
+        # LCU + polynomial coefficient snapshot — saved into the diagnostics
+        # npz alongside the quantum-diagnostic arrays.
         lcu_snap, poly_snap = snapshot_coefficients(model)
-        _set_epoch_entry(history, "lcu_coeffs", epoch, lcu_snap.tolist())
-        _set_epoch_entry(history, "poly_coeffs", epoch, poly_snap.tolist())
 
-        # Quantum diagnostics — wrap in try/except like full_experiment.py
         try:
-            stats_summary, mean_photon, diag_raw = quantum_diagnostics(
+            _, _, diag_raw = quantum_diagnostics(
                 model, diag_loader, device,
                 progress=f"epoch {epoch} diagnostics",
             )
-            _set_epoch_entry(history, "hypernet_stats", epoch, stats_summary)
-            _set_epoch_entry(history, "mean_photon_number", epoch,
-                             mean_photon.tolist())
+            diag_raw["lcu_coeffs"] = lcu_snap
+            diag_raw["poly_coeffs"] = poly_snap
             np.savez_compressed(diag_path, **diag_raw)
         except Exception as e:
             warnings.warn(
                 f"quantum_diagnostics failed at epoch {epoch}: "
-                f"{type(e).__name__}: {e}. Skipping diagnostic outputs.",
+                f"{type(e).__name__}: {e}. Saving only lcu/poly snapshots.",
                 RuntimeWarning,
             )
-            _set_epoch_entry(history, "hypernet_stats", epoch, None)
-            _set_epoch_entry(history, "mean_photon_number", epoch, None)
+            np.savez_compressed(
+                diag_path, lcu_coeffs=lcu_snap, poly_coeffs=poly_snap,
+            )
 
         # Persist incrementally so a kill mid-loop still leaves usable state
         _atomic_write_json(history_path, history)

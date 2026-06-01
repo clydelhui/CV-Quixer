@@ -365,24 +365,18 @@ def _synthesize_cutoff_rundir(
     with open(sub / "config.json", "w") as f:
         json.dump(cfg_dict, f, indent=2)
 
-    # history.json — single-epoch entries; train_* mirrored from test if no train eval
+    # history.json — single-epoch training-log entries only. Derived metrics
+    # (per-class acc, confusion, lcu/poly coeffs, mean photon, hypernet stats)
+    # are read from the npz artefacts by report_diagnostics.
     src = train_eval if train_eval is not None else test_eval
     h = new_history(int(n_params), str(device))
-    h["epoch"]["train_loss"]   = [float(src["loss"])]
-    h["epoch"]["train_acc"]    = [float(src["acc"])]
-    h["epoch"]["test_loss"]    = [float(test_eval["loss"])]
-    h["epoch"]["test_acc"]     = [float(test_eval["acc"])]
-    h["epoch"]["trunc_loss"]   = [float(src["trunc_loss"])]
-    h["epoch"]["elapsed_sec"]  = [0.0]
-    h["epoch"]["test_trunc_loss"]      = [float(test_eval["trunc_loss"])]
-    h["epoch"]["train_per_class_acc"]  = [src["per_class_acc"].tolist()]
-    h["epoch"]["test_per_class_acc"]   = [test_eval["per_class_acc"].tolist()]
-    h["epoch"]["train_confusion"]      = [src["confusion"].tolist()]
-    h["epoch"]["test_confusion"]       = [test_eval["confusion"].tolist()]
-    h["epoch"]["lcu_coeffs"]           = [lcu_snap.tolist()]
-    h["epoch"]["poly_coeffs"]          = [poly_snap.tolist()]
-    h["epoch"]["hypernet_stats"]       = [quantum_stats]
-    h["epoch"]["mean_photon_number"]   = [mean_photon.tolist()]
+    h["epoch"]["train_loss"]      = [float(src["loss"])]
+    h["epoch"]["train_acc"]       = [float(src["acc"])]
+    h["epoch"]["test_loss"]       = [float(test_eval["loss"])]
+    h["epoch"]["test_acc"]        = [float(test_eval["acc"])]
+    h["epoch"]["trunc_loss"]      = [float(src["trunc_loss"])]
+    h["epoch"]["test_trunc_loss"] = [float(test_eval["trunc_loss"])]
+    h["epoch"]["elapsed_sec"]     = [0.0]
     h["meta"]["best_test_acc"]    = float(test_eval["acc"])
     h["meta"]["best_epoch"]       = 1
     h["meta"]["total_runtime_sec"] = 0.0
@@ -390,7 +384,7 @@ def _synthesize_cutoff_rundir(
     with open(sub / "history.json", "w") as f:
         json.dump(h, f, indent=2)
 
-    # predictions/epoch_0001.npz — the file report_diagnostics consumes
+    # predictions/epoch_0001.npz (test) + optionally _train counterpart
     np.savez_compressed(
         sub / "predictions" / "epoch_0001.npz",
         y_true=test_eval["y_true"],
@@ -398,9 +392,22 @@ def _synthesize_cutoff_rundir(
         y_probs=test_eval["y_probs"],
         readouts=test_eval["readouts"],
     )
+    if train_eval is not None:
+        np.savez_compressed(
+            sub / "predictions" / "epoch_0001_train.npz",
+            y_true=train_eval["y_true"],
+            y_pred=train_eval["y_pred"],
+            y_probs=train_eval["y_probs"],
+            readouts=train_eval["readouts"],
+        )
 
-    # diagnostics/epoch_0001.npz — raw quantum-diagnostic arrays
-    np.savez_compressed(sub / "diagnostics" / "epoch_0001.npz", **diag_raw)
+    # diagnostics/epoch_0001.npz — raw quantum-diagnostic arrays plus the
+    # lcu/poly coefficient snapshots (so the post-hoc report_diagnostics
+    # figures don't need to rebuild the model).
+    diag_raw_with_coeffs = dict(diag_raw)
+    diag_raw_with_coeffs["lcu_coeffs"] = lcu_snap
+    diag_raw_with_coeffs["poly_coeffs"] = poly_snap
+    np.savez_compressed(sub / "diagnostics" / "epoch_0001.npz", **diag_raw_with_coeffs)
 
     # Shared heavy artefacts — relative symlinks back to the parent run.
     parent_test_images = run_dir / "predictions" / "test_images.npz"

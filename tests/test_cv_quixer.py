@@ -9,17 +9,23 @@ import torch
 import pytest
 from unittest.mock import MagicMock, patch
 
-from cv_quixer.config.schema import QuantumConfig
+from cv_quixer.config.schema import QuantumConfig, DataConfig
 from cv_quixer.models.base import BaseVisionTransformer
 from cv_quixer.models.quantum.cv_attention import (
     CNNHypernetwork,
     HyperCVAttention,
     HyperCVAttentionHead,
     LCUSumCoefficients,
+    LinearCVHead,
     PolynomialCoefficients,
+    SharedCVAttention,
+    SharedPatchCNN,
     _GATE_SEQUENCE,
+    _INTERFEROMETER_SEQUENCE,
     _bs_pair_count,
+    _build_op_plan,
     _gate_param_count,
+    _op_plan_param_count,
     norm_truncation_penalty,
     photon_number_penalty,
 )
@@ -27,7 +33,7 @@ from cv_quixer.quantum.interferometer import interferometer_param_count
 from cv_quixer.models.quantum.cv_quixer import (
     CVQuixer,
     CVQuixerOut,
-    _param_count_formula,
+    SharedCVQuixer,
 )
 from cv_quixer.quantum import CVCircuit, FockState
 from cv_quixer.utils.params import count_parameters
@@ -430,54 +436,6 @@ class TestTruncationHelpers:
         assert 0.0 <= penalty <= 1.0
 
 
-class TestParamCountConsistency:
-    def test_formula_matches_actual(self, small_quantum_config, data_config):
-        model = CVQuixer(small_quantum_config, data_config)
-        actual = count_parameters(model)
-        patch_size = data_config.patch_size
-        num_patches = (data_config.image_size // patch_size) ** 2
-        expected = _param_count_formula(
-            patch_size, num_patches,
-            small_quantum_config.num_heads, small_quantum_config.num_modes,
-            small_quantum_config.cnn_channels_1, small_quantum_config.cnn_channels_2,
-            small_quantum_config.cnn_kernel_size,
-            small_quantum_config.decoder_hidden_dim, data_config.num_classes,
-            small_quantum_config.bs_topology, small_quantum_config.poly_degree,
-            small_quantum_config._observable_plan,
-        )
-        assert actual == expected
-
-    def test_formula_matches_actual_pnr_distribution(self, data_config):
-        """When pnr_distribution is selected, the decoder grows by cutoff_dim
-        and the formula still equals the materialised parameter count."""
-        config = QuantumConfig(
-            num_modes=2,
-            cutoff_dim=4,
-            num_heads=2,
-            cnn_channels_1=4,
-            cnn_channels_2=8,
-            cnn_kernel_size=3,
-            decoder_hidden_dim=16,
-            poly_degree=2,
-            dtype="complex64",
-            readout_observable="pnr_distribution",
-        )
-        model = CVQuixer(config, data_config)
-        actual = count_parameters(model)
-        patch_size = data_config.patch_size
-        num_patches = (data_config.image_size // patch_size) ** 2
-        expected = _param_count_formula(
-            patch_size, num_patches,
-            config.num_heads, config.num_modes,
-            config.cnn_channels_1, config.cnn_channels_2,
-            config.cnn_kernel_size,
-            config.decoder_hidden_dim, data_config.num_classes,
-            config.bs_topology, config.poly_degree,
-            config._observable_plan,
-        )
-        assert actual == expected
-
-
 class TestCVQuixer:
     def test_is_base_model(self, small_quantum_config, data_config):
         from cv_quixer.models.quantum.cv_quixer import CVQuixer
@@ -726,6 +684,36 @@ class TestM1M2TruncFusion:
                 assert torch.allclose(got, exp, atol=1e-8), tp
             assert torch.allclose(tl, exp_tl, atol=1e-8), tp
 
+    def test_grad_reaches_every_head(self):
+        """The head-axis vmap stacks head params with plain (differentiable)
+        torch.stack, so a backward pass must deposit a non-trivial gradient on
+        EVERY head's leaf parameters. Guards against a regression to
+        stack_module_state (which detaches → strands head gradients, leaving
+        .grad None and silently breaking training).
+        """
+        torch.manual_seed(5)
+        cfg = QuantumConfig(
+            num_modes=2, cutoff_dim=4, num_heads=3,
+            cnn_channels_1=4, cnn_channels_2=8, cnn_kernel_size=3,
+            decoder_hidden_dim=16, poly_degree=2,
+            dtype="complex64", bs_topology="linear",
+            trunc_penalty="norm",
+        )
+        attn = HyperCVAttention(patch_size=7, num_patches=16, config=cfg)
+        patches = torch.randn(2, 16, 49)
+
+        readouts, _, _, trunc_loss = attn(patches)
+        # Depend on both the readout path and the trunc path so the gradient
+        # exercises every head's hypernetwork + coefficient parameters.
+        (readouts.sum() + trunc_loss).backward()
+
+        assert len(attn.heads) == 3
+        for h_idx, head in enumerate(attn.heads):
+            g = head.hypernetwork.conv1.weight.grad
+            assert g is not None, f"head {h_idx} conv1.weight.grad is None"
+            assert torch.isfinite(g).all(), f"head {h_idx} grad not finite"
+            assert g.abs().sum().item() > 0.0, f"head {h_idx} grad all-zero"
+
     def test_poly_degree_0_trunc_fallback(self):
         """poly_degree=0 has no LCU pass to fuse into, so forward falls back
         to the standalone _compute_patch_trunc_loss."""
@@ -937,3 +925,289 @@ class TestM5ReturnContract:
         out = model(self._patches(tiny_data_config), return_trunc_loss=True)
         assert isinstance(out, CVQuixerOut)
         assert out.trunc_loss is None
+
+
+class TestAutoScaling:
+    """Build-and-count auto-scaling via autoscale_to_target."""
+
+    def _data(self):
+        return DataConfig(
+            dataset="fashionmnist", normalize=False, patch_size=7,
+            batch_size=64, num_workers=0, data_root="data/",
+        )
+
+    def _quantum(self, **over):
+        from cv_quixer.config.observable_presets import resolve_observables
+        base = dict(
+            num_modes=2, cutoff_dim=6, num_heads=4, cnn_channels_1=8,
+            cnn_channels_2=16, cnn_kernel_size=3, decoder_hidden_dim=32,
+            poly_degree=3, dtype="complex64", trunc_penalty="norm",
+            trunc_lambda=0.01, target_params=13760,
+            readout_observables=resolve_observables("xpxsps", 6),
+        )
+        base.update(over)
+        return QuantumConfig(**base)
+
+    def test_default_knob_matches_historical_architecture(self):
+        # Pin: build-and-count resolves the same cnn_channels_2 (=14) and param
+        # count (=13050) the pre-refactor closed-form formula produced for the
+        # canonical full config, so existing runs stay comparable. Captured 2026-05-31.
+        model = CVQuixer(self._quantum(), self._data())
+        assert model.config.cnn_channels_2 == 14
+        assert count_parameters(model) == 13050
+
+    def test_scale_by_num_heads(self):
+        model = CVQuixer(self._quantum(scaling_knob="num_heads"), self._data())
+        # num_heads is a coarse knob -> loose tolerance, but must land near budget.
+        assert abs(count_parameters(model) - 13760) / 13760 < 0.40
+        assert model.config.num_heads >= 1
+
+    def test_unreachable_knob_raises(self):
+        # cutoff_dim sets the Fock-sim dimension but does not change the trainable
+        # param count under the xpxsps readout (the observable plan width is
+        # cutoff-independent), so it cannot reach the budget; autoscale must raise
+        # rather than loop forever.
+        with pytest.raises(ValueError):
+            CVQuixer(
+                self._quantum(target_params=10_000_000, scaling_knob="cutoff_dim"),
+                self._data(),
+            )
+
+    def test_scale_by_num_layers(self):
+        # num_layers now deepens the per-patch unitary (widening the hypernetwork
+        # output linear), so it is a valid — if coarse — scaling knob.
+        model = CVQuixer(self._quantum(scaling_knob="num_layers"), self._data())
+        assert abs(count_parameters(model) - 13760) / 13760 < 0.50
+        assert model.config.num_layers >= 1
+
+
+class TestSharedCVQuixer:
+    """Tests for the shared-CNN + per-head-linear model (model="quantum_shared").
+
+    The shared model swaps each head's CNNHypernetwork for a single shared
+    SharedPatchCNN feeding per-head Linear projections. These verify the forward
+    contract, gradient flow into both the shared CNN and the per-head linears,
+    embed_dim resolution, the diagnostics accessor, and num_heads auto-scaling.
+    """
+
+    def _config(self, *, num_heads=2, target_params=-1,
+                scaling_knob="num_heads", readout_observable=None):
+        return QuantumConfig(
+            num_modes=2,
+            cutoff_dim=4,
+            num_heads=num_heads,
+            cnn_channels_1=4,
+            cnn_channels_2=8,
+            cnn_kernel_size=3,
+            decoder_hidden_dim=16,
+            poly_degree=2,
+            dtype="complex64",
+            target_params=target_params,
+            scaling_knob=scaling_knob,
+            readout_observable=readout_observable,
+        )
+
+    def test_forward_shape(self, tiny_data_config):
+        model = SharedCVQuixer(self._config(), tiny_data_config)
+        # tiny_data_config → 14×14 image / 7×7 patch = 4 patches.
+        patches = torch.randn(3, 4, 49)
+        logits = model(patches)
+        assert logits.shape == (3, 10)
+        assert torch.isfinite(logits).all()
+
+    def test_head_linear_consumes_feature_dim(self, tiny_data_config):
+        # No projection: the shared CNN emits flattened conv features of width
+        # feature_dim = cnn_channels_2 * h_out². For C2=8, h_out = 7-2*2 = 3 → 72.
+        # Each head's linear consumes exactly that width.
+        model = SharedCVQuixer(self._config(), tiny_data_config)
+        feature_dim = 8 * 3 * 3
+        assert model.cv_attention.patch_cnn.out_dim == feature_dim
+        assert not hasattr(model.cv_attention.patch_cnn, "proj")
+        for head in model.cv_attention.heads:
+            assert isinstance(head, LinearCVHead)
+            assert head.linear.in_features == feature_dim
+
+    def test_gradients_flow_to_shared_cnn_and_head_linears(self, tiny_data_config):
+        # Use the PNR readout and set c_1 = 0.5 on every head: the default
+        # PolynomialCoefficients init [1, 0, …] collapses P(M) to c_0·|vacuum⟩,
+        # which is gate-param-independent (and ⟨x̂⟩ on the vacuum is degenerately
+        # zero). This mirrors TestForwardWithObservables's gradient test for the
+        # canonical model so the data-dependent branch is actually exercised.
+        model = SharedCVQuixer(
+            self._config(readout_observable="pnr_distribution"), tiny_data_config
+        )
+        with torch.no_grad():
+            for head in model.cv_attention.heads:
+                head.poly_coeffs.c.data[1] = 0.5
+
+        patches = torch.randn(2, 4, 49)
+        model(patches).sum().backward()
+
+        cnn_grads = [
+            p.grad for n, p in model.named_parameters()
+            if "patch_cnn" in n and p.requires_grad
+        ]
+        assert cnn_grads, "No shared patch_cnn parameters found"
+        assert all(g is not None for g in cnn_grads)
+        assert any(g.abs().sum() > 0 for g in cnn_grads), (
+            "PNR readout did not propagate gradient to the shared patch CNN"
+        )
+
+        lin_grads = [
+            p.grad for n, p in model.named_parameters()
+            if ".linear." in n and p.requires_grad
+        ]
+        assert lin_grads, "No per-head linear parameters found"
+        assert all(g is not None for g in lin_grads)
+        assert any(g.abs().sum() > 0 for g in lin_grads), (
+            "PNR readout did not propagate gradient to the per-head linears"
+        )
+
+    def test_gate_params_grid_shape(self, tiny_data_config):
+        cfg = self._config(num_heads=3)
+        model = SharedCVQuixer(cfg, tiny_data_config)
+        patches = torch.randn(2, 4, 49)
+        grids = model.cv_attention.gate_params_grid(patches)
+        gp = _gate_param_count(cfg.num_modes, cfg.bs_topology)
+        assert len(grids) == 3                      # one per head
+        for g in grids:
+            assert g.shape == (2, 4, gp)            # (B, N, gate_params)
+
+    def test_shared_cnn_runs_once_for_all_heads(self, tiny_data_config):
+        # There is exactly one SharedPatchCNN regardless of head count.
+        model = SharedCVQuixer(self._config(num_heads=4), tiny_data_config)
+        assert isinstance(model.cv_attention, SharedCVAttention)
+        assert isinstance(model.cv_attention.patch_cnn, SharedPatchCNN)
+        assert len(model.cv_attention.heads) == 4
+
+    def test_autoscale_on_num_heads(self, tiny_data_config):
+        # Self-calibrate the per-head param increment, then target ~4 heads and
+        # assert the auto-scaler lands within ±1 head. With no projection the
+        # shared-CNN floor is small, so num_heads scales freely.
+        m1 = SharedCVQuixer(self._config(num_heads=1), tiny_data_config)
+        m2 = SharedCVQuixer(self._config(num_heads=2), tiny_data_config)
+        p1, p2 = m1.get_num_parameters(), m2.get_num_parameters()
+        assert p2 > p1                              # monotonic in num_heads
+        inc = p2 - p1
+        target = p1 + 3 * inc + inc // 2            # ≈ 4.5 heads worth
+        scaled = SharedCVQuixer(
+            self._config(num_heads=2, target_params=target), tiny_data_config,
+        )
+        assert scaled.config.num_heads in (4, 5)
+
+    def test_is_base_model_with_inherited_forward(self, tiny_data_config):
+        model = SharedCVQuixer(self._config(), tiny_data_config)
+        assert isinstance(model, BaseVisionTransformer)
+        # Optional outputs flow through the shared _CVQuixerBase.forward.
+        out = model(torch.randn(2, 4, 49), return_readouts=True)
+        assert isinstance(out, CVQuixerOut)
+        per_head = len(model.config._observable_plan)
+        assert out.readouts.shape == (2, model.config.num_heads * per_head)
+
+
+class TestMultiLayer:
+    """Depth-L per-patch unitary: stacked gate sequences + BS→Rot interferometers."""
+
+    def _data(self):
+        return DataConfig(
+            dataset="fashionmnist", normalize=False, patch_size=7,
+            batch_size=8, num_workers=0, data_root="data/",
+        )
+
+    def _quantum(self, **over):
+        base = dict(
+            num_modes=2, cutoff_dim=4, num_heads=2, cnn_channels_1=4,
+            cnn_channels_2=8, cnn_kernel_size=3, decoder_hidden_dim=16,
+            poly_degree=2, dtype="complex64", trunc_penalty="norm",
+            trunc_lambda=0.01,
+        )
+        base.update(over)
+        return QuantumConfig(**base)
+
+    def test_op_plan_structure(self):
+        # L=1 is exactly the single-layer gate sequence (backward compatible).
+        assert _build_op_plan(1) == _GATE_SEQUENCE
+        # L layers interleave L full sequences with L-1 interferometers.
+        for L in (1, 2, 3, 4):
+            plan = _build_op_plan(L)
+            assert len(plan) == L * len(_GATE_SEQUENCE) + (L - 1) * len(_INTERFEROMETER_SEQUENCE)
+            # First block is always a full layer (no leading interferometer).
+            assert plan[: len(_GATE_SEQUENCE)] == _GATE_SEQUENCE
+
+    def test_op_plan_param_count_grows_linearly(self):
+        # Each extra layer adds one full sequence + one interferometer worth of params.
+        m, topo = 2, "linear"
+        p_full = _gate_param_count(m, topo)
+        p_if = _op_plan_param_count(_INTERFEROMETER_SEQUENCE, m, topo)
+        for L in (1, 2, 3):
+            got = _op_plan_param_count(_build_op_plan(L), m, topo)
+            assert got == L * p_full + (L - 1) * p_if
+        # L=1 matches the legacy single-layer helper exactly.
+        assert _op_plan_param_count(_build_op_plan(1), m, topo) == _gate_param_count(m, topo)
+
+    def test_invalid_num_layers_raises(self):
+        with pytest.raises(ValueError):
+            _build_op_plan(0)
+
+    def test_hypernetwork_width_scales_with_layers(self):
+        # The CNN hypernetwork's final linear emits the full op-plan width.
+        for L in (1, 2, 3):
+            head = HyperCVAttentionHead(7, 16, self._quantum(num_layers=L))
+            expected = _op_plan_param_count(_build_op_plan(L), 2, "linear")
+            assert head.hypernetwork.linear.out_features == expected
+            assert head.num_layers == L
+            assert len(head._op_plan) == len(_build_op_plan(L))
+
+    def test_param_count_strictly_increases_with_layers(self):
+        counts = [
+            count_parameters(CVQuixer(self._quantum(num_layers=L), self._data()))
+            for L in (1, 2, 3)
+        ]
+        assert counts[0] < counts[1] < counts[2]
+
+    def test_forward_and_grad_flow_multilayer(self):
+        torch.manual_seed(0)
+        model = CVQuixer(self._quantum(num_layers=2), self._data())
+        patches = torch.randn(4, 16, 49)
+        out = model(patches, return_trunc_loss=True)
+        assert out.logits.shape == (4, 10)
+        loss = torch.nn.functional.cross_entropy(
+            out.logits, torch.randint(0, 10, (4,))
+        ) + out.trunc_loss
+        loss.backward()
+        # Every hypernetwork parameter (which carries all layer + interferometer
+        # gate params) must receive a gradient.
+        for name, p in model.named_parameters():
+            if "hypernetwork" in name:
+                assert p.grad is not None and p.grad.abs().sum() > 0, name
+
+    def test_num_layers_one_matches_default(self):
+        # Explicit num_layers=1 is byte-identical to the default single-layer model.
+        cfg = self._quantum()
+        assert cfg.num_layers == 1
+        torch.manual_seed(7); a = CVQuixer(self._quantum(num_layers=1), self._data())
+        torch.manual_seed(7); b = CVQuixer(self._quantum(), self._data())
+        patches = torch.randn(3, 16, 49)
+        assert torch.allclose(a(patches), b(patches))
+
+    def test_diagnostics_layout_per_block(self):
+        from cv_quixer.evaluation.diagnostics import gate_param_layout
+
+        m, n_bs = 2, _bs_pair_count(2, "linear")
+        # L=1: legacy keys + offsets, total width = single-layer count.
+        l1 = gate_param_layout(m, n_bs, 1)
+        assert [name for name, _, _ in l1] == [
+            "squeeze_r", "squeeze_phi", "bs_theta", "bs_phi", "rot_phi",
+            "disp_re", "disp_im", "kerr_kappa",
+        ]
+        assert l1[-1][1] + l1[-1][2] == _gate_param_count(m, "linear")
+        # L=2: contiguous, non-overlapping slices spanning the full op-plan width,
+        # with prefixed keys for the interferometer (I0_) and second layer (L1_).
+        l2 = gate_param_layout(m, n_bs, 2)
+        offset = 0
+        for _, start, count in l2:
+            assert start == offset
+            offset += count
+        assert offset == _op_plan_param_count(_build_op_plan(2), m, "linear")
+        names = {name for name, _, _ in l2}
+        assert "I0_bs_theta" in names and "L1_squeeze_r" in names

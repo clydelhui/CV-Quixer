@@ -27,38 +27,35 @@ import torch.nn.functional as F
 # ---------------------------------------------------------------------------
 
 
+# Derived per-epoch fields are no longer carried in history.json; report_diagnostics
+# reads them from predictions/diagnostics npz instead. EPOCH_KEYS lists the
+# training-time-only log fields that ensure_history_schema guarantees.
 EPOCH_KEYS: tuple[str, ...] = (
-    "train_per_class_acc", "test_per_class_acc",
-    "train_confusion",     "test_confusion",
-    "test_trunc_loss",
-    "lcu_coeffs", "poly_coeffs",
-    "hypernet_stats", "mean_photon_number",
+    "train_loss", "train_acc",
+    "test_loss",  "test_acc",
+    "trunc_loss", "test_trunc_loss",
+    "elapsed_sec",
 )
 
 
 def ensure_history_schema(h: dict) -> None:
-    """Idempotently add any missing diagnostic fields to a (possibly resumed)
-    history dict. Safe to call on a fresh `new_history()` result or on a
-    resumed checkpoint payload from an older schema."""
+    """Idempotently ensure the training-log schema. Safe to call on a fresh
+    `new_history()` result or on a resumed checkpoint payload from an older
+    schema."""
     h.setdefault("epoch", {})
     for k in EPOCH_KEYS:
         h["epoch"].setdefault(k, [])
 
 
 def new_history(n_params: int, device: str) -> dict:
-    """Build a fresh history dict with the full `{epoch, batch, meta}` skeleton.
+    """Build a fresh history dict with the `{epoch, batch, meta}` skeleton.
 
-    `started_at` is captured at call time. The returned dict already contains
-    both the base epoch keys (train/test loss/acc, trunc_loss, elapsed_sec) and
-    the extended `EPOCH_KEYS` (per-class accuracy, confusion, lcu/poly coeffs,
-    hypernet stats, mean photon number).
+    `started_at` is captured at call time. `history["epoch"]` carries only
+    the training-time log fields (loss/acc, trunc_loss, elapsed_sec); all
+    derived metrics live in the per-epoch predictions/diagnostics npz files.
     """
     h = {
-        "epoch": {
-            "train_loss": [], "train_acc": [],
-            "test_loss":  [], "test_acc":  [],
-            "trunc_loss": [], "elapsed_sec": [],
-        },
+        "epoch": {k: [] for k in EPOCH_KEYS},
         "batch": {
             "step":       [], "epoch":      [],
             "train_loss": [], "trunc_loss": [], "total_loss": [],
@@ -72,7 +69,6 @@ def new_history(n_params: int, device: str) -> dict:
             "completed_at": None,
         },
     }
-    ensure_history_schema(h)
     return h
 
 
@@ -154,26 +150,44 @@ def save_test_images_once(loader, image_size: int, patch_size: int,
 # ---------------------------------------------------------------------------
 
 
-def gate_param_layout(num_modes: int, n_bs: int) -> list[tuple[str, int, int]]:
+def gate_param_layout(
+    num_modes: int, n_bs: int, num_layers: int = 1
+) -> list[tuple[str, int, int]]:
     """Slice layout for hypernetwork gate-parameter outputs.
 
-    Derived from cv_attention._GATE_SEQUENCE — single source of truth for the
-    gate set. Each op contributes one (name, start, count) entry per parameter
-    name; slice keys are f"{op.name}_{param_name}" to match the legacy names
-    (squeeze_r, squeeze_phi, bs_theta, bs_phi, rot_phi, disp_re, disp_im,
-    kerr_kappa).
+    Derived from the per-patch op-plan (cv_attention._GATE_SEQUENCE interleaved
+    with _INTERFEROMETER_SEQUENCE — the single source of truth for the gate
+    set). Each op contributes one (name, start, count) entry per parameter name.
+
+    Keys preserve the legacy names for the first layer (squeeze_r, squeeze_phi,
+    bs_theta, bs_phi, rot_phi, disp_re, disp_im, kerr_kappa), so at
+    num_layers == 1 the layout — and therefore the saved npz keys — are
+    byte-identical to the single-layer model. For num_layers > 1, later blocks
+    are prefixed: ``L{l}_`` for layer l (l>=1) and ``I{l}_`` for the
+    interferometer that follows layer l.
 
     Returns list of (name, start, count); count==0 means the gate is absent.
     """
-    from cv_quixer.models.quantum.cv_attention import _GATE_SEQUENCE
+    from cv_quixer.models.quantum.cv_attention import (
+        _GATE_SEQUENCE,
+        _INTERFEROMETER_SEQUENCE,
+    )
 
     layout: list[tuple[str, int, int]] = []
     offset = 0
-    for op in _GATE_SEQUENCE:
-        n_sites = num_modes if op.site_kind == "mode" else n_bs
-        for p in op.param_names:
-            layout.append((f"{op.name}_{p}", offset, n_sites))
-            offset += n_sites
+
+    def _emit(seq, prefix: str) -> None:
+        nonlocal offset
+        for op in seq:
+            n_sites = num_modes if op.site_kind == "mode" else n_bs
+            for p in op.param_names:
+                layout.append((f"{prefix}{op.name}_{p}", offset, n_sites))
+                offset += n_sites
+
+    for layer in range(num_layers):
+        _emit(_GATE_SEQUENCE, "" if layer == 0 else f"L{layer}_")
+        if layer < num_layers - 1:
+            _emit(_INTERFEROMETER_SEQUENCE, f"I{layer}_")
     return layout
 
 
@@ -223,7 +237,8 @@ def quantum_diagnostics(model, loader, device,
     cutoff = attn.cutoff_dim
     head0 = attn.heads[0]
     n_bs = len(head0._bs_pairs)
-    layout = gate_param_layout(num_modes, n_bs)
+    num_layers = getattr(head0, "num_layers", 1)
+    layout = gate_param_layout(num_modes, n_bs, num_layers)
 
     gate_outs: list[list[torch.Tensor]] = [[] for _ in range(num_heads)]
     state_norm_chunks: list[list[float]] = [[] for _ in range(num_heads)]
@@ -241,12 +256,12 @@ def quantum_diagnostics(model, loader, device,
         B, N, _ = patches.shape
         n_processed += B
 
-        # Hypernetwork gate-parameter samples: one batched call per head
-        # over the full (B, N, patch_dim) tensor.
-        for h_idx, head in enumerate(attn.heads):
-            gate_outs[h_idx].append(
-                head.hypernetwork.forward_grid(patches).detach().cpu()
-            )
+        # Per-head gate-parameter samples over the full (B, N, patch_dim)
+        # tensor. gate_params_grid is model-agnostic: the canonical model runs
+        # each head's CNN hypernetwork; the shared-CNN model embeds once then
+        # applies each head's linear.
+        for h_idx, gp in enumerate(attn.gate_params_grid(patches)):
+            gate_outs[h_idx].append(gp.detach().cpu())
 
         out = model(patches, return_states=True)
         states_list = out.states

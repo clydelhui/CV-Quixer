@@ -28,12 +28,13 @@ from cv_quixer.config.schema import DataConfig, QuantumConfig
 from cv_quixer.models.base import BaseVisionTransformer
 from cv_quixer.models.quantum.cv_attention import (
     HyperCVAttention,
-    _gate_param_count,
+    SharedCVAttention,
     _readout_total_dim,
     norm_truncation_penalty,
     photon_number_penalty,
 )
 from cv_quixer.quantum import CVCircuit
+from cv_quixer.utils.params import autoscale_to_target
 
 
 class CVQuixerOut(NamedTuple):
@@ -88,159 +89,19 @@ class CVDecoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Auto-scaling helper
+# Shared forward base
 # ---------------------------------------------------------------------------
 
 
-def _param_count_formula(
-    patch_size: int,
-    num_patches: int,
-    num_heads: int,
-    num_modes: int,
-    cnn_channels_1: int,
-    cnn_channels_2: int,
-    cnn_kernel_size: int,
-    decoder_hidden: int,
-    num_classes: int,
-    bs_topology: str,
-    poly_degree: int,
-    observable_plan: list,
-) -> int:
-    """Closed-form parameter count for CVQuixer."""
-    h_out = patch_size - 2 * (cnn_kernel_size - 1)
-    feature_dim = cnn_channels_2 * h_out * h_out
-    gate_params = _gate_param_count(num_modes, bs_topology)
-    # CNNHypernetwork: Conv1 + Conv2 + Linear
-    conv1 = cnn_channels_1 * cnn_kernel_size ** 2 + cnn_channels_1
-    conv2 = cnn_channels_2 * cnn_channels_1 * cnn_kernel_size ** 2 + cnn_channels_2
-    linear = feature_dim * gate_params + gate_params
-    # LCUSumCoefficients: b_real + b_imag, one per patch
-    lcu = 2 * num_patches
-    # PolynomialCoefficients: c_0 … c_d
-    poly = poly_degree + 1
-    per_head = conv1 + conv2 + linear + lcu + poly
-    heads = num_heads * per_head
-    # CVDecoder — input width = num_heads × len(observable_plan)
-    per_head_dim = _readout_total_dim(observable_plan)
-    decoder_in = num_heads * per_head_dim
-    decoder = (decoder_in * decoder_hidden + decoder_hidden
-               + decoder_hidden * num_classes + num_classes)
-    return heads + decoder
+class _CVQuixerBase(BaseVisionTransformer):
+    """Shared forward for the CV-Quixer model family.
 
-
-def _resolve_cnn_channels(
-    config: QuantumConfig,
-    patch_size: int,
-    num_patches: int,
-    num_classes: int,
-) -> QuantumConfig:
-    """Binary-search cnn_channels_2 so total params ≈ target_params."""
-    import dataclasses
-
-    target = config.target_params
-
-    # The 2D sinusoidal PE in CNNHypernetwork requires
-    # feature_dim = cnn_channels_2 * h_out**2 to be even. When h_out is odd
-    # (e.g. patch_size=7, kernel=3 → h_out=3), cnn_channels_2 itself must be
-    # even; otherwise any positive integer is valid. Search over k where
-    # cnn_channels_2 = step * k.
-    h_out = patch_size - 2 * (config.cnn_kernel_size - 1)
-    step = 2 if (h_out * h_out) % 2 == 1 else 1
-
-    def count(c2: int) -> int:
-        return _param_count_formula(
-            patch_size, num_patches,
-            config.num_heads, config.num_modes,
-            config.cnn_channels_1, c2, config.cnn_kernel_size,
-            config.decoder_hidden_dim, num_classes,
-            config.bs_topology, config.poly_degree,
-            config._observable_plan,
-        )
-
-    lo, hi = 1, 4096
-    while count(step * hi) < target:
-        hi *= 2
-
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if count(step * mid) < target:
-            lo = mid + 1
-        else:
-            hi = mid
-
-    best = lo
-    if best > 1 and abs(count(step * (best - 1)) - target) < abs(count(step * best) - target):
-        best -= 1
-    best *= step
-
-    achieved = count(best)
-    if abs(achieved - target) / max(target, 1) > 0.10:
-        import warnings
-        warnings.warn(
-            f"target_params={target} but closest achievable is {achieved} "
-            f"(cnn_channels_2={best}). "
-            "Adjust num_modes, num_heads, or cnn_channels_1 for a tighter match.",
-            stacklevel=3,
-        )
-
-    return dataclasses.replace(config, cnn_channels_2=best)
-
-
-# ---------------------------------------------------------------------------
-# CVQuixer
-# ---------------------------------------------------------------------------
-
-
-class CVQuixer(BaseVisionTransformer):
-    """CV Quantum Vision Transformer.
-
-    Components:
-        cv_attention: HyperCVAttention (M parallel heads, each CNN-hypernetwork-driven)
-        decoder:      CVDecoder (readout MLP → class logits)
-
-    The forward pass optionally returns a Fock truncation penalty term that
-    should be added (scaled by trunc_lambda) to the cross-entropy loss during
-    training:
-
-        out = model(patches, return_trunc_loss=True)
-        loss = F.cross_entropy(out.logits, labels)
-        if out.trunc_loss is not None:
-            loss = loss + config.trunc_lambda * out.trunc_loss
-
-    Args:
-        quantum_config: QuantumConfig — circuit and architecture hyperparameters.
-        data_config:    DataConfig — patch/image dimensions and num_classes.
+    Both ``CVQuixer`` (per-head CNN hypernetworks) and ``SharedCVQuixer`` (shared
+    patch CNN + per-head linears) build a ``cv_attention`` module exposing the
+    same 4-tuple forward contract and a ``decoder``; the forward below depends
+    only on ``self.cv_attention``, ``self.decoder``, and ``self.trunc_penalty``,
+    so it is identical for both and lives here.
     """
-
-    def __init__(
-        self, quantum_config: QuantumConfig, data_config: DataConfig
-    ) -> None:
-        super().__init__()
-
-        patch_size = data_config.patch_size
-        image_size = data_config.image_size
-        num_patches = (image_size // patch_size) ** 2
-
-        # Auto-scale cnn_channels_2 if requested
-        config = quantum_config
-        if config.target_params > 0:
-            config = _resolve_cnn_channels(
-                config, patch_size, num_patches, data_config.num_classes
-            )
-
-        self.config = config
-        self.cv_attention = HyperCVAttention(patch_size, num_patches, config)
-        per_head_dim = _readout_total_dim(config._observable_plan)
-        self.decoder = CVDecoder(
-            in_dim=config.num_heads * per_head_dim,
-            hidden_dim=config.decoder_hidden_dim,
-            num_classes=data_config.num_classes,
-        )
-
-        # Kept for truncation loss computation in forward()
-        self._circuit = CVCircuit(config.num_modes, config.cutoff_dim)
-        self.trunc_penalty = config.trunc_penalty
-        self.trunc_lambda = config.trunc_lambda
 
     def forward(
         self,
@@ -286,8 +147,8 @@ class CVQuixer(BaseVisionTransformer):
             raise NotImplementedError(
                 "return_success_prob is not yet implemented. "
                 "Per-head success_prob tensors are computed inside "
-                "HyperCVAttentionHead but aggregation and exposure from "
-                "CVQuixer is pending."
+                "the attention heads but aggregation and exposure from "
+                "the model is pending."
             )
 
         readouts, states, success_probs, trunc_loss = self.cv_attention(patches)
@@ -307,3 +168,143 @@ class CVQuixer(BaseVisionTransformer):
             states=states if return_states else None,
             success_probs=success_probs if return_states else None,
         )
+
+
+# ---------------------------------------------------------------------------
+# CVQuixer
+# ---------------------------------------------------------------------------
+
+
+class CVQuixer(_CVQuixerBase):
+    """CV Quantum Vision Transformer.
+
+    Components:
+        cv_attention: HyperCVAttention (M parallel heads, each CNN-hypernetwork-driven)
+        decoder:      CVDecoder (readout MLP → class logits)
+
+    The forward pass optionally returns a Fock truncation penalty term that
+    should be added (scaled by trunc_lambda) to the cross-entropy loss during
+    training:
+
+        out = model(patches, return_trunc_loss=True)
+        loss = F.cross_entropy(out.logits, labels)
+        if out.trunc_loss is not None:
+            loss = loss + config.trunc_lambda * out.trunc_loss
+
+    Args:
+        quantum_config: QuantumConfig — circuit and architecture hyperparameters.
+        data_config:    DataConfig — patch/image dimensions and num_classes.
+    """
+
+    def __init__(
+        self, quantum_config: QuantumConfig, data_config: DataConfig
+    ) -> None:
+        super().__init__()
+
+        patch_size = data_config.patch_size
+        image_size = data_config.image_size
+        num_patches = (image_size // patch_size) ** 2
+
+        # Auto-scale the configured knob to the parameter budget if requested.
+        # Counting is done by actually building trial models and summing their
+        # nn.Parameters (autoscale_to_target), so the budget is matched against
+        # the real architecture rather than a hand-maintained formula.
+        config = quantum_config
+        if config.target_params > 0:
+            # The 2D sinusoidal PE in CNNHypernetwork needs an even
+            # feature_dim = cnn_channels_2 * h_out**2. When scaling cnn_channels_2
+            # and h_out is odd (e.g. patch_size=7, kernel=3 → h_out=3), the knob
+            # must step in 2s; every other knob steps in 1s.
+            h_out = patch_size - 2 * (config.cnn_kernel_size - 1)
+            step = (
+                2
+                if config.scaling_knob == "cnn_channels_2" and (h_out * h_out) % 2 == 1
+                else 1
+            )
+            config = autoscale_to_target(
+                build_fn=lambda c: CVQuixer(c, data_config),
+                config=config,
+                knob=config.scaling_knob,
+                target=config.target_params,
+                step=step,
+            )
+
+        self.config = config
+        self.cv_attention = HyperCVAttention(patch_size, num_patches, config)
+        per_head_dim = _readout_total_dim(config._observable_plan)
+        self.decoder = CVDecoder(
+            in_dim=config.num_heads * per_head_dim,
+            hidden_dim=config.decoder_hidden_dim,
+            num_classes=data_config.num_classes,
+        )
+
+        # Kept for truncation loss computation in forward()
+        self._circuit = CVCircuit(config.num_modes, config.cutoff_dim)
+        self.trunc_penalty = config.trunc_penalty
+        self.trunc_lambda = config.trunc_lambda
+
+    # forward() is inherited from _CVQuixerBase.
+
+
+# ---------------------------------------------------------------------------
+# SharedCVQuixer
+# ---------------------------------------------------------------------------
+
+
+class SharedCVQuixer(_CVQuixerBase):
+    """CV Quantum Vision Transformer with a shared patch CNN (model="quantum_shared").
+
+    Identical to ``CVQuixer`` except the per-head ``CNNHypernetwork`` is replaced
+    by a single ``SharedPatchCNN`` (run once per patch) feeding per-head
+    ``Linear`` projections. The shared CNN emits flattened conv features (+ 2D PE)
+    of width ``cnn_channels_2 × h_out²`` directly — no extra projection. See
+    ``SharedCVAttention``.
+
+    Components:
+        cv_attention: SharedCVAttention (shared CNN + M linear heads)
+        decoder:      CVDecoder (readout MLP → class logits)
+
+    Args:
+        quantum_config: QuantumConfig — circuit and architecture hyperparameters.
+                        ``scaling_knob`` is typically "num_heads" for this model.
+        data_config:    DataConfig — patch/image dimensions and num_classes.
+    """
+
+    def __init__(
+        self, quantum_config: QuantumConfig, data_config: DataConfig
+    ) -> None:
+        super().__init__()
+
+        patch_size = data_config.patch_size
+        image_size = data_config.image_size
+        num_patches = (image_size // patch_size) ** 2
+
+        # Auto-scale the configured knob to the parameter budget if requested.
+        # Counting builds trial models and sums their nn.Parameters
+        # (autoscale_to_target), so the budget is matched against the real
+        # architecture. For this model the knob is typically num_heads.
+        config = quantum_config
+        if config.target_params > 0:
+            config = autoscale_to_target(
+                build_fn=lambda c: SharedCVQuixer(c, data_config),
+                config=config,
+                knob=config.scaling_knob,
+                target=config.target_params,
+                step=1,
+            )
+
+        self.config = config
+        self.cv_attention = SharedCVAttention(patch_size, num_patches, config)
+        per_head_dim = _readout_total_dim(config._observable_plan)
+        self.decoder = CVDecoder(
+            in_dim=config.num_heads * per_head_dim,
+            hidden_dim=config.decoder_hidden_dim,
+            num_classes=data_config.num_classes,
+        )
+
+        # Kept for truncation loss computation in forward()
+        self._circuit = CVCircuit(config.num_modes, config.cutoff_dim)
+        self.trunc_penalty = config.trunc_penalty
+        self.trunc_lambda = config.trunc_lambda
+
+    # forward() is inherited from _CVQuixerBase.

@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import NamedTuple, Optional, Union
 
 
@@ -124,7 +124,7 @@ def _expand_observable_specs(
 @dataclass
 class QuantumConfig:
     num_modes: int = 4           # number of bosonic modes (qumodes)
-    num_layers: int = 4          # reserved — not read until multi-layer stacking is implemented
+    num_layers: int = 1          # per-patch circuit depth: L stacked gate sequences + L-1 BS→Rot interferometers
     cutoff_dim: int = 6          # Fock space truncation (memory ~ cutoff_dim^num_modes)
     grad_mode: str = "backprop"          # "backprop" | "parameter_shift"
     param_shift_shift: float = 1.5708   # shift s for PSR (default π/2)
@@ -138,14 +138,20 @@ class QuantumConfig:
     # CNN hypernetwork: Conv(1→C1) → Conv(C1→C2) → flatten → 2D PE → Linear → gate params
     # No padding; spatial output: h_out = patch_size - 2*(cnn_kernel_size - 1)
     cnn_channels_1: int = 8    # output channels of first conv layer
-    cnn_channels_2: int = 16   # output channels of second conv layer (auto-scaled if target_params > 0)
+    cnn_channels_2: int = 16   # output channels of second conv layer (default scaling_knob when target_params > 0)
     cnn_kernel_size: int = 3   # kernel size for both conv layers
 
     # Matrix polynomial degree for LCU attention (P(M) = Σ c_j M^j, j=0..d)
     poly_degree: int = 2           # keep ≤ 4; d=2 or d=3 recommended
 
-    # Auto-scaling: set > 0 to auto-adjust cnn_channels_2 to hit this budget
+    # Auto-scaling: set target_params > 0 to binary-search `scaling_knob` (an
+    # integer architecture field) so the built model's trainable-param count hits
+    # the budget. scaling_knob defaults to cnn_channels_2 (historic behaviour);
+    # other monotonic knobs (num_heads, num_modes, cnn_channels_1,
+    # decoder_hidden_dim, num_layers) also work — num_layers now deepens the
+    # per-patch unitary, so it monotonically increases the param count.
     target_params: int = -1
+    scaling_knob: str = "cnn_channels_2"
 
     # Fock truncation penalty added to training loss
     trunc_penalty: str = "none"   # "none" | "norm" | "photon_number"
@@ -164,6 +170,17 @@ class QuantumConfig:
     readout_observables: Optional[list[ObservableSpec]] = None
 
     def __post_init__(self) -> None:
+        valid_knobs = {
+            f.name
+            for f in fields(self)
+            if f.type in (int, "int") and f.name != "target_params"
+        }
+        if self.scaling_knob not in valid_knobs:
+            raise ValueError(
+                f"scaling_knob={self.scaling_knob!r} must name an integer "
+                f"QuantumConfig field; valid choices: {sorted(valid_knobs)}"
+            )
+
         if (
             self.readout_observable is not None
             and self.readout_observables is not None

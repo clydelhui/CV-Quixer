@@ -43,6 +43,20 @@ uv run python experiments/eval_cutoff_sweep.py \
 
 # Post-hoc thesis figures from a completed full_experiment run
 uv run python experiments/report_diagnostics.py --run-dir results/runs/<ts>/
+
+# Single run at a chosen parameter budget + observable preset
+uv run python experiments/full_experiment.py \
+    --epochs 1 --train-fraction 0.1 --test-fraction 0.1 \
+    --target-params 8000 --observables xp
+
+# Hyperparameter sweep over parameter budget × observable preset (× seeds).
+# --dry-run writes the manifest only; --launch local|slurm runs/submits it.
+uv run python experiments/sweep.py \
+    --target-params 8000 13760 20000 --observables x xpxsps pnr \
+    --epochs 3 --train-fraction 0.1 --test-fraction 0.1 --dry-run
+
+# Aggregate a sweep into a thesis table (summary.csv/md) + comparison plots
+uv run python experiments/report_sweep.py --sweep-dir results/sweeps/<sweep>_<ts>/
 ```
 
 ## Repo layout
@@ -60,7 +74,8 @@ cv_quixer/
 │   ├── base.py         BaseVisionTransformer (shared interface)
 │   ├── classical/      Classical ViT wrapper
 │   └── quantum/        CV-Quixer (CNN hypernet, LCU, polynomial, multi-head)
-├── config/         schema.py: ExperimentConfig dataclasses + ObservableSpec
+├── config/         schema.py: ExperimentConfig dataclasses + ObservableSpec;
+│                   observable_presets.py: named readout presets
 │                   (utils.py load_config() YAML loader — legacy, unused)
 ├── data/           MNIST / FashionMNIST + patch extraction
 ├── evaluation/     metrics.py (compare.py removed)
@@ -71,12 +86,14 @@ experiments/
 ├── mini_experiment.py       200/50 subset, 100 epochs (override with --epochs)
 ├── full_experiment.py       60k/10k FashionMNIST, self-contained results/runs/<ts>/
 ├── eval_cutoff_sweep.py     Re-evaluate a checkpoint at larger Fock cutoffs
+├── sweep.py                 Fan a (param × observable × seed) grid into runs
+├── report_sweep.py          Cross-run sweep table + comparison plots
 └── report_diagnostics.py    Post-hoc thesis figures from a full_experiment run
 
 configs/                  LEGACY — YAML overrides, not loaded by any current
                           script; kept for a planned YAML-workflow revival
 tests/                    Project unit tests
-scripts/                  SLURM batch jobs (mini/full/eval) + CUDA diagnostics
+scripts/                  SLURM batch jobs (mini/full/eval/sweep) + CUDA diagnostics
 ```
 
 ## Testing
@@ -91,13 +108,15 @@ uv run pytest tests/
   Fock-basis matrix elements (column-norm sub-isometric, deficit equals the
   Fock-truncation leakage probability). Non-Gaussian gates: Kerr is diagonal,
   cubic phase via `matrix_exp`.
-* **vmap batching** — `HyperCVAttention.forward` uses `torch.func.vmap` +
-  `functional_call` to batch attention heads across the batch dimension; all
-  inner ops are out-of-place for vmap compatibility.
+* **vmap batching** — `HyperCVAttention.forward` uses nested `torch.func.vmap` +
+  `functional_call` to run the attention heads and batch elements as a single
+  vectorized pass (head → batch → patch nesting); all inner ops are out-of-place
+  for vmap compatibility.
 * **Identical data pipeline** for classical and quantum models — same
   patches, same normalisation, same DataLoader output.
-* **Auto-scaling** — `QuantumConfig.target_params > 0` binary-searches
-  `cnn_channels_2` to land within 5 % of the target parameter count.
+* **Auto-scaling** — `QuantumConfig.target_params > 0` binary-searches the configured `scaling_knob`
+  (default `cnn_channels_2`, but e.g. `num_heads` / `num_modes` also work) to land
+  within ~10 % of the target parameter count.
 * **Configurable readout** — `QuantumConfig.readout_observables` selects any
   mix of `x`, `p`, `x²`, `p²`, `n`, and photon-number-resolving `prob_n`
   observables per mode (defaults to ⟨x̂⟩ per mode).
@@ -107,3 +126,10 @@ uv run pytest tests/
 * **Configs built in Python** — scripts construct `ExperimentConfig`
   directly; `full_experiment.py` writes `config.json` per run, which
   `eval_cutoff_sweep.py` / `report_diagnostics.py` reload via `dacite`.
+* **Hyperparameter sweeps** — `full_experiment.py` exposes the two sweep axes
+  (`--target-params`, `--observables <preset>`) plus `--seed`/`--run-name`/
+  `--runs-root`. `experiments/sweep.py` fans a grid into one process per point
+  (local or SLURM array via `scripts/run_sweep.sh`) under
+  `results/sweeps/<sweep>_<ts>/`; `experiments/report_sweep.py` aggregates them
+  into `summary.csv`/`summary.md` + comparison plots. Optional W&B logging via
+  `--wandb` (grouped per sweep; `WANDB_MODE=offline` on offline nodes).

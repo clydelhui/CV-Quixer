@@ -1,9 +1,22 @@
 """Post-hoc diagnostic figure generator for a `full_experiment.py` run.
 
-Consumes the artefacts already written by `full_experiment.py`
-(config.json, history.json, checkpoints/, predictions/, diagnostics/) and
-emits the qualitative + quantum-specific figures that don't fit into the
-training loop's per-epoch save pass.
+The single figure-generation tool for the project. `full_experiment.py`
+writes only raw data artefacts (per-epoch `predictions/*.npz` for both
+train and test, `diagnostics/*.npz`, checkpoints, per-batch arrays in
+`history.json`); every derived metric (accuracy, per-class accuracy,
+confusion matrices, mean photon number, LCU/polynomial coefficient
+snapshots) is recomputed here from those raw artefacts.
+
+`history["epoch"]` is treated as a training-time log only — never as the
+canonical source for plotted values. `plot_training_curves` derives
+accuracy/loss from predictions npz and cross-checks against the logged
+values, emitting a `RuntimeWarning` on mismatch.
+
+Hard-fail policy: when a required per-epoch npz is missing, the
+relevant figure function raises with a clear message directing the user
+to run `experiments/backfill_artefacts.py --run-dir <run>`. The
+top-level `main()` catches the exception and surfaces it as a warning so
+the rest of the figures still render.
 
 Usage:
     uv run python experiments/report_diagnostics.py \\
@@ -38,9 +51,174 @@ from cv_quixer.evaluation.labels import class_names
 # importing class_names at module scope is safe.
 
 
+# Moving-average window for the per-batch curves. Matches what the old
+# full_experiment.save_figures used (kept here so that figure styling is
+# unchanged between this script and any future producer).
+MA_WINDOW = 50
+
+
 # ---------------------------------------------------------------------------
 # Loading + helpers
 # ---------------------------------------------------------------------------
+
+
+class MissingArtefactError(RuntimeError):
+    """Raised when a required per-epoch npz file is missing. Carries a
+    backfill-hint message so the user knows the canonical fix."""
+
+
+def _require_predictions(run_dir: Path, epoch: int, side: str) -> dict:
+    """Load `predictions/epoch_NNNN.npz` (side='test') or
+    `predictions/epoch_NNNN_train.npz` (side='train'). Raises
+    `MissingArtefactError` with a backfill hint when absent.
+    """
+    suffix = "" if side == "test" else "_train"
+    path = run_dir / "predictions" / f"epoch_{epoch:04d}{suffix}.npz"
+    if not path.is_file():
+        raise MissingArtefactError(
+            f"required artefact missing: {path.relative_to(run_dir)} — "
+            f"run `uv run python experiments/backfill_artefacts.py "
+            f"--run-dir {run_dir}` to produce it."
+        )
+    return dict(np.load(path))
+
+
+def _load_all_per_epoch_predictions(run_dir: Path, side: str = "test",
+                                    n_epochs: int | None = None) -> dict[int, dict]:
+    """Load every available `predictions/epoch_NNNN{,_train}.npz` for the
+    given side, returning `{epoch: {y_true, y_pred, y_probs, readouts}}`.
+
+    If `n_epochs` is given, the result must cover every epoch in
+    `[1, n_epochs]` — missing epochs raise `MissingArtefactError`. If
+    `n_epochs` is None, returns whatever exists.
+    """
+    suffix = "" if side == "test" else "_train"
+    preds_dir = run_dir / "predictions"
+    out: dict[int, dict] = {}
+    if n_epochs is None:
+        for path in sorted(preds_dir.glob(f"epoch_*{suffix}.npz")):
+            # Skip test-side files when scanning train-side and vice versa
+            # (the glob is ambiguous for side='test' since `_train` files
+            # also match `epoch_*.npz`).
+            stem = path.stem  # "epoch_0001" or "epoch_0001_train"
+            if side == "test" and stem.endswith("_train"):
+                continue
+            if side == "train" and not stem.endswith("_train"):
+                continue
+            try:
+                epoch = int(stem.split("_")[1])
+            except (IndexError, ValueError):
+                continue
+            out[epoch] = dict(np.load(path))
+        return out
+    for e in range(1, n_epochs + 1):
+        out[e] = _require_predictions(run_dir, e, side)
+    return out
+
+
+def _load_all_diagnostics(run_dir: Path,
+                          n_epochs: int | None = None) -> dict[int, dict]:
+    """Load every available `diagnostics/epoch_NNNN.npz`, returning a
+    `{epoch: {key: array, ...}}` mapping. Behaves like
+    `_load_all_per_epoch_predictions` w.r.t. the `n_epochs` flag.
+    """
+    diag_dir = run_dir / "diagnostics"
+    out: dict[int, dict] = {}
+    if n_epochs is None:
+        for path in sorted(diag_dir.glob("epoch_*.npz")):
+            try:
+                epoch = int(path.stem.split("_")[1])
+            except (IndexError, ValueError):
+                continue
+            out[epoch] = dict(np.load(path))
+        return out
+    for e in range(1, n_epochs + 1):
+        path = diag_dir / f"epoch_{e:04d}.npz"
+        if not path.is_file():
+            raise MissingArtefactError(
+                f"required artefact missing: {path.relative_to(run_dir)} — "
+                f"run `uv run python experiments/backfill_artefacts.py "
+                f"--run-dir {run_dir}` to produce it."
+            )
+        out[e] = dict(np.load(path))
+    return out
+
+
+def _warn_mismatch(name: str, derived: float, logged: float | None,
+                   tol: float) -> None:
+    """Emit a `RuntimeWarning` if a derived per-epoch metric disagrees
+    with the corresponding training-log entry by more than `tol`. A None
+    logged value is treated as "no log" and silently ignored.
+    """
+    if logged is None:
+        return
+    if not np.isfinite(derived) or not np.isfinite(logged):
+        return
+    diff = abs(float(derived) - float(logged))
+    if diff > tol:
+        warnings.warn(
+            f"{name}: derived={derived:.6f} vs logged={logged:.6f} "
+            f"(|Δ|={diff:.2e} > tol={tol:.0e}). The npz-derived value is "
+            "used for the figure; the logged value comes from "
+            "history.json and may be stale.",
+            RuntimeWarning,
+        )
+
+
+def _accuracy_from(preds: dict) -> float:
+    return float((preds["y_pred"] == preds["y_true"]).mean())
+
+
+def _cross_entropy_from(preds: dict) -> float:
+    # -log p_{true_class}; numerically stabilised against probs == 0.
+    probs = np.clip(preds["y_probs"], 1e-12, 1.0)
+    idx = preds["y_true"].astype(np.int64)
+    rows = np.arange(probs.shape[0])
+    return float(-np.log(probs[rows, idx]).mean())
+
+
+def _per_class_acc_from(preds: dict, num_classes: int) -> np.ndarray:
+    """Recall per class — `diag(C)/rowsum(C)` with zero-row safety."""
+    y_true = preds["y_true"].astype(np.int64)
+    y_pred = preds["y_pred"].astype(np.int64)
+    flat = y_true * num_classes + y_pred
+    cm = np.bincount(flat, minlength=num_classes * num_classes).reshape(
+        num_classes, num_classes
+    ).astype(np.int64)
+    totals = cm.sum(axis=1)
+    return np.where(totals > 0, cm.diagonal() / np.maximum(totals, 1), 0.0)
+
+
+def _confusion_from(preds: dict, num_classes: int) -> np.ndarray:
+    y_true = preds["y_true"].astype(np.int64)
+    y_pred = preds["y_pred"].astype(np.int64)
+    flat = y_true * num_classes + y_pred
+    return np.bincount(flat, minlength=num_classes * num_classes).reshape(
+        num_classes, num_classes
+    ).astype(np.int64)
+
+
+def _moving_average(x: list[float] | np.ndarray, window: int) -> np.ndarray:
+    arr = np.asarray(x, dtype=float)
+    if len(arr) < window:
+        return arr.copy()
+    cumsum = np.cumsum(np.insert(arr, 0, 0.0))
+    ma = (cumsum[window:] - cumsum[:-window]) / float(window)
+    return np.concatenate([np.full(window - 1, np.nan), ma])
+
+
+def _epoch_boundary_steps(bh: dict) -> list[int]:
+    """Global step at which each epoch ended (used for vertical markers)."""
+    epochs_arr = np.asarray(bh.get("epoch", []))
+    steps_arr = np.asarray(bh.get("step", []))
+    if epochs_arr.size == 0:
+        return []
+    boundaries = []
+    for e in sorted(set(epochs_arr.tolist())):
+        mask = epochs_arr == e
+        if mask.any():
+            boundaries.append(int(steps_arr[mask].max()))
+    return boundaries[:-1]
 
 
 def _resolve_epoch(history: dict, epoch_arg: str) -> int:
@@ -102,9 +280,11 @@ def load_run(run_dir: Path, epoch_arg: str) -> dict:
     subset_indices = (dict(np.load(subset_path))
                       if subset_path.is_file() else None)
 
+    fig_dir = run_dir / "figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
     return {
         "run_dir":        run_dir,
-        "fig_dir":        run_dir / "figures",
+        "fig_dir":        fig_dir,
         "config":         config,
         "history":        history,
         "epoch":          epoch,
@@ -293,14 +473,196 @@ def _check_parity(run: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-def plot_confusion_matrix_evolution(run: dict) -> None:
+def plot_training_curves(run: dict) -> None:
+    """Render the training-time curves and the latest-epoch test confusion
+    matrix from raw artefacts. Cross-checks the derived per-epoch loss /
+    accuracy values against the history.json training log and warns on
+    mismatch — never reads the logged value into the figure.
+    """
     eh = run["history"]["epoch"]
-    cms = eh.get("test_confusion")
-    if not cms:
-        print("  - test_confusion missing → skipping confusion_matrix_evolution")
+    bh = run["history"].get("batch", {})
+    config = run["config"]
+    fig_dir = run["fig_dir"]
+    run_dir = run["run_dir"]
+    num_classes = config.data.num_classes
+    classes = class_names(config)
+
+    n_epochs = len(eh.get("test_loss", []))
+    if n_epochs == 0:
+        print("  - history.json has no epoch entries → skipping training curves")
         return
+
+    # Load per-epoch predictions for both sides — hard-fail if any are missing.
+    test_preds = _load_all_per_epoch_predictions(run_dir, side="test",
+                                                 n_epochs=n_epochs)
+    train_preds = _load_all_per_epoch_predictions(run_dir, side="train",
+                                                  n_epochs=n_epochs)
+
+    epoch_x = list(range(1, n_epochs + 1))
+    train_loss_derived = [_cross_entropy_from(train_preds[e]) for e in epoch_x]
+    test_loss_derived = [_cross_entropy_from(test_preds[e]) for e in epoch_x]
+    train_acc_derived = [_accuracy_from(train_preds[e]) for e in epoch_x]
+    test_acc_derived = [_accuracy_from(test_preds[e]) for e in epoch_x]
+
+    # Cross-check against the training log. The two values should agree to
+    # within float32 + device drift since both come from the same evaluate()
+    # call inside the training loop.
+    for e, (d, l) in enumerate(zip(train_loss_derived, eh.get("train_loss", [])), 1):
+        _warn_mismatch(f"epoch {e} train_loss", d, l, tol=1e-3)
+    for e, (d, l) in enumerate(zip(test_loss_derived, eh.get("test_loss", [])), 1):
+        _warn_mismatch(f"epoch {e} test_loss", d, l, tol=1e-3)
+    for e, (d, l) in enumerate(zip(train_acc_derived, eh.get("train_acc", [])), 1):
+        _warn_mismatch(f"epoch {e} train_acc", d, l, tol=1e-4)
+    for e, (d, l) in enumerate(zip(test_acc_derived, eh.get("test_acc", [])), 1):
+        _warn_mismatch(f"epoch {e} test_acc", d, l, tol=1e-4)
+
+    # Per-epoch loss
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.plot(epoch_x, train_loss_derived, label="train loss", marker="o")
+    ax.plot(epoch_x, test_loss_derived, label="test loss", marker="s")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Cross-entropy loss")
+    ax.set_title("Loss (per epoch)")
+    ax.legend(); ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(fig_dir / "loss_curve.png", dpi=150)
+    plt.close(fig)
+    print("  ✓ loss_curve.png")
+
+    # Per-epoch accuracy
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.plot(epoch_x, train_acc_derived, label="train acc", marker="o")
+    ax.plot(epoch_x, test_acc_derived, label="test acc", marker="s")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Accuracy")
+    ax.set_title("Accuracy (per epoch)")
+    ax.legend(); ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(fig_dir / "accuracy_curve.png", dpi=150)
+    plt.close(fig)
+    print("  ✓ accuracy_curve.png")
+
+    # Per-epoch trunc loss — training-log-only until per-sample trunc is
+    # plumbed in Step 3. Falls back gracefully if both fields are absent.
+    trunc = eh.get("trunc_loss") or []
+    test_trunc = eh.get("test_trunc_loss") or []
+    if trunc or test_trunc:
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        if trunc:
+            ax.plot(epoch_x[:len(trunc)], trunc,
+                    label="train trunc loss", color="tab:orange", marker="o")
+        if test_trunc:
+            ax.plot(epoch_x[:len(test_trunc)], test_trunc,
+                    label="test trunc loss", color="tab:blue", marker="s")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Mean per-patch truncation loss")
+        ax.set_title("Truncation loss (per epoch) — from training log")
+        ax.legend(); ax.grid(alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(fig_dir / "trunc_loss_curve.png", dpi=150)
+        plt.close(fig)
+        print("  ✓ trunc_loss_curve.png")
+
+    # Per-class accuracy curve (test) — derived per epoch from predictions.
+    per_class = np.stack(
+        [_per_class_acc_from(test_preds[e], num_classes) for e in epoch_x]
+    )  # (n_epochs, num_classes)
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    cmap = matplotlib.colormaps.get_cmap("tab10").resampled(num_classes)
+    for c in range(num_classes):
+        ax.plot(epoch_x, per_class[:, c], marker="o", color=cmap(c),
+                label=f"{c}: {classes[c]}")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Test accuracy (recall)")
+    ax.set_title("Per-class test accuracy across epochs")
+    ax.set_ylim(-0.02, 1.02)
+    ax.grid(alpha=0.3)
+    ax.legend(loc="lower right", fontsize=8, ncol=2)
+    fig.tight_layout()
+    fig.savefig(fig_dir / "per_class_accuracy_curve.png", dpi=150)
+    plt.close(fig)
+    print("  ✓ per_class_accuracy_curve.png")
+
+    # Latest-epoch test confusion matrix (counts + row-normalised).
+    last_cm = _confusion_from(test_preds[n_epochs], num_classes)
+    last_cm_row = last_cm / np.maximum(last_cm.sum(axis=1, keepdims=True), 1)
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+    for ax_, mat, title, fmt in (
+        (axes[0], last_cm, "Counts", "d"),
+        (axes[1], last_cm_row, "Row-normalised", ".2f"),
+    ):
+        im = ax_.imshow(mat, cmap="Blues")
+        ax_.set_title(f"{title} (epoch {n_epochs})")
+        ax_.set_xticks(range(num_classes))
+        ax_.set_yticks(range(num_classes))
+        ax_.set_xticklabels(classes, rotation=45, ha="right", fontsize=8)
+        ax_.set_yticklabels(classes, fontsize=8)
+        ax_.set_xlabel("Predicted"); ax_.set_ylabel("True")
+        for i in range(num_classes):
+            for j in range(num_classes):
+                val = mat[i, j]
+                colour = "white" if (val > mat.max() * 0.6) else "black"
+                ax_.text(j, i, format(val, fmt),
+                         ha="center", va="center", color=colour, fontsize=7)
+        fig.colorbar(im, ax=ax_, fraction=0.046, pad=0.04)
+    fig.suptitle("Test confusion matrix")
+    fig.tight_layout()
+    fig.savefig(fig_dir / "confusion_matrix_test.png", dpi=150)
+    plt.close(fig)
+    print("  ✓ confusion_matrix_test.png")
+
+    # Per-batch curves — sourced from history["batch"] (intrinsically a
+    # training-time observation, not derivable from predictions).
+    steps = bh.get("step") or []
+    if not steps:
+        return
+    boundaries = _epoch_boundary_steps(bh)
+
+    def _per_batch_plot(values: list[float], ylabel: str, title: str,
+                        fname: str, log_y: bool = False) -> None:
+        fig, ax = plt.subplots(figsize=(10, 4.5))
+        ax.plot(steps, values, alpha=0.25, lw=0.7, label="per batch")
+        ma = _moving_average(values, MA_WINDOW)
+        if not np.all(np.isnan(ma)):
+            ax.plot(steps, ma, lw=1.8, label=f"moving avg (w={MA_WINDOW})")
+        for b in boundaries:
+            ax.axvline(b, color="gray", ls="--", alpha=0.4, lw=0.8)
+        if log_y:
+            ax.set_yscale("log")
+        ax.set_xlabel("Global batch step")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.legend(); ax.grid(alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(fig_dir / fname, dpi=150)
+        plt.close(fig)
+        print(f"  ✓ {fname}")
+
+    _per_batch_plot(bh.get("train_loss") or [], "Cross-entropy loss",
+                    "Train CE loss (per batch)", "per_batch_train_loss.png")
+    _per_batch_plot(bh.get("trunc_loss") or [], "Truncation loss",
+                    "Truncation loss (per batch)", "per_batch_trunc_loss.png")
+    _per_batch_plot(bh.get("batch_acc") or [], "Batch accuracy",
+                    "Train accuracy (per batch)", "per_batch_train_accuracy.png")
+    _per_batch_plot(bh.get("grad_norm") or [], "Gradient L2 norm (log scale)",
+                    "Gradient norm (per batch)", "per_batch_grad_norm.png",
+                    log_y=True)
+
+
+def plot_confusion_matrix_evolution(run: dict) -> None:
+    """Render a grid of row-normalised confusion matrices, one per epoch,
+    derived from each epoch's test predictions npz.
+    """
+    eh = run["history"]["epoch"]
+    n_epochs = len(eh.get("test_loss", []))
+    if n_epochs == 0:
+        print("  - history.json has no epoch entries → skipping confusion_matrix_evolution")
+        return
+    test_preds = _load_all_per_epoch_predictions(
+        run["run_dir"], side="test", n_epochs=n_epochs,
+    )
     classes = class_names(run["config"])
-    n_epochs = len(cms)
+    num_classes = run["config"].data.num_classes
     cols = min(4, n_epochs)
     rows = (n_epochs + cols - 1) // cols
     fig, axes = plt.subplots(rows, cols, figsize=(3.5 * cols, 3.5 * rows),
@@ -309,12 +671,11 @@ def plot_confusion_matrix_evolution(run: dict) -> None:
         if idx >= n_epochs:
             ax.axis("off")
             continue
-        cm = np.asarray(cms[idx], dtype=np.float64)
+        cm = _confusion_from(test_preds[idx + 1], num_classes).astype(np.float64)
         cm_norm = cm / np.maximum(cm.sum(axis=1, keepdims=True), 1)
         ax.imshow(cm_norm, cmap="Blues", vmin=0, vmax=1)
         ax.set_title(f"epoch {idx + 1}", fontsize=10)
-        ax.set_xticks([])
-        ax.set_yticks([])
+        ax.set_xticks([]); ax.set_yticks([])
     fig.suptitle(f"Test confusion-matrix evolution ({len(classes)} classes)")
     fig.tight_layout()
     fig.savefig(run["fig_dir"] / "confusion_matrix_evolution.png", dpi=150)
@@ -544,16 +905,15 @@ def plot_hypernet_gate_histograms(run: dict) -> None:
 
 
 def plot_photon_number_per_mode(run: dict) -> None:
-    eh = run["history"]["epoch"]
-    if not eh.get("mean_photon_number"):
-        print("  - mean_photon_number missing → skipping photon_number_per_mode")
-        return
-    chosen = run["epoch"] - 1
-    entry = eh["mean_photon_number"][chosen]
-    if entry is None:
-        print("  - mean_photon_number entry for chosen epoch is null → skipping")
-        return
-    arr = np.asarray(entry)        # (num_heads, num_modes)
+    diag = run["diagnostics"]
+    if diag is None or "mean_photon_number" not in diag:
+        raise MissingArtefactError(
+            f"diagnostics/epoch_{run['epoch']:04d}.npz missing or has no "
+            f"`mean_photon_number` key — run `uv run python "
+            f"experiments/backfill_artefacts.py --run-dir {run['run_dir']}` "
+            "to produce it."
+        )
+    arr = np.asarray(diag["mean_photon_number"])  # (num_heads, num_modes)
     num_heads, num_modes = arr.shape
     cutoff = run["config"].quantum.cutoff_dim
     fig, ax = plt.subplots(figsize=(8, 4.5))
@@ -612,12 +972,15 @@ def plot_state_norm_histogram(run: dict) -> None:
 
 
 def plot_lcu_coefficients_heatmap(run: dict) -> None:
-    eh = run["history"]["epoch"]
-    if not eh.get("lcu_coeffs"):
-        print("  - lcu_coeffs missing → skipping lcu_coefficients_heatmap")
-        return
-    chosen = run["epoch"] - 1
-    arr = np.asarray(eh["lcu_coeffs"][chosen])   # (num_heads, num_patches, 2)
+    diag = run["diagnostics"]
+    if diag is None or "lcu_coeffs" not in diag:
+        raise MissingArtefactError(
+            f"diagnostics/epoch_{run['epoch']:04d}.npz missing or has no "
+            f"`lcu_coeffs` key — run `uv run python "
+            f"experiments/backfill_artefacts.py --run-dir {run['run_dir']}` "
+            "to produce it."
+        )
+    arr = np.asarray(diag["lcu_coeffs"])   # (num_heads, num_patches, 2)
     magnitude = np.sqrt((arr ** 2).sum(axis=-1))  # (num_heads, num_patches)
     fig, ax = plt.subplots(figsize=(10, 4))
     im = ax.imshow(magnitude, aspect="auto", cmap="viridis")
@@ -633,10 +996,22 @@ def plot_lcu_coefficients_heatmap(run: dict) -> None:
 
 def plot_polynomial_coefficient_trajectory(run: dict) -> None:
     eh = run["history"]["epoch"]
-    if not eh.get("poly_coeffs"):
-        print("  - poly_coeffs missing → skipping polynomial_coefficients_trajectory")
+    n_epochs = len(eh.get("test_loss", []))
+    if n_epochs == 0:
+        print("  - history.json has no epoch entries → skipping polynomial_coefficients_trajectory")
         return
-    arr = np.asarray(eh["poly_coeffs"])   # (n_epochs, num_heads, degree+1)
+    diag_per_epoch = _load_all_diagnostics(run["run_dir"], n_epochs=n_epochs)
+    poly_chunks = []
+    for e in range(1, n_epochs + 1):
+        d = diag_per_epoch[e]
+        if "poly_coeffs" not in d:
+            raise MissingArtefactError(
+                f"diagnostics/epoch_{e:04d}.npz missing `poly_coeffs` — "
+                f"run `uv run python experiments/backfill_artefacts.py "
+                f"--run-dir {run['run_dir']}` to produce it."
+            )
+        poly_chunks.append(np.asarray(d["poly_coeffs"]))
+    arr = np.stack(poly_chunks)            # (n_epochs, num_heads, degree+1)
     n_epochs, num_heads, degree_plus_1 = arr.shape
     fig, axes = plt.subplots(1, num_heads, figsize=(3.5 * num_heads, 4),
                              sharey=True, squeeze=False)
@@ -664,26 +1039,7 @@ def plot_polynomial_coefficient_trajectory(run: dict) -> None:
 
 
 def sanity_checks(run: dict) -> None:
-    eh = run["history"]["epoch"]
-    # Pick whichever source we have on disk as the authoritative N for the
-    # confusion matrix sanity check.
-    expected_n = None
-    if run["test_images"] is not None and "images" in run["test_images"]:
-        expected_n = int(run["test_images"]["images"].shape[0])
-    elif run["predictions"] is not None and "y_true" in run["predictions"]:
-        expected_n = int(run["predictions"]["y_true"].shape[0])
-    if eh.get("test_confusion") and expected_n is not None:
-        cm = np.asarray(eh["test_confusion"][-1], dtype=np.int64)
-        total = int(cm.sum())
-        if total != expected_n:
-            warnings.warn(
-                f"Confusion matrix row sum {total} != saved test set size "
-                f"{expected_n} (this may be expected if the test set was "
-                "sub-sampled at training time and the resulting npz reflects "
-                "that subset).",
-                RuntimeWarning,
-            )
-
+    # Compare loaded test predictions vs subset_indices.npz / test_images.
     si = run["subset_indices"]
     if si is not None and run["predictions"] is not None:
         n_idx = int(si["test_indices"].size)
@@ -696,8 +1052,12 @@ def sanity_checks(run: dict) -> None:
                 "versa.",
                 RuntimeWarning,
             )
-    if eh.get("lcu_coeffs"):
-        arr = np.asarray(eh["lcu_coeffs"][0])
+
+    # LCU coeffs shape sanity — pulled from the chosen epoch's diagnostics
+    # npz now that the per-epoch history.epoch.lcu_coeffs list is gone.
+    diag = run["diagnostics"]
+    if diag is not None and "lcu_coeffs" in diag:
+        arr = np.asarray(diag["lcu_coeffs"])
         n_heads_expected = run["config"].quantum.num_heads
         if arr.shape[0] != n_heads_expected:
             warnings.warn(
@@ -813,6 +1173,7 @@ def main() -> None:
 
     # Figures that only need history.json / .npz files
     fast_plots = [
+        ("training_curves",                plot_training_curves),
         ("confusion_matrix_evolution",     plot_confusion_matrix_evolution),
         ("per_class_metrics_table",        write_per_class_metrics_table),
         ("top_k_accuracy",                 plot_top_k_accuracy),

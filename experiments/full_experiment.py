@@ -20,8 +20,11 @@ Run directory layout (one self-contained folder per run):
     │   ├── best.pt                  # best test-acc snapshot
     │   ├── final_model.pt           # written once at end of training
     │   └── epoch_NNNN.pt            # versioned per-epoch checkpoint
-    ├── figures/                     # all PNGs re-rendered after every epoch
     └── logs/
+
+Figures are produced separately by `experiments/report_diagnostics.py` —
+run it against the run directory (post-hoc or partway through) to populate
+`figures/` from `history.json` + the saved npz files.
 
 Run (fresh):
     uv run python experiments/full_experiment.py
@@ -47,16 +50,13 @@ from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
+from cv_quixer.config.observable_presets import PRESET_NAMES, resolve_observables
 from cv_quixer.config.schema import (
     DataConfig,
     ExperimentConfig,
@@ -73,9 +73,9 @@ from cv_quixer.evaluation.diagnostics import (
     save_test_images_once,
     snapshot_coefficients,
 )
-from cv_quixer.evaluation.labels import class_names
 from cv_quixer.models import build_model
 from cv_quixer.utils import print_parameter_table
+from cv_quixer.utils.logging import finish_logging, init_logging, log_metrics
 
 # ---------------------------------------------------------------------------
 # Defaults (CLI-overridable below)
@@ -84,8 +84,12 @@ from cv_quixer.utils import print_parameter_table
 EPOCHS = 3
 BATCH_SIZE = 64
 TARGET_PARAMS = 13_760
+SCALING_KNOB = "cnn_channels_2"  # architecture knob auto-scaled to hit TARGET_PARAMS
+NUM_LAYERS = 1  # per-patch circuit depth L (L gate sequences + L-1 BS→Rot interferometers)
+CUTOFF_DIM = 6  # Fock truncation (also used to expand the `pnr` observable preset)
+SEED = 42
 CHECKPOINT_INTERVAL = 1  # versioned epoch_NNNN.pt every N epochs
-MA_WINDOW = 50  # moving-average window for per-batch plots
+DEFAULT_OBSERVABLES = "xpxsps"  # x, p, x², p² per mode
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +142,96 @@ parser.add_argument(
     default=42,
     help="seed shared by --train-fraction and --test-fraction random subsets",
 )
+# --- sweep axes -----------------------------------------------------------
+parser.add_argument(
+    "--target-params",
+    type=int,
+    default=None,
+    help=f"parameter budget; auto-scales the configured --scaling-knob "
+    f"(default TARGET_PARAMS={TARGET_PARAMS:,})",
+)
+parser.add_argument(
+    "--scaling-knob",
+    type=str,
+    default=None,
+    help=f"integer QuantumConfig field to auto-scale toward --target-params "
+    f"(default {SCALING_KNOB!r}); e.g. cnn_channels_2, num_heads, num_modes",
+)
+parser.add_argument(
+    "--num-layers",
+    type=int,
+    default=None,
+    help="per-patch circuit depth L (default 1): L stacked gate sequences with "
+    "L-1 BS→Rot interferometers between them. Deepening L raises the param "
+    "count, so it may also be used as a --scaling-knob.",
+)
+parser.add_argument(
+    "--observables",
+    type=str,
+    default=None,
+    choices=PRESET_NAMES,
+    help="named observable readout preset (default 'xpxsps'). "
+    "Mutually exclusive with --observables-json.",
+)
+parser.add_argument(
+    "--observables-json",
+    type=str,
+    default=None,
+    help="ad-hoc observable spec as a JSON list of "
+    '{"type","mode","n"} objects, e.g. \'[{"type":"x","mode":"all"}]\'. '
+    "Requires --run-name. Mutually exclusive with --observables.",
+)
+parser.add_argument(
+    "--seed",
+    type=int,
+    default=None,
+    help="training seed (default 42); vary for repeat runs / error bars",
+)
+# --- model selection ------------------------------------------------------
+parser.add_argument(
+    "--model",
+    type=str,
+    default="quantum",
+    choices=["quantum", "quantum_shared", "classical"],
+    help="model variant: 'quantum' (per-head CNN hypernetworks, default), "
+    "'quantum_shared' (shared patch CNN + per-head linears; defaults "
+    "--scaling-knob to num_heads), or 'classical'.",
+)
+# --- run organisation -----------------------------------------------------
+parser.add_argument(
+    "--run-name",
+    type=str,
+    default=None,
+    help="explicit run-directory name (default full_fashionmnist_<timestamp>). "
+    "Sweeps pass an encoded name like p13760__obs-xpxsps__seed42.",
+)
+parser.add_argument(
+    "--runs-root",
+    type=str,
+    default="results/runs",
+    help="parent directory for the run (default results/runs; "
+    "sweeps pass results/sweeps/<sweep_name>)",
+)
+# --- experiment tracking --------------------------------------------------
+parser.add_argument(
+    "--wandb",
+    action="store_true",
+    help="log metrics to Weights & Biases (set WANDB_MODE=offline on "
+    "nodes without network)",
+)
+parser.add_argument(
+    "--wandb-group",
+    type=str,
+    default=None,
+    help="wandb run group (pass the sweep name to group sweep runs)",
+)
+parser.add_argument(
+    "--wandb-tags",
+    type=str,
+    nargs="*",
+    default=None,
+    help="extra wandb tags (params/obs/seed tags are added automatically)",
+)
 args = parser.parse_args()
 
 if args.train_fraction is not None and args.train_limit is not None:
@@ -151,10 +245,40 @@ if args.test_fraction is not None and not (0.0 < args.test_fraction <= 1.0):
 
 if args.epochs is not None:
     EPOCHS = args.epochs
+if args.target_params is not None:
+    TARGET_PARAMS = args.target_params
+# The shared-CNN model auto-scales on num_heads by default (per-head linears are
+# cheap, so cnn_channels_2 is a poor budget knob here). An explicit --scaling-knob
+# still wins.
+if args.model == "quantum_shared" and args.scaling_knob is None:
+    SCALING_KNOB = "num_heads"
+if args.scaling_knob is not None:
+    SCALING_KNOB = args.scaling_knob
+if args.num_layers is not None:
+    NUM_LAYERS = args.num_layers
+if args.seed is not None:
+    SEED = args.seed
+
+# Resolve the observable readout (sweep axis 2). A named preset gives a clean
+# `observables_name` for run naming / history meta; ad-hoc JSON is labelled
+# "custom" and requires an explicit --run-name since there is no short name.
+if args.observables is not None and args.observables_json is not None:
+    parser.error("--observables and --observables-json are mutually exclusive")
+if args.observables_json is not None:
+    if args.run_name is None:
+        parser.error("--observables-json requires --run-name")
+    readout_observables = [
+        ObservableSpec(**spec) for spec in json.loads(args.observables_json)
+    ]
+    observables_name = "custom"
+else:
+    observables_name = args.observables or DEFAULT_OBSERVABLES
+    readout_observables = resolve_observables(observables_name, CUTOFF_DIM)
 
 
 # ---------------------------------------------------------------------------
-# Config (quantum config matches mini_experiment.py — do not change)
+# Config (quantum config matches mini_experiment.py — do not change the
+# fixed architecture knobs; only target_params / observables / seed are swept)
 # ---------------------------------------------------------------------------
 
 data_cfg = DataConfig(
@@ -167,10 +291,11 @@ data_cfg = DataConfig(
 )
 quantum_cfg = QuantumConfig(
     num_modes=2,
-    cutoff_dim=6,
+    num_layers=NUM_LAYERS,
+    cutoff_dim=CUTOFF_DIM,
     num_heads=4,
     cnn_channels_1=8,
-    cnn_channels_2=16,  # overridden by target_params auto-scaling
+    cnn_channels_2=16,  # overridden when scaling_knob == "cnn_channels_2"
     cnn_kernel_size=3,
     decoder_hidden_dim=32,
     poly_degree=3,
@@ -178,20 +303,16 @@ quantum_cfg = QuantumConfig(
     trunc_penalty="norm",
     trunc_lambda=0.01,
     target_params=TARGET_PARAMS,
-    readout_observables=[
-        ObservableSpec(type="x", mode="all"),
-        ObservableSpec(type="p", mode="all"),
-        ObservableSpec(type="x_squared", mode="all"),
-        ObservableSpec(type="p_squared", mode="all"),
-    ],
+    scaling_knob=SCALING_KNOB,
+    readout_observables=readout_observables,
 )
 config = ExperimentConfig(
     name="full_fashionmnist",
-    model="quantum",
+    model=args.model,
     data=data_cfg,
     quantum=quantum_cfg,
-    training=TrainingConfig(lr=1e-3, epochs=EPOCHS, seed=42),
-    use_wandb=False,
+    training=TrainingConfig(lr=1e-3, epochs=EPOCHS, seed=SEED),
+    use_wandb=args.wandb,
 )
 
 
@@ -207,16 +328,19 @@ if args.resume:
     run_dir = resume_path.parent.parent
     print(f"Resuming into existing run directory: {run_dir}")
 else:
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_dir = Path("results/runs") / f"full_fashionmnist_{timestamp}"
+    if args.run_name is not None:
+        run_name = args.run_name
+    else:
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        run_name = f"full_fashionmnist_{timestamp}"
+    run_dir = Path(args.runs_root) / run_name
     print(f"Fresh run directory: {run_dir}")
 
 ckpt_dir = run_dir / "checkpoints"
-fig_dir = run_dir / "figures"
 log_dir = run_dir / "logs"
 preds_dir = run_dir / "predictions"
 diag_dir = run_dir / "diagnostics"
-for d in (run_dir, ckpt_dir, fig_dir, log_dir, preds_dir, diag_dir):
+for d in (run_dir, ckpt_dir, log_dir, preds_dir, diag_dir):
     d.mkdir(parents=True, exist_ok=True)
 
 
@@ -417,14 +541,48 @@ if args.resume:
 # Save resolved config (after auto-scaling has chosen cnn_channels_2)
 # ---------------------------------------------------------------------------
 
-# Reflect the auto-scaled cnn_channels_2 (chosen by binary search inside
-# CVQuixer.__init__) in the saved config so the JSON matches the model actually built.
+# Reflect the resolved quantum config (the auto-scaler may change any single
+# scaling_knob — cnn_channels_2, num_heads, … — inside CVQuixer.__init__) so the
+# saved JSON matches the model actually built and eval_cutoff_sweep.py /
+# report_diagnostics.py rebuild the same architecture from config.json.
 config_to_save = asdict(config)
-if hasattr(model, "config") and hasattr(model.config, "cnn_channels_2"):
-    config_to_save["quantum"]["cnn_channels_2"] = int(model.config.cnn_channels_2)
+if hasattr(model, "config"):
+    config_to_save["quantum"] = asdict(model.config)
 
 with open(run_dir / "config.json", "w") as f:
     json.dump(config_to_save, f, indent=2)
+
+# Record sweep coordinates in history meta so report_sweep.py can group/plot
+# runs without re-parsing config.json or logs. Idempotent across resumes.
+history["meta"]["target_params"] = int(TARGET_PARAMS)
+history["meta"]["scaling_knob"] = str(SCALING_KNOB)
+history["meta"]["achieved_params"] = int(n_params)
+history["meta"]["observables_name"] = observables_name
+# model.config carries the *resolved* quantum config (post auto-scaling), so
+# this reflects the achieved num_layers when it is the scaling_knob.
+history["meta"]["num_layers"] = int(
+    getattr(getattr(model, "config", None), "num_layers", config.quantum.num_layers)
+)
+history["meta"]["seed"] = int(SEED)
+
+
+# ---------------------------------------------------------------------------
+# Weights & Biases (opt-in via --wandb; no-op otherwise)
+# ---------------------------------------------------------------------------
+
+wandb_tags = [
+    f"params={TARGET_PARAMS}",
+    f"obs={observables_name}",
+    f"seed={SEED}",
+    *(args.wandb_tags or []),
+]
+init_logging(
+    config,
+    group=args.wandb_group,
+    tags=wandb_tags,
+    name=run_dir.name,
+    dir=run_dir,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -489,199 +647,9 @@ def train_epoch(epoch: int) -> float:
     return total_trunc / total
 
 
-# ---------------------------------------------------------------------------
-# Plotting (re-rendered after every epoch so a SLURM kill mid-run still
-# leaves usable figures)
-# ---------------------------------------------------------------------------
-
-
-def _moving_average(x: list[float], window: int) -> np.ndarray:
-    if len(x) < window:
-        return np.array(x, dtype=float)
-    cumsum = np.cumsum(np.insert(np.asarray(x, dtype=float), 0, 0.0))
-    ma = (cumsum[window:] - cumsum[:-window]) / float(window)
-    # left-pad with NaN so x-axis lengths match
-    return np.concatenate([np.full(window - 1, np.nan), ma])
-
-
-def _epoch_boundary_steps() -> list[int]:
-    """Global step at which each epoch ended (used for vertical markers)."""
-    epochs_arr = np.asarray(history["batch"]["epoch"])
-    steps_arr = np.asarray(history["batch"]["step"])
-    boundaries = []
-    for e in sorted(set(epochs_arr.tolist())):
-        mask = epochs_arr == e
-        if mask.any():
-            boundaries.append(int(steps_arr[mask].max()))
-    return boundaries[:-1]  # don't draw a line at the final step
-
-
-def save_figures() -> None:
-    epoch_x = list(range(1, len(history["epoch"]["train_loss"]) + 1))
-    eh = history["epoch"]
-    bh = history["batch"]
-    classes = class_names(config)
-    num_classes = len(classes)
-
-    # Per-epoch loss
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    ax.plot(epoch_x, eh["train_loss"], label="train loss", marker="o")
-    ax.plot(epoch_x, eh["test_loss"], label="test loss", marker="s")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Cross-entropy loss")
-    ax.set_title("Loss (per epoch)")
-    ax.legend()
-    ax.grid(alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(fig_dir / "loss_curve.png", dpi=150)
-    plt.close(fig)
-
-    # Per-epoch accuracy
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    ax.plot(epoch_x, eh["train_acc"], label="train acc", marker="o")
-    ax.plot(epoch_x, eh["test_acc"], label="test acc", marker="s")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Accuracy")
-    ax.set_title("Accuracy (per epoch)")
-    ax.legend()
-    ax.grid(alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(fig_dir / "accuracy_curve.png", dpi=150)
-    plt.close(fig)
-
-    # Per-epoch trunc loss (train + test side-by-side if test is available)
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    ax.plot(
-        epoch_x,
-        eh["trunc_loss"],
-        label="train trunc loss",
-        color="tab:orange",
-        marker="o",
-    )
-    if eh.get("test_trunc_loss"):
-        ax.plot(
-            epoch_x[: len(eh["test_trunc_loss"])],
-            eh["test_trunc_loss"],
-            label="test trunc loss",
-            color="tab:blue",
-            marker="s",
-        )
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Mean per-patch truncation loss")
-    ax.set_title("Truncation loss (per epoch)")
-    ax.legend()
-    ax.grid(alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(fig_dir / "trunc_loss_curve.png", dpi=150)
-    plt.close(fig)
-
-    # Per-class accuracy curve (test)
-    if eh.get("test_per_class_acc"):
-        fig, ax = plt.subplots(figsize=(9, 5.5))
-        per_class = np.asarray(eh["test_per_class_acc"])  # (n_epochs, C)
-        ep_x = list(range(1, per_class.shape[0] + 1))
-        cmap = matplotlib.colormaps.get_cmap("tab10").resampled(num_classes)
-        for c in range(per_class.shape[1]):
-            ax.plot(
-                ep_x,
-                per_class[:, c],
-                marker="o",
-                color=cmap(c),
-                label=f"{c}: {classes[c]}",
-            )
-        ax.set_xlabel("Epoch")
-        ax.set_ylabel("Test accuracy (recall)")
-        ax.set_title("Per-class test accuracy across epochs")
-        ax.set_ylim(-0.02, 1.02)
-        ax.grid(alpha=0.3)
-        ax.legend(loc="lower right", fontsize=8, ncol=2)
-        fig.tight_layout()
-        fig.savefig(fig_dir / "per_class_accuracy_curve.png", dpi=150)
-        plt.close(fig)
-
-    # Latest-epoch test confusion matrix (counts + row-normalised)
-    if eh.get("test_confusion"):
-        cm = np.asarray(eh["test_confusion"][-1], dtype=np.int64)
-        cm_row = cm / np.maximum(cm.sum(axis=1, keepdims=True), 1)
-        fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
-        for ax_, mat, title, fmt, cmap_name in (
-            (axes[0], cm, "Counts", "d", "Blues"),
-            (axes[1], cm_row, "Row-normalised", ".2f", "Blues"),
-        ):
-            im = ax_.imshow(mat, cmap=cmap_name)
-            ax_.set_title(f"{title} (epoch {len(eh['test_confusion'])})")
-            ax_.set_xticks(range(num_classes))
-            ax_.set_yticks(range(num_classes))
-            ax_.set_xticklabels(classes, rotation=45, ha="right", fontsize=8)
-            ax_.set_yticklabels(classes, fontsize=8)
-            ax_.set_xlabel("Predicted")
-            ax_.set_ylabel("True")
-            for i in range(num_classes):
-                for j in range(num_classes):
-                    val = mat[i, j]
-                    txt = format(val, fmt)
-                    colour = "white" if (val > mat.max() * 0.6) else "black"
-                    ax_.text(
-                        j, i, txt, ha="center", va="center", color=colour, fontsize=7
-                    )
-            fig.colorbar(im, ax=ax_, fraction=0.046, pad=0.04)
-        fig.suptitle("Test confusion matrix")
-        fig.tight_layout()
-        fig.savefig(fig_dir / "confusion_matrix_test.png", dpi=150)
-        plt.close(fig)
-
-    if not bh["step"]:
-        return
-
-    steps = bh["step"]
-    boundaries = _epoch_boundary_steps()
-
-    def _per_batch_plot(
-        values: list[float], ylabel: str, title: str, fname: str, log_y: bool = False
-    ) -> None:
-        fig, ax = plt.subplots(figsize=(10, 4.5))
-        ax.plot(steps, values, alpha=0.25, lw=0.7, label="per batch")
-        ma = _moving_average(values, MA_WINDOW)
-        if not np.all(np.isnan(ma)):
-            ax.plot(steps, ma, lw=1.8, label=f"moving avg (w={MA_WINDOW})")
-        for b in boundaries:
-            ax.axvline(b, color="gray", ls="--", alpha=0.4, lw=0.8)
-        if log_y:
-            ax.set_yscale("log")
-        ax.set_xlabel("Global batch step")
-        ax.set_ylabel(ylabel)
-        ax.set_title(title)
-        ax.legend()
-        ax.grid(alpha=0.3)
-        fig.tight_layout()
-        fig.savefig(fig_dir / fname, dpi=150)
-        plt.close(fig)
-
-    _per_batch_plot(
-        bh["train_loss"],
-        "Cross-entropy loss",
-        "Train CE loss (per batch)",
-        "per_batch_train_loss.png",
-    )
-    _per_batch_plot(
-        bh["trunc_loss"],
-        "Truncation loss",
-        "Truncation loss (per batch)",
-        "per_batch_trunc_loss.png",
-    )
-    _per_batch_plot(
-        bh["batch_acc"],
-        "Batch accuracy",
-        "Train accuracy (per batch)",
-        "per_batch_train_accuracy.png",
-    )
-    _per_batch_plot(
-        bh["grad_norm"],
-        "Gradient L2 norm (log scale)",
-        "Gradient norm (per batch)",
-        "per_batch_grad_norm.png",
-        log_y=True,
-    )
+# Figure generation lives in `experiments/report_diagnostics.py` — run it
+# post-hoc (or partway through a still-running job) against this run dir to
+# regenerate the full figure set from `history.json` + the saved npz files.
 
 
 def save_history() -> None:
@@ -727,10 +695,19 @@ for epoch in range(start_epoch, EPOCHS + 1):
     history["epoch"]["test_acc"].append(test_acc)
     history["epoch"]["trunc_loss"].append(trunc_loss)
     history["epoch"]["test_trunc_loss"].append(float(test_eval["trunc_loss"]))
-    history["epoch"]["train_per_class_acc"].append(train_eval["per_class_acc"].tolist())
-    history["epoch"]["test_per_class_acc"].append(test_eval["per_class_acc"].tolist())
-    history["epoch"]["train_confusion"].append(train_eval["confusion"].tolist())
-    history["epoch"]["test_confusion"].append(test_eval["confusion"].tolist())
+
+    log_metrics(
+        {
+            "epoch": epoch,
+            "epoch/train_loss": train_loss,
+            "epoch/train_acc": train_acc,
+            "epoch/test_loss": test_loss,
+            "epoch/test_acc": test_acc,
+            "epoch/trunc_loss": trunc_loss,
+            "epoch/test_trunc_loss": float(test_eval["trunc_loss"]),
+        },
+        use_wandb=config.use_wandb,
+    )
 
     np.savez_compressed(
         preds_dir / f"epoch_{epoch:04d}.npz",
@@ -739,10 +716,15 @@ for epoch in range(start_epoch, EPOCHS + 1):
         y_probs=test_eval["y_probs"],
         readouts=test_eval["readouts"],
     )
+    np.savez_compressed(
+        preds_dir / f"epoch_{epoch:04d}_train.npz",
+        y_true=train_eval["y_true"],
+        y_pred=train_eval["y_pred"],
+        y_probs=train_eval["y_probs"],
+        readouts=train_eval["readouts"],
+    )
 
     lcu_snap, poly_snap = snapshot_coefficients(model)
-    history["epoch"]["lcu_coeffs"].append(lcu_snap.tolist())
-    history["epoch"]["poly_coeffs"].append(poly_snap.tolist())
 
     t_diag = time.time()
     try:
@@ -750,21 +732,25 @@ for epoch in range(start_epoch, EPOCHS + 1):
             model, diag_loader, device,
             progress="diagnostics",
         )
-        history["epoch"]["hypernet_stats"].append(stats_summary)
-        history["epoch"]["mean_photon_number"].append(mean_photon.tolist())
+        diag_raw["lcu_coeffs"] = lcu_snap
+        diag_raw["poly_coeffs"] = poly_snap
         np.savez_compressed(diag_dir / f"epoch_{epoch:04d}.npz", **diag_raw)
         diag_status = f"  (diag {time.time() - t_diag:.1f}s)"
     except Exception as e:
         # Don't let a diagnostic-pass failure kill a multi-hour training run.
+        # Still persist lcu/poly snapshots so cross-epoch coefficient figures
+        # have data for this epoch.
         import warnings
 
         warnings.warn(
             f"quantum_diagnostics failed at epoch {epoch}: {type(e).__name__}: {e}. "
-            "Skipping diagnostic outputs for this epoch.",
+            "Saving only lcu/poly snapshots for this epoch.",
             RuntimeWarning,
         )
-        history["epoch"]["hypernet_stats"].append(None)
-        history["epoch"]["mean_photon_number"].append(None)
+        np.savez_compressed(
+            diag_dir / f"epoch_{epoch:04d}.npz",
+            lcu_coeffs=lcu_snap, poly_coeffs=poly_snap,
+        )
         diag_status = "  (diag skipped)"
 
     elapsed = time.time() - t0
@@ -789,12 +775,12 @@ for epoch in range(start_epoch, EPOCHS + 1):
         best_epoch = epoch
         torch.save(ckpt_payload, ckpt_dir / "best.pt")
 
-    # Persist metadata + figures every epoch so a SLURM kill is non-destructive
+    # Persist metadata every epoch so a SLURM kill is non-destructive.
+    # (Figures are rendered separately by experiments/report_diagnostics.py.)
     history["meta"]["best_test_acc"] = float(best_test_acc)
     history["meta"]["best_epoch"] = int(best_epoch) if best_epoch is not None else None
     history["meta"]["total_runtime_sec"] = float(time.time() - run_start)
     save_history()
-    save_figures()
 
 total_runtime = time.time() - run_start
 
@@ -805,12 +791,17 @@ total_runtime = time.time() - run_start
 history["meta"]["completed_at"] = datetime.now().isoformat(timespec="seconds")
 history["meta"]["total_runtime_sec"] = float(total_runtime)
 save_history()
-save_figures()
 
 torch.save(
     {"model_state_dict": model.state_dict(), "history": history},
     ckpt_dir / "final_model.pt",
 )
+
+log_metrics(
+    {"best_test_acc": float(best_test_acc)},
+    use_wandb=config.use_wandb,
+)
+finish_logging(config.use_wandb)
 
 # ---------------------------------------------------------------------------
 # Summary
@@ -821,7 +812,12 @@ print(f"Best test acc:    {best_test_acc:.4f} (epoch {best_epoch})")
 print(f"Run directory:    {run_dir}/")
 print(f"  config         → config.json")
 print(f"  history        → history.json")
-print(f"  figures        → figures/")
+print(f"  predictions    → predictions/  (per-epoch npz + test_images.npz)")
+print(f"  diagnostics    → diagnostics/  (per-epoch npz)")
 print(
     f"  checkpoints    → checkpoints/  (latest.pt, best.pt, final_model.pt, epoch_NNNN.pt)"
+)
+print(
+    f"\nFigures: run `uv run python experiments/report_diagnostics.py "
+    f"--run-dir {run_dir}/` to populate {run_dir}/figures/"
 )
