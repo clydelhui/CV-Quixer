@@ -52,14 +52,32 @@ FULL_EXPERIMENT = "experiments/full_experiment.py"
 RUN_SWEEP_SH = "scripts/run_sweep.sh"
 
 
-def _run_name(target_params: int, observables: str, seed: int, num_layers: int) -> str:
+def _run_name(
+    target_params: int,
+    observables: str,
+    seed: int,
+    num_layers: int,
+    scaling_knob: str,
+    trunc_lambda: float | None,
+) -> str:
     """Encode a grid point as a filesystem-safe run-directory name.
 
-    The ``__L{n}`` suffix is omitted at ``num_layers == 1`` so single-layer
-    sweeps keep their historic run-directory names.
+    The ``__knob-{knob}`` marker is omitted for the historic default
+    ``cnn_channels_2`` and the ``__L{n}`` suffix is omitted at ``num_layers == 1``,
+    so single-knob / single-layer sweeps keep their historic run-directory names
+    while multi-knob grids stay collision-free. A ``__tl{λ}`` marker is appended
+    only when ``trunc_lambda`` is explicitly swept (``None`` ⇒ inherit
+    full_experiment.py's default, no marker).
     """
-    base = f"p{target_params}__obs-{observables}__seed{seed}"
-    return base if num_layers == 1 else f"{base}__L{num_layers}"
+    base = f"p{target_params}__obs-{observables}"
+    if scaling_knob != "cnn_channels_2":
+        base += f"__knob-{scaling_knob}"
+    base += f"__seed{seed}"
+    if num_layers != 1:
+        base += f"__L{num_layers}"
+    if trunc_lambda is not None:
+        base += f"__tl{trunc_lambda}"
+    return base
 
 
 def build_manifest(args: argparse.Namespace) -> dict:
@@ -81,21 +99,29 @@ def build_manifest(args: argparse.Namespace) -> dict:
     if args.wandb:
         common += ["--wandb", "--wandb-group", f"{args.sweep_name}_{timestamp}"]
 
+    # trunc_lambda is an optional axis: when not given, iterate a single None so
+    # the flag is omitted and behaviour is byte-identical to a no-axis sweep.
+    trunc_lambdas = args.trunc_lambda if args.trunc_lambda else [None]
+
     runs: list[dict] = []
-    for idx, (tp, obs, seed, n_layers) in enumerate(
+    for idx, (tp, obs, seed, n_layers, knob, tl) in enumerate(
         itertools.product(
-            args.target_params, args.observables, args.seeds, args.num_layers
+            args.target_params, args.observables, args.seeds,
+            args.num_layers, args.scaling_knob, trunc_lambdas,
         )
     ):
-        run_name = _run_name(tp, obs, seed, n_layers)
+        run_name = _run_name(tp, obs, seed, n_layers, knob, tl)
         run_args = [
             "--target-params", str(tp),
             "--observables", obs,
             "--seed", str(seed),
             "--num-layers", str(n_layers),
+            "--scaling-knob", knob,
             "--run-name", run_name,
             *common,
         ]
+        if tl is not None:
+            run_args += ["--trunc-lambda", str(tl)]
         runs.append(
             {
                 "index": idx,
@@ -104,6 +130,8 @@ def build_manifest(args: argparse.Namespace) -> dict:
                 "observables": obs,
                 "seed": seed,
                 "num_layers": n_layers,
+                "scaling_knob": knob,
+                "trunc_lambda": tl,
                 "args": run_args,
             }
         )
@@ -118,6 +146,8 @@ def build_manifest(args: argparse.Namespace) -> dict:
             "observables": list(args.observables),
             "seeds": list(args.seeds),
             "num_layers": list(args.num_layers),
+            "scaling_knob": list(args.scaling_knob),
+            "trunc_lambda": list(args.trunc_lambda or []),
         },
         "common_args": common,
         "n_runs": len(runs),
@@ -179,6 +209,17 @@ def main() -> None:
         help="one or more per-patch circuit depths L (default [1]); each L adds "
         "a stacked gate sequence + a BS→Rot interferometer",
     )
+    parser.add_argument(
+        "--scaling-knob", type=str, nargs="+", default=["cnn_channels_2"],
+        help="one or more QuantumConfig fields to auto-scale toward each "
+        "--target-params (grid axis; e.g. cnn_channels_2 num_heads). Forwarded "
+        "to full_experiment.py per run.",
+    )
+    parser.add_argument(
+        "--trunc-lambda", type=float, nargs="+", default=None,
+        help="one or more Fock truncation penalty weights (grid axis). Omit to "
+        "inherit full_experiment.py's default (no extra runs, no name marker).",
+    )
     # --- shared run settings (identical across the grid) ------------------
     parser.add_argument(
         "--model", type=str, default="quantum",
@@ -225,6 +266,8 @@ def main() -> None:
     print(f"  observables:   {manifest['axes']['observables']}")
     print(f"  seeds:         {manifest['axes']['seeds']}")
     print(f"  num_layers:    {manifest['axes']['num_layers']}")
+    print(f"  scaling_knob:  {manifest['axes']['scaling_knob']}")
+    print(f"  trunc_lambda:  {manifest['axes']['trunc_lambda']}")
     print(f"  manifest:      {manifest_path}")
     for run in manifest["runs"]:
         print(f"    [{run['index']}] {run['run_name']}")

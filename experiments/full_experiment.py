@@ -90,6 +90,7 @@ CUTOFF_DIM = 6  # Fock truncation (also used to expand the `pnr` observable pres
 SEED = 42
 CHECKPOINT_INTERVAL = 1  # versioned epoch_NNNN.pt every N epochs
 DEFAULT_OBSERVABLES = "xpxsps"  # x, p, x², p² per mode
+TRUNC_LAMBDA = 0.01  # Fock truncation penalty weight (added to CE loss)
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +233,13 @@ parser.add_argument(
     default=None,
     help="extra wandb tags (params/obs/seed tags are added automatically)",
 )
+parser.add_argument(
+    "--trunc-lambda",
+    type=float,
+    default=None,
+    help=f"Fock truncation penalty weight added to the CE loss "
+    f"(default TRUNC_LAMBDA={TRUNC_LAMBDA})",
+)
 args = parser.parse_args()
 
 if args.train_fraction is not None and args.train_limit is not None:
@@ -256,6 +264,8 @@ if args.scaling_knob is not None:
     SCALING_KNOB = args.scaling_knob
 if args.num_layers is not None:
     NUM_LAYERS = args.num_layers
+if args.trunc_lambda is not None:
+    TRUNC_LAMBDA = args.trunc_lambda
 if args.seed is not None:
     SEED = args.seed
 
@@ -301,7 +311,7 @@ quantum_cfg = QuantumConfig(
     poly_degree=3,
     dtype="complex64",
     trunc_penalty="norm",
-    trunc_lambda=0.01,
+    trunc_lambda=TRUNC_LAMBDA,
     target_params=TARGET_PARAMS,
     scaling_knob=SCALING_KNOB,
     readout_observables=readout_observables,
@@ -563,6 +573,7 @@ history["meta"]["observables_name"] = observables_name
 history["meta"]["num_layers"] = int(
     getattr(getattr(model, "config", None), "num_layers", config.quantum.num_layers)
 )
+history["meta"]["trunc_lambda"] = float(TRUNC_LAMBDA)
 history["meta"]["seed"] = int(SEED)
 
 
