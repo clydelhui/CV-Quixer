@@ -13,17 +13,29 @@ from __future__ import annotations
 
 from cv_quixer.config.schema import ObservableSpec
 
-# Ordered for stable display (tables, CLI help). `pnr` is last because its
-# expanded width depends on cutoff_dim, unlike the fixed-width presets.
-PRESET_NAMES: tuple[str, ...] = ("x", "xp", "xpxsps", "n", "xpn", "pnr")
+# Ordered for stable display (tables, CLI help). `pnr` / `xpxsps_pnr` are last
+# because their expanded width depends on cutoff_dim, unlike the fixed-width presets.
+PRESET_NAMES: tuple[str, ...] = ("x", "xp", "xpxsps", "n", "xpn", "pnr", "xpxsps_pnr")
+
+# Highest photon number a (simulated) PNR detector can resolve. The `pnr` readout
+# enumerates bins P(n=k) for k=0..PNR_MAX_PHOTON, modelling a real detector with a
+# fixed resolving limit rather than one that grows with the Fock cutoff. Bins at or
+# above the truncation are not measurable (n must be < cutoff_dim), so the actual
+# range is 0..min(cutoff_dim-1, PNR_MAX_PHOTON).
+PNR_MAX_PHOTON: int = 5
+
+
+def _pnr_levels(cutoff_dim: int) -> list[int]:
+    """Photon-number bins a PNR detector resolves: 0..min(cutoff_dim-1, PNR_MAX_PHOTON)."""
+    return list(range(min(cutoff_dim, PNR_MAX_PHOTON + 1)))
 
 
 def _presets(cutoff_dim: int) -> dict[str, list[ObservableSpec]]:
     """Build the preset → specs mapping for a given Fock cutoff.
 
-    Only `pnr` depends on `cutoff_dim` (it enumerates photon numbers
-    0..cutoff_dim-1), but all presets go through this factory so callers have a
-    single uniform interface.
+    Only `pnr` / `xpxsps_pnr` depend on `cutoff_dim` (they enumerate photon
+    numbers 0..min(cutoff_dim-1, PNR_MAX_PHOTON)), but all presets go through this
+    factory so callers have a single uniform interface.
     """
     return {
         # ⟨x̂⟩ per mode — matches the schema default / baseline readout.
@@ -48,9 +60,20 @@ def _presets(cutoff_dim: int) -> dict[str, list[ObservableSpec]]:
             ObservableSpec(type="p", mode="all"),
             ObservableSpec(type="n", mode="all"),
         ],
-        # Photon-number-resolving distribution P(n=k), k=0..cutoff_dim-1, per mode.
+        # Photon-number-resolving distribution P(n=k), k=0..min(cutoff_dim-1,
+        # PNR_MAX_PHOTON), per mode (fixed detector resolving limit).
         "pnr": [
-            ObservableSpec(type="prob_n", mode="all", n=list(range(cutoff_dim))),
+            ObservableSpec(type="prob_n", mode="all", n=_pnr_levels(cutoff_dim)),
+        ],
+        # xpxsps + pnr: ⟨x̂⟩,⟨p̂⟩,⟨x̂²⟩,⟨p̂²⟩ AND P(n=k), k=0..min(cutoff_dim-1,
+        # PNR_MAX_PHOTON), per mode. Width = (4 + len(pnr_levels))·num_modes
+        # (e.g. 20 for num_modes=2, cutoff_dim≥6 → 8 + 6·2).
+        "xpxsps_pnr": [
+            ObservableSpec(type="x", mode="all"),
+            ObservableSpec(type="p", mode="all"),
+            ObservableSpec(type="x_squared", mode="all"),
+            ObservableSpec(type="p_squared", mode="all"),
+            ObservableSpec(type="prob_n", mode="all", n=_pnr_levels(cutoff_dim)),
         ],
     }
 

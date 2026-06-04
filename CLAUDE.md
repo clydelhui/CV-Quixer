@@ -142,7 +142,9 @@ the canonical single-run behaviour exactly):
 **Observable presets** (`cv_quixer/config/observable_presets.py`,
 `resolve_observables(name, cutoff_dim)`): `x` (⟨x̂⟩/mode), `xp`, `xpxsps`
 (x,p,x²,p² per mode — the `full_experiment.py` default), `n` (⟨n̂⟩/mode),
-`xpn`, `pnr` (P(n=k) for k=0..cutoff-1 per mode). Because `target_params`
+`xpn`, `pnr` (P(n=k) for k=0..min(cutoff-1, 5) per mode — a fixed PNR detector
+resolving limit, `PNR_MAX_PHOTON`), `xpxsps_pnr` (xpxsps + pnr combined →
+(4 + min(cutoff, 6))·num_modes scalars/head). Because `target_params`
 targets the *total* count, the observable choice barely shifts the budget — the
 two axes are cleanly separable.
 
