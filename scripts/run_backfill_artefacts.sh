@@ -66,27 +66,15 @@ echo "Extra:    $*"
 cd "$HOME/CV-Quixer"
 
 # -----------------------------------------------------------------------
-# uv — install if not in PATH (installed per-user, persists in $HOME)
+# uv + per-arch CUDA venv (auto-installed/built; no manual pre-build).
+# Pass REBUILD_VENV=1 (sbatch --export=ALL,REBUILD_VENV=1) for a clean rebuild.
 # -----------------------------------------------------------------------
-if ! command -v uv &> /dev/null; then
-    echo "Installing uv..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-fi
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-
-# -----------------------------------------------------------------------
-# Python environment — reuse the dedicated CUDA venv (do NOT rebuild;
-# this is a short-lived job and the venv from a recent training run is
-# reusable).
-# -----------------------------------------------------------------------
-export UV_PROJECT_ENVIRONMENT="$HOME/.venvs/cv-quixer-cuda"
-echo "Syncing dependencies..."
-uv sync
+source scripts/setup_cuda_env.sh
 
 # -----------------------------------------------------------------------
 # Sanity check — verify CUDA is visible to PyTorch
 # -----------------------------------------------------------------------
-uv run python - <<'EOF'
+uv run --no-sync python - <<'EOF'
 import torch
 assert torch.cuda.is_available(), "CUDA not available — check GPU allocation"
 print(f"Device:         {torch.cuda.get_device_name(0)}")
@@ -100,12 +88,12 @@ EOF
 echo ""
 echo "=== Import diagnostics ==="
 PYTHONPATH="$HOME/CV-Quixer${PYTHONPATH:+:$PYTHONPATH}" \
-    uv run python scripts/debug_imports.py
+    uv run --no-sync python scripts/debug_imports.py
 
 echo ""
 echo "Starting artefact backfill..."
 PYTHONPATH="$HOME/CV-Quixer${PYTHONPATH:+:$PYTHONPATH}" \
-    uv run python experiments/backfill_artefacts.py \
+    uv run --no-sync python experiments/backfill_artefacts.py \
         --run-dir "$RUN_DIR" \
         "$@"
 

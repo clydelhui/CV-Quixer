@@ -39,27 +39,12 @@ echo "Started:   $(date)"
 
 cd "$HOME/CV-Quixer"
 
-# uv — install if not in PATH (persists in $HOME).
-if ! command -v uv &> /dev/null; then
-    echo "Installing uv..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-fi
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-
-# Dedicated CUDA venv — REUSED across array tasks (do NOT rebuild per task, the
-# tasks share this path and run concurrently). Build it once before submitting,
-# e.g. by running scripts/run_full_experiment.sh once, or:
-#     UV_PROJECT_ENVIRONMENT="$HOME/.venvs/cv-quixer-cuda" uv sync
-export UV_PROJECT_ENVIRONMENT="$HOME/.venvs/cv-quixer-cuda"
-if [ ! -x "$UV_PROJECT_ENVIRONMENT/bin/python" ]; then
-    echo "ERROR: CUDA venv not found at $UV_PROJECT_ENVIRONMENT."
-    echo "Pre-build it once (avoids concurrent rebuilds across array tasks):"
-    echo "    UV_PROJECT_ENVIRONMENT=\"$UV_PROJECT_ENVIRONMENT\" uv sync"
-    exit 1
-fi
+# uv + per-arch CUDA venv (auto-installed/built; flock serialises the first array
+# task's build, the rest wait then reuse — no manual pre-build).
+source scripts/setup_cuda_env.sh
 
 # Sanity check — CUDA visible to PyTorch.
-uv run python - <<'EOF'
+uv run --no-sync python - <<'EOF'
 import torch
 assert torch.cuda.is_available(), "CUDA not available — check GPU allocation"
 print(f"Device:       {torch.cuda.get_device_name(0)}")
@@ -69,7 +54,7 @@ EOF
 # Pull this task's full_experiment.py arguments out of the manifest (one per
 # line → bash array). The grid values contain no spaces, but readarray handles
 # them robustly regardless.
-readarray -t RUN_ARGS < <(uv run python - "$MANIFEST" "$TASK_ID" <<'EOF'
+readarray -t RUN_ARGS < <(uv run --no-sync python - "$MANIFEST" "$TASK_ID" <<'EOF'
 import json, sys
 manifest_path, task_id = sys.argv[1], int(sys.argv[2])
 manifest = json.load(open(manifest_path))
@@ -96,7 +81,7 @@ echo "Running full_experiment.py with: ${RUN_ARGS[*]}"
 echo ""
 
 PYTHONPATH="$HOME/CV-Quixer${PYTHONPATH:+:$PYTHONPATH}" \
-    uv run python experiments/full_experiment.py "${RUN_ARGS[@]}"
+    uv run --no-sync python experiments/full_experiment.py "${RUN_ARGS[@]}"
 
 echo ""
 echo "Finished task ${TASK_ID}: $(date)"

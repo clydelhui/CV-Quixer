@@ -169,8 +169,8 @@ and per-run sub-dirs named `p{params}__obs-{preset}__seed{seed}` (with a
 runs share `--subset-seed` + fractions so they see the identical data subset.
 `--launch local` runs them sequentially; `--launch slurm` submits
 `scripts/run_sweep.sh` as a job array (`#SBATCH --array`, one task per grid
-point, reusing the shared `cv-quixer-cuda` venv — pre-build it once); `--dry-run`
-writes the manifest only.
+point; the per-arch CUDA venv is auto-built once via `scripts/setup_cuda_env.sh`'s
+flock — no manual pre-build); `--dry-run` writes the manifest only.
 
 `experiments/report_sweep.py --sweep-dir <dir>` scans the sweep (JSON only — no
 torch), emitting `summary.csv` + `summary.md` (one row/run: target/achieved
@@ -242,7 +242,7 @@ sbatch scripts/run_eval_cutoff_sweep.sh \
 
 # Hyperparameter sweep — sweep.py writes the manifest and prints the exact
 # `sbatch --array=0-<N-1> scripts/run_sweep.sh <manifest>` command (or pass
-# --launch slurm to submit it directly). Pre-build the venv once first.
+# --launch slurm to submit it directly). The CUDA venv is auto-built by the job.
 uv run python experiments/sweep.py \
     --target-params 8000 13760 20000 --observables x xp xpxsps pnr \
     --scaling-knob num_heads \
@@ -250,16 +250,22 @@ uv run python experiments/sweep.py \
 
 # Whole-sweep cutoff eval — eval_cutoff_sweep_all.py writes the manifest and
 # prints/submits `sbatch --array=0-<N-1> scripts/run_eval_cutoff_sweep_array.sh
-# <manifest>` (one array task per run). Pre-build the venv once first.
+# <manifest>` (one array task per run). The CUDA venv is auto-built by the job.
 uv run python experiments/eval_cutoff_sweep_all.py \
     --sweep-dir results/sweeps/<sweep>_<ts>/ --launch slurm
 ```
 
-All cluster scripts reuse the dedicated `$HOME/.venvs/cv-quixer-cuda` venv
-(`run_full_experiment.sh` rebuilds it fresh; `run_eval_cutoff_sweep.sh`,
-`run_sweep.sh`, and `run_eval_cutoff_sweep_array.sh` reuse it — for the arrays,
-pre-build the venv once so concurrent tasks don't race) and
-`cd "$HOME/CV-Quixer"` before running.
+All cluster scripts `source scripts/setup_cuda_env.sh` (after `cd
+"$HOME/CV-Quixer"`), which installs/repairs `uv` and **auto-builds the CUDA venv —
+no manual pre-build**. Both are **architecture-keyed** by `$(uname -m)`
+(`~/.local/uv/<arch>/uv`, `~/.venvs/cv-quixer-cuda-<arch>`), so a job array
+spanning mixed hardware (x86_64 / aarch64) never shares an incompatible binary or
+venv. The venv build is serialised with an `flock` (the first array task builds,
+the rest wait, then reuse). The helper also **repairs a broken/wrong-arch `uv`**
+(it checks `uv --version`, not just presence — the fix for
+`cannot execute binary file: Exec format error`). Force a clean venv rebuild with
+`REBUILD_VENV=1` (e.g. `sbatch --export=ALL,REBUILD_VENV=1 …`). Experiment calls
+use `uv run --no-sync` since the helper already synced.
 
 All SLURM `.out`/`.err` logs and the per-task `gpu_util-*.csv` files are written
 to `slurm_logs/` (kept in git via `slurm_logs/.gitkeep`; the logs themselves are
@@ -304,9 +310,11 @@ sbatch -J gpujob --gres=gpu:a100-40:1 scripts/run_mini_experiment.sh
 - Cluster runs CUDA 12.5 and 12.9 on GPU nodes; no `module load` needed.
 - `pyproject.toml` pins torch/torchvision to the `cu124` index on Linux via
   `[tool.uv.sources]`. CUDA 12.4 runtime wheels are forward-compatible with 12.5 / 12.9.
-- The script builds a dedicated venv at `$HOME/.venvs/cv-quixer-cuda` (deleted and
-  rebuilt fresh each run to avoid stale CUDA state). `UV_PROJECT_ENVIRONMENT` overrides
-  uv's default `.venv` location.
+- `scripts/setup_cuda_env.sh` builds a per-arch venv at
+  `$HOME/.venvs/cv-quixer-cuda-$(uname -m)` (built once, reused; `REBUILD_VENV=1`
+  forces a clean rebuild). `UV_PROJECT_ENVIRONMENT` (set by the helper) overrides
+  uv's default `.venv` location; uv itself installs per-arch to
+  `~/.local/uv/$(uname -m)` via `UV_INSTALL_DIR`.
 - The local macOS `.venv` uses the MPS/CPU torch build. Never cross-activate the two venvs.
 
 #### Storage on the cluster

@@ -22,37 +22,15 @@ echo "Started:  $(date)"
 cd "$HOME/CV-Quixer"
 
 # -----------------------------------------------------------------------
-# uv — install if not in PATH (installed per-user, persists in $HOME)
+# uv + per-arch CUDA venv (auto-installed/built; no manual pre-build).
+# Pass REBUILD_VENV=1 (sbatch --export=ALL,REBUILD_VENV=1) for a clean rebuild.
 # -----------------------------------------------------------------------
-if ! command -v uv &> /dev/null; then
-    echo "Installing uv..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-fi
-# Add both possible install locations (newer uv uses .local/bin, older used .cargo/bin)
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-
-# -----------------------------------------------------------------------
-# Python environment
-# Dedicated CUDA venv — separate from local .venv (which has MPS torch).
-# UV_PROJECT_ENVIRONMENT overrides the default .venv location.
-# cu124 (CUDA 12.4 runtime) is forward-compatible with CUDA 12.5 and 12.9.
-# All nv GPUs (V100 sm_70, Titan RTX sm_75, T4 sm_75) are supported.
-# uv sync is fast on subsequent runs (only re-installs changed deps).
-# -----------------------------------------------------------------------
-export UV_PROJECT_ENVIRONMENT="$HOME/.venvs/cv-quixer-cuda"
-
-# Remove any existing venv so uv starts clean (previous run may have CUDA 13 torch).
-rm -rf "$UV_PROJECT_ENVIRONMENT"
-
-# pyproject.toml [tool.uv.sources] binds torch/torchvision exclusively to the cu124
-# index on Linux, so uv will not pick PyPI's incompatible cu130 build.
-echo "Syncing dependencies..."
-uv sync
+source scripts/setup_cuda_env.sh
 
 # -----------------------------------------------------------------------
 # Sanity check — verify CUDA is visible to PyTorch
 # -----------------------------------------------------------------------
-uv run python - <<'EOF'
+uv run --no-sync python - <<'EOF'
 import torch
 assert torch.cuda.is_available(), "CUDA not available — check GPU allocation"
 print(f"Device:         {torch.cuda.get_device_name(0)}")
@@ -66,12 +44,12 @@ EOF
 echo ""
 echo "=== Import diagnostics ==="
 PYTHONPATH="$HOME/CV-Quixer${PYTHONPATH:+:$PYTHONPATH}" \
-    uv run python scripts/debug_imports.py
+    uv run --no-sync python scripts/debug_imports.py
 
 echo ""
 echo "Starting mini experiment..."
 PYTHONPATH="$HOME/CV-Quixer${PYTHONPATH:+:$PYTHONPATH}" \
-    uv run python experiments/mini_experiment.py
+    uv run --no-sync python experiments/mini_experiment.py
 
 echo ""
 echo "Finished: $(date)"

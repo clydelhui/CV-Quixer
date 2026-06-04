@@ -21,17 +21,13 @@ echo ""
 echo "=== CUDA toolkit on PATH ==="
 nvcc --version 2>/dev/null || echo "nvcc not on PATH"
 
-# Ensure uv is available
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-if ! command -v uv &> /dev/null; then
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-fi
+# uv + per-arch CUDA venv (auto-installed/built; no manual pre-build).
+cd "$HOME/CV-Quixer"
+source scripts/setup_cuda_env.sh
 
 echo ""
 echo "=== Currently installed torch (in CUDA venv) ==="
-export UV_PROJECT_ENVIRONMENT="$HOME/.venvs/cv-quixer-cuda"
-uv run python - <<'EOF'
+uv run --no-sync python - <<'EOF'
 import torch
 print(f"torch version:      {torch.__version__}")
 print(f"torch.version.cuda: {torch.version.cuda}")

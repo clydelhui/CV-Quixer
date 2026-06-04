@@ -75,28 +75,15 @@ echo "Extra args: $*"
 cd "$HOME/CV-Quixer"
 
 # -----------------------------------------------------------------------
-# uv — install if not in PATH
+# uv + per-arch CUDA venv (auto-installed/built; no manual pre-build).
+# Pass REBUILD_VENV=1 (sbatch --export=ALL,REBUILD_VENV=1) for a clean rebuild.
 # -----------------------------------------------------------------------
-if ! command -v uv &> /dev/null; then
-    echo "Installing uv..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-fi
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-
-# -----------------------------------------------------------------------
-# Python environment — same dedicated CUDA venv as the training script.
-# Do NOT rebuild the venv here; eval is a short-lived job and the venv
-# from a recent training run is reusable. If it's missing, uv sync will
-# create it.
-# -----------------------------------------------------------------------
-export UV_PROJECT_ENVIRONMENT="$HOME/.venvs/cv-quixer-cuda"
-echo "Syncing dependencies..."
-uv sync
+source scripts/setup_cuda_env.sh
 
 # -----------------------------------------------------------------------
 # Sanity check — verify CUDA is visible to PyTorch
 # -----------------------------------------------------------------------
-uv run python - <<'EOF'
+uv run --no-sync python - <<'EOF'
 import torch
 assert torch.cuda.is_available(), "CUDA not available — check GPU allocation"
 print(f"Device:         {torch.cuda.get_device_name(0)}")
@@ -110,12 +97,12 @@ EOF
 echo ""
 echo "=== Import diagnostics ==="
 PYTHONPATH="$HOME/CV-Quixer${PYTHONPATH:+:$PYTHONPATH}" \
-    uv run python scripts/debug_imports.py
+    uv run --no-sync python scripts/debug_imports.py
 
 echo ""
 echo "Starting cutoff-dim sweep evaluation..."
 PYTHONPATH="$HOME/CV-Quixer${PYTHONPATH:+:$PYTHONPATH}" \
-    uv run python experiments/eval_cutoff_sweep.py \
+    uv run --no-sync python experiments/eval_cutoff_sweep.py \
         --checkpoint "$CHECKPOINT" \
         "$@"
 
