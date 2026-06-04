@@ -49,11 +49,33 @@ REPORT_DIAGNOSTICS = "experiments/report_diagnostics.py"
 
 # Columns for the summary table, in display order.
 SUMMARY_COLUMNS = [
-    "run_name", "observables", "target_params", "achieved_params",
+    "run_name", "model", "observables", "target_params", "achieved_params",
     "scaling_knob", "num_layers", "trunc_lambda", "seed",
     "best_test_acc", "best_epoch", "final_test_acc",
     "final_train_acc", "n_epochs", "total_runtime_sec", "device",
 ]
+
+
+def _resolve_model(run_dir: Path, meta: dict) -> str:
+    """Model variant for a run: meta → config.json fallback → "quantum".
+
+    `meta["model"]` only exists on runs trained after that key was added; older
+    runs (e.g. the finished quantum sweeps) carry it only in config.json, so fall
+    back to the saved config and finally to the historic default "quantum".
+    """
+    model = meta.get("model")
+    if model:
+        return str(model)
+    config_path = run_dir / "config.json"
+    if config_path.is_file():
+        try:
+            with open(config_path) as f:
+                cfg_model = json.load(f).get("model")
+            if cfg_model:
+                return str(cfg_model)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return "quantum"
 
 
 def _load_run(run_dir: Path) -> dict | None:
@@ -75,6 +97,7 @@ def _load_run(run_dir: Path) -> dict | None:
 
     return {
         "run_name": run_dir.name,
+        "model": _resolve_model(run_dir, meta),
         "observables": meta.get("observables_name"),
         "target_params": meta.get("target_params"),
         "achieved_params": meta.get("achieved_params") or meta.get("n_params"),

@@ -587,6 +587,7 @@ history["meta"]["num_layers"] = int(
 )
 history["meta"]["trunc_lambda"] = float(TRUNC_LAMBDA)
 history["meta"]["seed"] = int(SEED)
+history["meta"]["model"] = str(args.model)
 
 
 # ---------------------------------------------------------------------------

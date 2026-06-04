@@ -52,14 +52,23 @@ uv run python experiments/full_experiment.py \
 # Hyperparameter sweep: grid over param budgets × observable presets (× seeds).
 # --dry-run writes the manifest only; --launch local runs sequentially here;
 # --launch slurm submits a job array (see scripts/run_sweep.sh).
+# --scaling-knob is REQUIRED (no default — pass it explicitly per sweep).
 uv run python experiments/sweep.py \
     --target-params 8000 13760 20000 --observables x xpxsps pnr \
+    --scaling-knob num_heads \
     --epochs 3 --train-fraction 0.1 --test-fraction 0.1 --dry-run
 
 # Aggregate a finished/partial sweep into a thesis table + comparison plots
 # (also renders the full report_diagnostics suite per run; --skip-per-run-figures to skip)
 uv run python experiments/report_sweep.py \
     --sweep-dir results/sweeps/<sweep>_<ts>/
+
+# Compare ≥2 sweeps side by side (e.g. one quantum sweep vs one quantum_shared
+# sweep) into one combined table + cross-sweep figures (JSON only, no torch)
+uv run python experiments/report_sweep_compare.py \
+    --sweep-dir results/sweeps/<sweepA>_<ts>/ \
+    --sweep-dir results/sweeps/<sweepB>_<ts>/ \
+    --label quantum --label quantum_shared
 
 # Cutoff-dim sweep across EVERY run in a sweep dir (one eval_cutoff_sweep per run).
 # --dry-run writes the manifest only; --launch local|slurm as with sweep.py.
@@ -149,9 +158,13 @@ targets the *total* count, the observable choice barely shifts the budget — th
 two axes are cleanly separable.
 
 `experiments/sweep.py` fans a Cartesian grid (`--target-params … --observables …
---seeds … --num-layers …`) into independent `full_experiment.py` runs, one
-process per grid point. It writes `results/sweeps/<sweep_name>_<ts>/sweep_manifest.json`
+--seeds … --num-layers … --scaling-knob …`) into independent `full_experiment.py`
+runs, one process per grid point. `--scaling-knob` is **required** (no default —
+every sweep must name the budget knob explicitly, e.g. `num_heads` for
+quantum / quantum_shared width). It writes
+`results/sweeps/<sweep_name>_<ts>/sweep_manifest.json`
 and per-run sub-dirs named `p{params}__obs-{preset}__seed{seed}` (with a
+`__knob-{knob}` marker when the knob isn't the historic `cnn_channels_2`, and a
 `__L{n}` suffix when `num_layers > 1`; each a full run dir). All
 runs share `--subset-seed` + fractions so they see the identical data subset.
 `--launch local` runs them sequentially; `--launch slurm` submits
@@ -201,7 +214,7 @@ Login via the login node, `cd ~/CV-Quixer`, then submit:
 ```bash
 sbatch scripts/run_mini_experiment.sh      # submit job
 squeue --me                                # monitor
-cat slurm-cv_quixer_mini-<JOBID>.out      # view output
+cat slurm_logs/slurm-cv_quixer_mini-<JOBID>.out   # view output (logs → slurm_logs/)
 ```
 
 To resume from a checkpoint, edit `run_mini_experiment.sh` and add `--resume <path>`
@@ -232,6 +245,7 @@ sbatch scripts/run_eval_cutoff_sweep.sh \
 # --launch slurm to submit it directly). Pre-build the venv once first.
 uv run python experiments/sweep.py \
     --target-params 8000 13760 20000 --observables x xp xpxsps pnr \
+    --scaling-knob num_heads \
     --epochs 3 --train-fraction 0.1 --test-fraction 0.1 --launch slurm
 
 # Whole-sweep cutoff eval — eval_cutoff_sweep_all.py writes the manifest and
@@ -246,6 +260,12 @@ All cluster scripts reuse the dedicated `$HOME/.venvs/cv-quixer-cuda` venv
 `run_sweep.sh`, and `run_eval_cutoff_sweep_array.sh` reuse it — for the arrays,
 pre-build the venv once so concurrent tasks don't race) and
 `cd "$HOME/CV-Quixer"` before running.
+
+All SLURM `.out`/`.err` logs and the per-task `gpu_util-*.csv` files are written
+to `slurm_logs/` (kept in git via `slurm_logs/.gitkeep`; the logs themselves are
+gitignored) instead of cluttering the repo root. Submit jobs from the repo root
+so the relative `--output`/`--error` paths resolve — SLURM does **not** create the
+directory, so it must already exist (the `.gitkeep` ensures it does after a pull).
 
 #### SLURM job config (`run_mini_experiment.sh`)
 
@@ -301,7 +321,7 @@ sbatch -J gpujob --gres=gpu:a100-40:1 scripts/run_mini_experiment.sh
 ```bash
 sbatch scripts/triage_cuda.sh        # runs nvidia-smi, nvcc, torch CUDA sanity check
 squeue --me                          # check job status
-cat slurm-cuda_triage-<JOBID>.out   # view triage output
+cat slurm_logs/slurm-cuda_triage-<JOBID>.out   # view triage output (logs → slurm_logs/)
 ```
 
 ## Package structure
@@ -344,6 +364,7 @@ experiments/
 ├── eval_cutoff_sweep_all.py  Fan eval_cutoff_sweep over EVERY run in a sweep (manifest + local/slurm)
 ├── sweep.py               Fan a (param × observable × seed) grid into full_experiment runs
 ├── report_sweep.py        Cross-run sweep table (summary.csv/md) + plots + per-run diagnostics
+├── report_sweep_compare.py  Overlay ≥2 sweeps (e.g. quantum vs quantum_shared) → combined table + cross-sweep figures
 ├── report_cutoff_sweep.py Cross-run cutoff table + figures/cutoff/ + per-cutoff diagnostics
 └── report_diagnostics.py  All figures (training curves + diagnostics) from a full_experiment run
 
@@ -579,7 +600,7 @@ Output layout differs per script (none of `results/` is git-tracked):
 | Entry | Contents |
 |---|---|
 | `config.json` | Full resolved `ExperimentConfig` (read back by eval/diagnostics) |
-| `history.json` | Training-time log only — per-epoch `train_loss`, `train_acc`, `test_loss`, `test_acc`, `trunc_loss`, `test_trunc_loss`, `elapsed_sec`, plus `history["batch"]` (per-minibatch arrays) and `history["meta"]` (best_epoch, runtime, plus sweep coordinates `target_params`/`achieved_params`/`observables_name`/`seed`). Never the canonical source for figures. |
+| `history.json` | Training-time log only — per-epoch `train_loss`, `train_acc`, `test_loss`, `test_acc`, `trunc_loss`, `test_trunc_loss`, `elapsed_sec`, plus `history["batch"]` (per-minibatch arrays) and `history["meta"]` (best_epoch, runtime, plus sweep coordinates `target_params`/`achieved_params`/`observables_name`/`scaling_knob`/`num_layers`/`trunc_lambda`/`seed`/`model`). Never the canonical source for figures. |
 | `parameter_table.txt` | Snapshot of `print_parameter_table()` |
 | `checkpoints/` | `latest.pt` (every epoch), `best.pt` (best test acc), `final_model.pt`, `epoch_NNNN.pt` |
 | `figures/` | Populated by `report_diagnostics.py` (run post-hoc or partway through). Not written by `full_experiment.py` itself. |
@@ -611,5 +632,18 @@ eval, written into the sweep dir):
 |---|---|
 | `sweep_manifest.json` | Grid axes, per-run `run_name`, and the exact `full_experiment.py` argv for each grid point (consumed by `run_sweep.sh`). |
 | `p{params}__obs-{preset}__seed{seed}/` | One full `full_experiment.py` run dir per grid point (same layout as above). |
-| `summary.csv` / `summary.md` | Written by `report_sweep.py` — one row per run (target/achieved params, observable preset, best/final acc, runtime). |
+| `summary.csv` / `summary.md` | Written by `report_sweep.py` — one row per run (model, target/achieved params, observable preset, scaling knob, best/final acc, runtime). |
 | `figures/acc_vs_params.png`, `figures/acc_by_observable.png` | Written by `report_sweep.py` — cross-run comparison plots. |
+
+**`report_sweep_compare.py`** (cross-sweep overlay; default out-dir
+`results/sweeps/compare_<YYYY-MM-DD_HH-MM-SS>/`, override with `--out-dir`).
+Reuses `report_sweep`'s loaders; reads each run's `model` from `history["meta"]`
+or, for older runs, `config.json` (default `"quantum"`). Series key on
+`(model, observables, scaling_knob)` so different knobs/models are never averaged
+together:
+
+| Entry | Contents |
+|---|---|
+| `comparison.csv` / `comparison.md` | One row per run across all `--sweep-dir`s, tagged with `sweep_label` + `model`. |
+| `figures/acc_vs_params_compare.png` | Best test acc vs achieved params (colour = model, marker = scaling knob). |
+| `figures/acc_by_params_compare.png` | Grouped bars: model/knob at each target budget (bar labels = achieved params). |

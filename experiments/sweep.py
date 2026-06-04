@@ -10,23 +10,30 @@ each run lands in a sibling sub-directory named like `p13760__obs-xpxsps__seed42
 (a full `full_experiment.py` run dir). Aggregate the results afterwards with
 `experiments/report_sweep.py --sweep-dir <that dir>`.
 
+`--scaling-knob` is required — every grid point must name the knob to auto-scale
+toward each `--target-params` (no implicit default), so the budget knob is always
+explicit in the manifest and the per-run argv.
+
 Examples
 --------
 Write the manifest only (inspect before launching)::
 
     uv run python experiments/sweep.py \\
-        --target-params 8000 13760 20000 --observables x xpxsps pnr --dry-run
+        --target-params 8000 13760 20000 --observables x xpxsps pnr \\
+        --scaling-knob num_heads --dry-run
 
 Run the grid locally, sequentially (small/smoke configs)::
 
     uv run python experiments/sweep.py \\
         --target-params 8000 13760 --observables xp xpxsps \\
+        --scaling-knob num_heads \\
         --epochs 1 --train-fraction 0.02 --test-fraction 0.05 --launch local
 
 Submit the grid as a SLURM array (one array task per grid point)::
 
     uv run python experiments/sweep.py \\
         --target-params 8000 13760 20000 --observables x xp xpxsps pnr \\
+        --scaling-knob num_heads \\
         --epochs 3 --train-fraction 0.1 --test-fraction 0.1 --launch slurm
 
 All runs share `--subset-seed` and the same train/test fractions so every
@@ -210,10 +217,12 @@ def main() -> None:
         "a stacked gate sequence + a BS→Rot interferometer",
     )
     parser.add_argument(
-        "--scaling-knob", type=str, nargs="+", default=["cnn_channels_2"],
-        help="one or more QuantumConfig fields to auto-scale toward each "
-        "--target-params (grid axis; e.g. cnn_channels_2 num_heads). Forwarded "
-        "to full_experiment.py per run.",
+        "--scaling-knob", type=str, nargs="+", required=True,
+        help="REQUIRED: one or more QuantumConfig fields to auto-scale toward "
+        "each --target-params (grid axis; forwarded to full_experiment.py per "
+        "run). No default — pass it explicitly so the budget knob is never "
+        "silently chosen. Use num_heads for quantum / quantum_shared width, "
+        "cnn_channels_2 for the CNN-width knob.",
     )
     parser.add_argument(
         "--trunc-lambda", type=float, nargs="+", default=None,
