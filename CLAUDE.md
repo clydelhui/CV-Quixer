@@ -57,14 +57,26 @@ uv run python experiments/sweep.py \
     --epochs 3 --train-fraction 0.1 --test-fraction 0.1 --dry-run
 
 # Aggregate a finished/partial sweep into a thesis table + comparison plots
+# (also renders the full report_diagnostics suite per run; --skip-per-run-figures to skip)
 uv run python experiments/report_sweep.py \
+    --sweep-dir results/sweeps/<sweep>_<ts>/
+
+# Cutoff-dim sweep across EVERY run in a sweep dir (one eval_cutoff_sweep per run).
+# --dry-run writes the manifest only; --launch local|slurm as with sweep.py.
+uv run python experiments/eval_cutoff_sweep_all.py \
+    --sweep-dir results/sweeps/<sweep>_<ts>/ --launch slurm
+
+# Aggregate the whole-sweep cutoff eval into cross-run figures + per-cutoff suites
+uv run python experiments/report_cutoff_sweep.py \
     --sweep-dir results/sweeps/<sweep>_<ts>/
 
 # Run tests
 uv run pytest tests/
 ```
 
-`report_diagnostics.py` is the single figure-generation tool for the project.
+`report_diagnostics.py` is the single figure-generation tool for the project —
+`report_sweep.py` and `report_cutoff_sweep.py` *invoke* it (one subprocess per
+run / per cutoff) rather than reimplementing any figures.
 `full_experiment.py` writes only **raw** data artefacts (`config.json`,
 `history.json`, `predictions/`, `diagnostics/`, `checkpoints/`,
 `subset_indices.npz`); `report_diagnostics.py` consumes those and *derives*
@@ -118,7 +130,7 @@ the canonical single-run behaviour exactly):
 | Flag | Default | Effect |
 |---|---|---|
 | `--model NAME` | `quantum` | `quantum` \| `quantum_shared` \| `classical`. `quantum_shared` defaults `--scaling-knob` to `num_heads`. |
-| `--target-params N` | 13760 | parameter budget; auto-scales `--scaling-knob` (default `cnn_channels_2`; `num_heads` for `quantum_shared`) |
+| `--target-params N` | -1 (off; frozen 13,530-param model) | parameter budget; when >0 auto-scales `--scaling-knob` (default `num_heads`) |
 | `--num-layers L` | 1 | per-patch circuit depth (L stacked gate sequences + L−1 `BS→Rot` interferometers); can also be a `--scaling-knob` |
 | `--observables NAME` | `xpxsps` | named observable preset (see below) |
 | `--observables-json STR` | — | ad-hoc `ObservableSpec` JSON; requires `--run-name` |
@@ -148,8 +160,26 @@ writes the manifest only.
 `experiments/report_sweep.py --sweep-dir <dir>` scans the sweep (JSON only — no
 torch), emitting `summary.csv` + `summary.md` (one row/run: target/achieved
 params, observable preset, best/final acc, runtime) and `figures/acc_vs_params.png`
-+ `figures/acc_by_observable.png`. Per-run figures still come from
-`report_diagnostics.py --run-dir <sweep>/<run>/`.
++ `figures/acc_by_observable.png` (cross-run figures plot the *achieved* param
+count). It then **also renders the full `report_diagnostics.py` figure suite for
+every run by default** (one subprocess per run; `report_diagnostics`'s default
+path is npz/JSON-based, so heavy torch imports stay deferred); pass
+`--skip-per-run-figures` for the fast cross-run-only pass.
+
+**Whole-sweep cutoff sweep.** `experiments/eval_cutoff_sweep_all.py --sweep-dir
+<dir>` fans `eval_cutoff_sweep.py` over **every** run in a sweep (discovers runs
+that have `checkpoints/<name>` + `config.json` + `subset_indices.npz`), writes
+`cutoff_sweep_manifest.json` and drives every per-run eval with one shared
+`--output-name` (`cutoff_sweep_<ts>`) so all outputs land at
+`<run>/eval/<name>/`; `--launch local|slurm|none` / `--dry-run` mirror `sweep.py`
+(slurm submits `scripts/run_eval_cutoff_sweep_array.sh` as a job array, one task
+per run). `experiments/report_cutoff_sweep.py --sweep-dir <dir>` (JSON only)
+aggregates the per-run `eval/<name>/results.json` into `cutoff_summary.csv/md` +
+`figures/cutoff/{acc_vs_cutoff_all,trunc_loss_vs_cutoff_all,acc_recovery_vs_params,
+acc_vs_params_by_cutoff}.png`, then auto-renders the full per-cutoff `D{NN}/`
+diagnostics suite (`--skip-per-run-figures` to skip). Cost caveat: cutoff cost
+scales with `num_heads` (not the param budget), so high-head runs need
+`--test-fraction` to stay under the array wall — default `--cutoffs 6 8 10`.
 
 **Weights & Biases** (optional, opt-in via `--wandb`; off by default). Wired
 through `cv_quixer/utils/logging.py` (`init_logging`/`log_metrics`/
@@ -183,6 +213,7 @@ to the `mini_experiment.py` invocation at the bottom.
 | `run_full_experiment.sh` | `cv_quixer_full` | `03:00:00` | `gpu:a100-40:1` / 32G / 4 | `full_experiment.py --train-fraction 0.1 --test-fraction 0.1` (3 epochs on a 10% subset; edit the script to resume or change fractions) |
 | `run_eval_cutoff_sweep.sh` | `cv_quixer_eval` | `12:00:00` | `gpu:a100-40:1` / 32G / 4 | `eval_cutoff_sweep.py` — takes a checkpoint as `$1`, extra flags passed through |
 | `run_sweep.sh` | `cv_quixer_sweep` | `03:00:00` | `gpu:a100-40:1` / 32G / 4 | job ARRAY — takes a `sweep_manifest.json` as `$1`, runs the `full_experiment.py` entry for `$SLURM_ARRAY_TASK_ID` |
+| `run_eval_cutoff_sweep_array.sh` | `cv_quixer_eval_all` | `12:00:00` | `gpu:a100-40:1` / 32G / 4 | job ARRAY — takes a `cutoff_sweep_manifest.json` as `$1`, runs the `eval_cutoff_sweep.py` entry for `$SLURM_ARRAY_TASK_ID` |
 | `triage_cuda.sh` | `cuda_triage` | — | `gpu:nv:1` | CUDA/GPU sanity diagnostics |
 
 ```bash
@@ -200,12 +231,19 @@ sbatch scripts/run_eval_cutoff_sweep.sh \
 uv run python experiments/sweep.py \
     --target-params 8000 13760 20000 --observables x xp xpxsps pnr \
     --epochs 3 --train-fraction 0.1 --test-fraction 0.1 --launch slurm
+
+# Whole-sweep cutoff eval — eval_cutoff_sweep_all.py writes the manifest and
+# prints/submits `sbatch --array=0-<N-1> scripts/run_eval_cutoff_sweep_array.sh
+# <manifest>` (one array task per run). Pre-build the venv once first.
+uv run python experiments/eval_cutoff_sweep_all.py \
+    --sweep-dir results/sweeps/<sweep>_<ts>/ --launch slurm
 ```
 
 All cluster scripts reuse the dedicated `$HOME/.venvs/cv-quixer-cuda` venv
-(`run_full_experiment.sh` rebuilds it fresh; `run_eval_cutoff_sweep.sh` and
-`run_sweep.sh` reuse it — for the array, pre-build the venv once so concurrent
-tasks don't race) and `cd "$HOME/CV-Quixer"` before running.
+(`run_full_experiment.sh` rebuilds it fresh; `run_eval_cutoff_sweep.sh`,
+`run_sweep.sh`, and `run_eval_cutoff_sweep_array.sh` reuse it — for the arrays,
+pre-build the venv once so concurrent tasks don't race) and
+`cd "$HOME/CV-Quixer"` before running.
 
 #### SLURM job config (`run_mini_experiment.sh`)
 
@@ -301,17 +339,20 @@ experiments/
 ├── mini_experiment.py     200 train / 50 test, 100 epochs, periodic checkpointing
 ├── full_experiment.py     60k/10k FashionMNIST, self-contained results/runs/<ts>/ dir
 ├── eval_cutoff_sweep.py   Re-evaluate a trained checkpoint at larger Fock cutoffs
+├── eval_cutoff_sweep_all.py  Fan eval_cutoff_sweep over EVERY run in a sweep (manifest + local/slurm)
 ├── sweep.py               Fan a (param × observable × seed) grid into full_experiment runs
-├── report_sweep.py        Cross-run sweep table (summary.csv/md) + comparison plots
+├── report_sweep.py        Cross-run sweep table (summary.csv/md) + plots + per-run diagnostics
+├── report_cutoff_sweep.py Cross-run cutoff table + figures/cutoff/ + per-cutoff diagnostics
 └── report_diagnostics.py  All figures (training curves + diagnostics) from a full_experiment run
 
 scripts/
-├── run_mini_experiment.sh     SLURM batch job for mini_experiment
-├── run_full_experiment.sh     SLURM batch job for full_experiment (A100, 3 h)
-├── run_eval_cutoff_sweep.sh   SLURM batch job for eval_cutoff_sweep (A100, 12 h)
-├── run_sweep.sh               SLURM job ARRAY for sweep.py manifests (A100, one task/run)
-├── triage_cuda.sh             SLURM GPU/CUDA diagnostic job
-└── debug_imports.py           Sequential import diagnostics with tracebacks
+├── run_mini_experiment.sh        SLURM batch job for mini_experiment
+├── run_full_experiment.sh        SLURM batch job for full_experiment (A100, 3 h)
+├── run_eval_cutoff_sweep.sh      SLURM batch job for eval_cutoff_sweep (A100, 12 h)
+├── run_eval_cutoff_sweep_array.sh SLURM job ARRAY for eval_cutoff_sweep_all manifests (A100, one task/run)
+├── run_sweep.sh                  SLURM job ARRAY for sweep.py manifests (A100, one task/run)
+├── triage_cuda.sh                SLURM GPU/CUDA diagnostic job
+└── debug_imports.py              Sequential import diagnostics with tracebacks
 
 configs/                 LEGACY — not loaded by any current experiment script.
 ├── defaults.yaml         Kept deliberately (intend to revive YAML-driven runs).
@@ -425,11 +466,11 @@ hard-wired to `num_modes`. See `QuantumConfig.readout_observables` /
 | `num_heads` | 4 | Parallel CV attention heads |
 | `decoder_hidden_dim` | 64 | CVDecoder hidden layer width |
 | `cnn_channels_1` | 8 | CNNHypernetwork first conv output channels |
-| `cnn_channels_2` | 16 | CNNHypernetwork second conv output channels (default `scaling_knob`; auto-scaled when `target_params > 0`) |
+| `cnn_channels_2` | 16 | CNNHypernetwork second conv output channels (a valid `scaling_knob`, but `num_heads` is the default) |
 | `cnn_kernel_size` | 3 | Conv kernel size |
 | `poly_degree` | 2 | Matrix polynomial degree (keep ≤ 4) |
-| `target_params` | -1 | If > 0, binary-search the configured `scaling_knob` (build-and-count) to hit this count (±5%) |
-| `scaling_knob` | `"cnn_channels_2"` | Integer QuantumConfig field auto-scaled toward `target_params` (e.g. `cnn_channels_2`, `num_heads`, `num_modes`, `num_layers` — all monotonic in param count) |
+| `target_params` | -1 | If > 0, binary-search the configured `scaling_knob` (build-and-count) to hit this count (warns if the closest achievable is >10% off — `tol=0.10` in `utils/params.py`) |
+| `scaling_knob` | `"num_heads"` | Integer QuantumConfig field auto-scaled toward `target_params` (e.g. `num_heads`, `cnn_channels_2`, `num_modes`, `num_layers` — all monotonic in param count). `num_heads` is the default (robust across budgets; `cnn_channels_2` accuracy degrades with scale) |
 | `trunc_penalty` | `"none"` | `"none"`, `"norm"`, or `"photon_number"` |
 | `trunc_lambda` | 0.01 | Truncation penalty loss weight |
 | `readout_observable` | `None` | Legacy single-string selector: `"quadrature_x"`, `"photon_number"`, or `"pnr_distribution"`. Mutually exclusive with `readout_observables` |
@@ -480,21 +521,26 @@ output paths (see below) rather than reading every `TrainingConfig` field.
 | `TRAIN_SIZE` | 200 | Training subset size |
 | `TEST_SIZE` | 50 | Test subset size |
 | `BATCH_SIZE` | 32 | Batch size |
-| `TARGET_PARAMS` | 13,760 | Parameter budget (auto-scales `cnn_channels_2`) |
+| `TARGET_PARAMS` | 13,760 | Parameter budget (auto-scales `num_heads`, the default knob) |
 | `CHECKPOINT_INTERVAL` | 10 | Save checkpoint every N epochs |
 
 ### full_experiment.py constants
 
-Same quantum config as `mini_experiment.py` (num_modes=2, cutoff_dim=6,
-num_heads=4, poly_degree=2, ~13.7k params) but trained on the full 60k/10k
-split. CLI-overridable: `--epochs`, `--train-fraction`, `--test-fraction`,
-`--resume`.
+Default is the frozen best p12800 L2 sweep point: num_modes=2, cutoff_dim=6,
+num_heads=4, num_layers=2, poly_degree=3, cnn_channels_2=8, trunc norm λ=0.1,
+`xpxsps` observables → **13,530 params** (`TARGET_PARAMS=-1` so the architecture
+is built verbatim, no auto-scaling). Trained on the full 60k/10k split.
+CLI-overridable: `--epochs`, `--train-fraction`, `--test-fraction`, `--resume`,
+`--target-params` (re-enables auto-scaling on `--scaling-knob`, default `num_heads`).
 
 | Constant | Value | Description |
 |---|---|---|
 | `EPOCHS` | 3 | Default epochs (~75-90 min/epoch V100, ~30-45 min/epoch A100) |
 | `BATCH_SIZE` | 64 | Batch size |
-| `TARGET_PARAMS` | 13,760 | Parameter budget (auto-scales `cnn_channels_2`) |
+| `TARGET_PARAMS` | -1 | Auto-scaling off → frozen 13,530-param architecture. Set >0 to binary-search `SCALING_KNOB` |
+| `SCALING_KNOB` | `"num_heads"` | Knob auto-scaled toward `--target-params` when enabled |
+| `NUM_LAYERS` | 2 | Per-patch circuit depth L |
+| `TRUNC_LAMBDA` | 0.1 | Fock truncation penalty weight |
 | `CHECKPOINT_INTERVAL` | 1 | Versioned `epoch_NNNN.pt` every N epochs |
 | `MA_WINDOW` | 50 | Moving-average window for per-batch plots |
 
@@ -505,7 +551,7 @@ Fock backend memory scales as `cutoff_dim ^ num_modes`. Keep `num_modes ≤ 8` a
 
 **mini_experiment config**: `num_modes=2`, `cutoff_dim=6`, `num_heads=4`,
 `patch_size=7` (16 patches), `dtype=complex64`. `target_params=13760` auto-scales
-`cnn_channels_2` via binary search at init time.
+`num_heads` (the default knob) via binary search at init time.
 
 **Fock truncation penalty** (weighted by `trunc_lambda`):
 - `"norm"` — penalises `1 - ‖ψ‖²` (probability leakage outside truncated space)
@@ -543,7 +589,18 @@ Output layout differs per script (none of `results/` is git-tracked):
 | `logs/train.log` | Tee'd stdout from the training process. |
 
 **`eval_cutoff_sweep.py`**: writes `<run_dir>/eval/cutoff_sweep_<timestamp>/`
-containing `results.json`, `results.csv`, and per-metric plots.
+containing `results.json`, `results.csv`, `meta.json`, per-metric plots, and one
+`D{NN}/` report_diagnostics-runnable sub-run dir per cutoff.
+
+**`eval_cutoff_sweep_all.py` / `report_cutoff_sweep.py`** (whole-sweep cutoff
+eval, written into the sweep dir):
+
+| Entry | Contents |
+|---|---|
+| `cutoff_sweep_manifest.json` | Per-run `eval_cutoff_sweep.py` argv (one shared `--output-name` across runs), consumed by `run_eval_cutoff_sweep_array.sh`. |
+| `<run>/eval/<shared-name>/` | The per-run `eval_cutoff_sweep.py` output (layout above), one per run, all under the same `cutoff_sweep_<ts>` name. |
+| `cutoff_summary.csv` / `.md` | Written by `report_cutoff_sweep.py` — one row per (run, split, cutoff). |
+| `figures/cutoff/*.png` | Written by `report_cutoff_sweep.py` — cross-run acc/trunc-vs-cutoff, acc-recovery-vs-params, acc-vs-params-by-cutoff. |
 
 **`sweep.py`** (one directory per sweep,
 `results/sweeps/<sweep_name>_<YYYY-MM-DD_HH-MM-SS>/`):
