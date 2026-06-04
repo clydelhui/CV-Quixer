@@ -1,0 +1,4 @@
+# Keeps the slurm_logs/ directory in git so SLURM `--output`/`--error` paths
+# (e.g. slurm_logs/slurm-%x-%j.out) resolve at submit time. SLURM does NOT create
+# the log directory itself, so this directory must exist before sbatch runs.
+# The .out/.err/.csv job logs themselves are gitignored.

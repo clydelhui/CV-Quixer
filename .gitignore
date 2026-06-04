@@ -212,3 +212,11 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# SLURM job logs (routed to slurm_logs/ by scripts/*.sh; keep the dir, ignore logs)
+/slurm_logs/*
+!/slurm_logs/.gitkeep
+# Stray root-level SLURM logs from older runs / scripts
+/slurm-*.out
+/slurm-*.err
+/gpu_util-*.csv

@@ -20,8 +20,8 @@
 # Bump --time or change --gres if your epochs/depth/fractions need more.
 # -----------------------------------------------------------------------
 #SBATCH --job-name=cv_quixer_sweep
-#SBATCH --output=slurm-%x-%A_%a.out
-#SBATCH --error=slurm-%x-%A_%a.err
+#SBATCH --output=slurm_logs/slurm-%x-%A_%a.out
+#SBATCH --error=slurm_logs/slurm-%x-%A_%a.err
 #SBATCH --time=06:00:00
 #SBATCH --gres=gpu:a100-40:1
 #SBATCH --cpus-per-task=4
@@ -82,7 +82,8 @@ EOF
 # GPU utilization sampling for future resource planning. Polls every 30s into
 # a CSV next to the slurm logs; cleaned up on exit (success or failure). wandb
 # also auto-logs system metrics, but this gives a self-contained per-task record.
-GPU_LOG="gpu_util-${SLURM_JOB_ID:-0}_${TASK_ID}.csv"
+mkdir -p slurm_logs
+GPU_LOG="slurm_logs/gpu_util-${SLURM_JOB_ID:-0}_${TASK_ID}.csv"
 nvidia-smi \
     --query-gpu=timestamp,index,name,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw \
     --format=csv -l 30 > "$GPU_LOG" &

@@ -8,8 +8,8 @@
 # congested (V100 will be slower; bump --time if needed).
 # -----------------------------------------------------------------------
 #SBATCH --job-name=cv_quixer_full
-#SBATCH --output=slurm-%x-%j.out
-#SBATCH --error=slurm-%x-%j.err
+#SBATCH --output=slurm_logs/slurm-%x-%j.out
+#SBATCH --error=slurm_logs/slurm-%x-%j.err
 #SBATCH --time=03:00:00
 #SBATCH --gres=gpu:a100-40:1
 #SBATCH --cpus-per-task=4

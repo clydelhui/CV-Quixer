@@ -34,8 +34,8 @@
 #   sbatch scripts/run_backfill_artefacts.sh results/runs/<run>/ --overwrite
 # -----------------------------------------------------------------------
 #SBATCH --job-name=cv_quixer_backfill
-#SBATCH --output=slurm-%x-%j.out
-#SBATCH --error=slurm-%x-%j.err
+#SBATCH --output=slurm_logs/slurm-%x-%j.out
+#SBATCH --error=slurm_logs/slurm-%x-%j.err
 #SBATCH --time=02:00:00
 #SBATCH --gres=gpu:a100-40:1
 #SBATCH --cpus-per-task=4

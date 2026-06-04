@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=cuda_triage
-#SBATCH --output=slurm-%x-%j.out
-#SBATCH --error=slurm-%x-%j.err
+#SBATCH --output=slurm_logs/slurm-%x-%j.out
+#SBATCH --error=slurm_logs/slurm-%x-%j.err
 #SBATCH --time=00:15:00
 #SBATCH --gres=gpu:nv:1
 #SBATCH --cpus-per-task=2
