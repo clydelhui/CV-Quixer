@@ -1,9 +1,11 @@
 """Full FashionMNIST experiment for CV-Quixer.
 
-Same quantum config as `experiments/mini_experiment.py` (num_modes=2, cutoff_dim=6,
-num_heads=4, poly_degree=2, ~13.7k params via target_params auto-scaling), but
-trained on the **full** 60k train / 10k test FashionMNIST split. Default 3 epochs;
-~75-90 min/epoch on V100, ~30-45 min/epoch on A100.
+Default quantum config is the frozen best p12800 L2 sweep point (num_modes=2,
+cutoff_dim=6, num_heads=4, num_layers=2, poly_degree=3, cnn_channels_2=8 →
+13,530 params; target_params=-1 so the architecture is built verbatim, no
+auto-scaling), trained on the **full** 60k train / 10k test FashionMNIST split.
+Pass --target-params N to re-enable auto-scaling (scaling knob defaults to
+num_heads). Default 3 epochs; ~75-90 min/epoch on V100, ~30-45 min/epoch on A100.
 
 Per-batch metrics (CE loss, trunc loss, total loss, batch accuracy, gradient L2 norm)
 are logged alongside per-epoch metrics so the loss/trunc/accuracy/gradient curves
@@ -83,14 +85,18 @@ from cv_quixer.utils.logging import finish_logging, init_logging, log_metrics
 
 EPOCHS = 3
 BATCH_SIZE = 64
-TARGET_PARAMS = 13_760
-SCALING_KNOB = "cnn_channels_2"  # architecture knob auto-scaled to hit TARGET_PARAMS
-NUM_LAYERS = 1  # per-patch circuit depth L (L gate sequences + L-1 BS→Rot interferometers)
+# Default = the frozen 13,530-param model (the best p12800 L2 sweep point:
+# num_heads=4, cnn_channels_2=8). TARGET_PARAMS=-1 disables auto-scaling so the
+# explicit architecture below is built verbatim. Pass --target-params N to
+# re-enable the binary search, which then scales SCALING_KNOB (num_heads).
+TARGET_PARAMS = -1
+SCALING_KNOB = "num_heads"  # knob auto-scaled to hit --target-params (when enabled)
+NUM_LAYERS = 2  # per-patch circuit depth L (L gate sequences + L-1 BS→Rot interferometers)
 CUTOFF_DIM = 6  # Fock truncation (also used to expand the `pnr` observable preset)
 SEED = 42
 CHECKPOINT_INTERVAL = 1  # versioned epoch_NNNN.pt every N epochs
 DEFAULT_OBSERVABLES = "xpxsps"  # x, p, x², p² per mode
-TRUNC_LAMBDA = 0.01  # Fock truncation penalty weight (added to CE loss)
+TRUNC_LAMBDA = 0.1  # Fock truncation penalty weight (added to CE loss)
 
 
 # ---------------------------------------------------------------------------
@@ -149,14 +155,16 @@ parser.add_argument(
     type=int,
     default=None,
     help=f"parameter budget; auto-scales the configured --scaling-knob "
-    f"(default TARGET_PARAMS={TARGET_PARAMS:,})",
+    f"(default TARGET_PARAMS={TARGET_PARAMS} → auto-scaling off, the frozen "
+    f"13,530-param architecture is built as-is)",
 )
 parser.add_argument(
     "--scaling-knob",
     type=str,
     default=None,
     help=f"integer QuantumConfig field to auto-scale toward --target-params "
-    f"(default {SCALING_KNOB!r}); e.g. cnn_channels_2, num_heads, num_modes",
+    f"(default {SCALING_KNOB!r}; only used when --target-params is set); "
+    f"e.g. num_heads, cnn_channels_2, num_modes",
 )
 parser.add_argument(
     "--num-layers",
@@ -287,8 +295,10 @@ else:
 
 
 # ---------------------------------------------------------------------------
-# Config (quantum config matches mini_experiment.py — do not change the
-# fixed architecture knobs; only target_params / observables / seed are swept)
+# Config — the frozen best p12800 L2 architecture (num_heads=4, cnn_channels_2=8,
+# num_layers=2, poly_degree=3, trunc norm λ=0.1, xpxsps → 13,530 params).
+# target_params=-1 by default so it is built verbatim; --target-params re-enables
+# auto-scaling on --scaling-knob (default num_heads). Observables / seed are swept.
 # ---------------------------------------------------------------------------
 
 data_cfg = DataConfig(
@@ -303,9 +313,10 @@ quantum_cfg = QuantumConfig(
     num_modes=2,
     num_layers=NUM_LAYERS,
     cutoff_dim=CUTOFF_DIM,
-    num_heads=4,
+    num_heads=4,            # fixed at the resolved 13,530-param value (the scaling
+                            # seed only when --target-params re-enables auto-scaling)
     cnn_channels_1=8,
-    cnn_channels_2=16,  # overridden when scaling_knob == "cnn_channels_2"
+    cnn_channels_2=8,       # the value the autoscaler resolved for the 13,530 model
     cnn_kernel_size=3,
     decoder_hidden_dim=32,
     poly_degree=3,
@@ -516,7 +527,8 @@ print(param_table_str)
 (run_dir / "parameter_table.txt").write_text(param_table_str)
 
 n_params = model.get_num_parameters()
-print(f"Trainable parameters: {n_params:,}  (target: {TARGET_PARAMS:,})\n")
+_target_str = f"{TARGET_PARAMS:,}" if TARGET_PARAMS > 0 else "off (fixed architecture)"
+print(f"Trainable parameters: {n_params:,}  (target: {_target_str})\n")
 
 # Shape check on one batch
 _patches, _ = next(iter(train_loader))

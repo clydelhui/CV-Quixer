@@ -115,7 +115,7 @@ uv run pytest tests/
 * **Identical data pipeline** for classical and quantum models — same
   patches, same normalisation, same DataLoader output.
 * **Auto-scaling** — `QuantumConfig.target_params > 0` binary-searches the configured `scaling_knob`
-  (default `cnn_channels_2`, but e.g. `num_heads` / `num_modes` also work) to land
+  (default `num_heads`, but e.g. `cnn_channels_2` / `num_modes` also work) to land
   within ~10 % of the target parameter count.
 * **Configurable readout** — `QuantumConfig.readout_observables` selects any
   mix of `x`, `p`, `x²`, `p²`, `n`, and photon-number-resolving `prob_n`

@@ -948,13 +948,19 @@ class TestAutoScaling:
         base.update(over)
         return QuantumConfig(**base)
 
-    def test_default_knob_matches_historical_architecture(self):
+    def test_cnn_channels_2_knob_matches_historical_architecture(self):
         # Pin: build-and-count resolves the same cnn_channels_2 (=14) and param
         # count (=13050) the pre-refactor closed-form formula produced for the
         # canonical full config, so existing runs stay comparable. Captured 2026-05-31.
-        model = CVQuixer(self._quantum(), self._data())
+        # scaling_knob is passed explicitly (the default is now num_heads) so this
+        # keeps pinning the cnn_channels_2 resolution specifically.
+        model = CVQuixer(self._quantum(scaling_knob="cnn_channels_2"), self._data())
         assert model.config.cnn_channels_2 == 14
         assert count_parameters(model) == 13050
+
+    def test_default_scaling_knob_is_num_heads(self):
+        # The default auto-scaling knob is num_heads (the robust knob).
+        assert QuantumConfig().scaling_knob == "num_heads"
 
     def test_scale_by_num_heads(self):
         model = CVQuixer(self._quantum(scaling_knob="num_heads"), self._data())

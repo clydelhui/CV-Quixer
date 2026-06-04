@@ -138,7 +138,7 @@ class QuantumConfig:
     # CNN hypernetwork: Conv(1→C1) → Conv(C1→C2) → flatten → 2D PE → Linear → gate params
     # No padding; spatial output: h_out = patch_size - 2*(cnn_kernel_size - 1)
     cnn_channels_1: int = 8    # output channels of first conv layer
-    cnn_channels_2: int = 16   # output channels of second conv layer (default scaling_knob when target_params > 0)
+    cnn_channels_2: int = 16   # output channels of second conv layer (a valid scaling_knob, but num_heads is the default)
     cnn_kernel_size: int = 3   # kernel size for both conv layers
 
     # Matrix polynomial degree for LCU attention (P(M) = Σ c_j M^j, j=0..d)
@@ -146,12 +146,13 @@ class QuantumConfig:
 
     # Auto-scaling: set target_params > 0 to binary-search `scaling_knob` (an
     # integer architecture field) so the built model's trainable-param count hits
-    # the budget. scaling_knob defaults to cnn_channels_2 (historic behaviour);
-    # other monotonic knobs (num_heads, num_modes, cnn_channels_1,
+    # the budget. scaling_knob defaults to num_heads — the robust knob (sweeps
+    # show cnn_channels_2 accuracy degrades with scale while num_heads holds up).
+    # Other monotonic knobs (cnn_channels_2, num_modes, cnn_channels_1,
     # decoder_hidden_dim, num_layers) also work — num_layers now deepens the
     # per-patch unitary, so it monotonically increases the param count.
     target_params: int = -1
-    scaling_knob: str = "cnn_channels_2"
+    scaling_knob: str = "num_heads"
 
     # Fock truncation penalty added to training loss
     trunc_penalty: str = "none"   # "none" | "norm" | "photon_number"
