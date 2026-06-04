@@ -244,25 +244,41 @@ def plot_acc_recovery_vs_params(rows: list[dict], fig_dir: Path) -> None:
 
 
 def plot_acc_vs_params_by_cutoff(rows: list[dict], fig_dir: Path) -> None:
-    """Test acc vs achieved params, one line per cutoff_dim."""
+    """Test acc vs achieved params, one line per (scaling knob, cutoff_dim).
+
+    Keying by scaling_knob as well as cutoff keeps the two knobs (which scale
+    very differently) from collapsing into one averaged line per cutoff. Colour
+    encodes the Fock cutoff D, linestyle encodes the scaling knob.
+    """
     test = [r for r in _test_rows(rows)
-            if r["achieved_params"] is not None and r["acc"] is not None]
+            if r["achieved_params"] is not None and r["acc"] is not None
+            and r["cutoff_dim"] is not None and r["scaling_knob"] is not None]
     if not test:
         print("  (no data — skipping acc_vs_params_by_cutoff)")
         return
-    by_cut: dict[int, list[tuple[int, float]]] = defaultdict(list)
+    by_kc: dict[tuple[str, int], list[tuple[int, float]]] = defaultdict(list)
     for r in test:
-        by_cut[r["cutoff_dim"]].append((r["achieved_params"], r["acc"]))
+        by_kc[(r["scaling_knob"], r["cutoff_dim"])].append(
+            (r["achieved_params"], r["acc"])
+        )
+    knobs = sorted({k for (k, _d) in by_kc})
+    cutoffs = sorted({d for (_k, d) in by_kc})
+    cmap = plt.get_cmap("viridis")
+    color_for = {d: cmap(i / max(len(cutoffs) - 1, 1)) for i, d in enumerate(cutoffs)}
+    linestyles = ["-", "--", "-.", ":"]
+    style_for = {k: linestyles[i % len(linestyles)] for i, k in enumerate(knobs)}
+
     fig, ax = plt.subplots(figsize=(7.5, 4.5))
-    for D in sorted(by_cut):
-        pts = sorted(by_cut[D])
+    for knob, D in sorted(by_kc):
+        pts = sorted(by_kc[(knob, D)])
         ax.plot([p[0] for p in pts], [p[1] for p in pts],
-                marker="o", lw=1.8, label=f"D={D}")
+                marker="o", lw=1.8, color=color_for[D], ls=style_for[knob],
+                label=f"{knob} / D={D}")
     ax.set_xlabel("Achieved parameter count")
     ax.set_ylabel("Best test accuracy")
-    ax.set_title("Accuracy vs params, by Fock cutoff")
+    ax.set_title("Accuracy vs params, by scaling knob and Fock cutoff")
     ax.grid(alpha=0.3)
-    ax.legend(title="cutoff_dim")
+    ax.legend(title="knob / cutoff_dim", fontsize=8)
     fig.tight_layout()
     out = fig_dir / "acc_vs_params_by_cutoff.png"
     fig.savefig(out, dpi=150)
