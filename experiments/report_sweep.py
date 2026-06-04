@@ -82,6 +82,15 @@ def _load_run(run_dir: Path) -> dict | None:
     """Read one run's history/config into a flat summary row, or None to skip."""
     history_path = run_dir / "history.json"
     if not history_path.is_file():
+        # A dir with config.json but no history.json is a run that started but
+        # never finished an epoch (e.g. OOM / wall-time kill). Warn so it isn't
+        # silently dropped from the table and figures.
+        if (run_dir / "config.json").is_file():
+            warnings.warn(
+                f"skipping {run_dir.name}: no history.json — run did not complete "
+                "an epoch (check its logs/slurm .err; re-run to populate).",
+                RuntimeWarning, stacklevel=2,
+            )
         return None
     with open(history_path) as f:
         history = json.load(f)

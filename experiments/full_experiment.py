@@ -638,6 +638,7 @@ def train_epoch(epoch: int) -> float:
     global global_step
     model.train()
     total_trunc, total = 0.0, 0
+    _logged_first_batch_mem = False
     for patches, labels in tqdm(
         train_loader, desc=f"Epoch {epoch:>3}/{EPOCHS}", leave=False, unit="batch"
     ):
@@ -651,6 +652,15 @@ def train_epoch(epoch: int) -> float:
 
         grad_norm = _grad_l2_norm(model.parameters())
         optimizer.step()
+
+        # Early OOM-headroom signal: the steady-state footprint (fwd+bwd+step)
+        # is reached on the first batch. Print it once to stdout (the tee'd
+        # train.log) so memory headroom is visible even if the epoch never
+        # finishes. (peak measured since the per-epoch reset in the main loop.)
+        if device.type == "cuda" and not _logged_first_batch_mem:
+            _peak = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+            print(f"  [epoch {epoch}] peak GPU mem after first batch: {_peak:,.0f} MB")
+            _logged_first_batch_mem = True
 
         n = labels.size(0)
         preds = logits.argmax(dim=-1)
@@ -687,9 +697,12 @@ def save_history() -> None:
 
 print(
     f"{'Epoch':<7} {'Train loss':<12} {'Train acc':<11} "
-    f"{'Test loss':<11} {'Test acc':<11} {'Trunc loss':<12} {'Time'}"
+    f"{'Test loss':<11} {'Test acc':<11} {'Trunc loss':<12} {'Peak mem':<11} {'Time'}"
 )
-print("─" * 76)
+print("─" * 88)
+
+# Per-epoch peak GPU memory is recorded under this key (CUDA only).
+history["epoch"].setdefault("peak_mem_mb", [])
 
 run_start = time.time()
 best_test_acc = (
@@ -703,12 +716,22 @@ best_epoch = (
 
 for epoch in range(start_epoch, EPOCHS + 1):
     t0 = time.time()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     trunc_loss = train_epoch(epoch)
     train_eval = evaluate(model, train_eval_loader, device,
                           progress="train eval")
     test_eval = evaluate(model, test_loader, device,
                          progress="test eval")
     elapsed_train_eval = time.time() - t0
+
+    # Peak GPU memory across this epoch (train + eval), recorded for headroom
+    # tracking. None on non-CUDA devices.
+    peak_mem_mb = (
+        torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+        if device.type == "cuda" else None
+    )
+    history["epoch"]["peak_mem_mb"].append(peak_mem_mb)
 
     train_loss, train_acc = train_eval["loss"], train_eval["acc"]
     test_loss, test_acc = test_eval["loss"], test_eval["acc"]
@@ -778,10 +801,11 @@ for epoch in range(start_epoch, EPOCHS + 1):
         diag_status = "  (diag skipped)"
 
     elapsed = time.time() - t0
+    mem_str = f"{peak_mem_mb:,.0f} MB" if peak_mem_mb is not None else "n/a"
     print(
         f"{epoch:<7} {train_loss:<12.4f} {train_acc:<11.3f} "
         f"{test_loss:<11.4f} {test_acc:<11.3f} {trunc_loss:<12.4f} "
-        f"{elapsed:.1f}s{diag_status}"
+        f"{mem_str:<11} {elapsed:.1f}s{diag_status}"
     )
 
     # Checkpoints

@@ -1,8 +1,16 @@
 #!/bin/bash
 # -----------------------------------------------------------------------
-# SLURM directives — A100 (40 GB), 3 h wall time for 3 epochs on a 10%
-# subset of FashionMNIST (~6k train / 1k test), plus buffer for
-# checkpointing, dataset normalisation stats, and dependency sync.
+# SLURM directives — A100 (40 GB), 3 h wall time.
+#
+# By default this runs full_experiment.py on the FULL 60k/10k FashionMNIST
+# split (the ~13.5k default model, 3 epochs, ~1 h on A100). Any args passed
+# after the script name are forwarded verbatim to full_experiment.py, so a
+# single custom grid point can be (re-)run, e.g.:
+#   sbatch --gres=gpu:a100-80:1 scripts/run_full_experiment.sh \
+#       --target-params 128000 --scaling-knob num_heads --observables xpxsps_pnr \
+#       --run-name <name> --runs-root results/sweeps/<sweep>/ ...
+# Heavy/custom configs (many heads, larger budgets) should override
+# `--gres` (more GPU memory) and `--time` at submit, as above.
 #
 # V100 fallback: change to `--gres=gpu:nv:1` if A100 queues are
 # congested (V100 will be slower; bump --time if needed).
@@ -76,19 +84,30 @@ PYTHONPATH="$HOME/CV-Quixer${PYTHONPATH:+:$PYTHONPATH}" \
 echo ""
 echo "Starting full FashionMNIST experiment..."
 
-# To resume from a previous run, comment out the fresh-start line below and
-# uncomment the resume line, replacing the timestamp with the actual run directory.
-# Note: when resuming, re-pass the same --train-fraction/--test-fraction/--subset-seed
-# values so the loaders are rebuilt with identical subsets.
-PYTHONPATH="$HOME/CV-Quixer${PYTHONPATH:+:$PYTHONPATH}" \
-    uv run python experiments/full_experiment.py \
-        --train-fraction 0.1 --test-fraction 0.1
+# GPU utilization/memory sampling (every 30s) → slurm_logs/, cleaned up on exit.
+# Complements full_experiment.py's in-process peak-memory logging: this captures
+# the memory-over-time curve (useful for spotting an OOM climb on a single run).
+mkdir -p slurm_logs
+GPU_LOG="slurm_logs/gpu_util-${SLURM_JOB_ID:-0}.csv"
+nvidia-smi \
+    --query-gpu=timestamp,index,name,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw \
+    --format=csv -l 30 > "$GPU_LOG" &
+NVSMI_PID=$!
+trap 'kill "$NVSMI_PID" 2>/dev/null || true' EXIT
+echo "Sampling GPU utilization → $GPU_LOG"
 
-# Resume variant (continues writing into the same run directory):
-# PYTHONPATH="$HOME/CV-Quixer${PYTHONPATH:+:$PYTHONPATH}" \
-#     uv run python experiments/full_experiment.py \
-#         --train-fraction 0.1 --test-fraction 0.1 \
-#         --resume results/runs/full_fashionmnist_YYYY-MM-DD_HH-MM-SS/checkpoints/latest.pt
+# Args after the script name are forwarded to full_experiment.py (so a single
+# custom/re-run grid point can be submitted). With no args, run the full 60k/10k
+# split with default settings. To resume, pass
+# `--resume results/runs/<run>/checkpoints/latest.pt` (re-pass any
+# --train-fraction/--test-fraction/--subset-seed used originally).
+if [ "$#" -gt 0 ]; then
+    PYTHONPATH="$HOME/CV-Quixer${PYTHONPATH:+:$PYTHONPATH}" \
+        uv run python experiments/full_experiment.py "$@"
+else
+    PYTHONPATH="$HOME/CV-Quixer${PYTHONPATH:+:$PYTHONPATH}" \
+        uv run python experiments/full_experiment.py
+fi
 
 echo ""
 echo "Finished: $(date)"
