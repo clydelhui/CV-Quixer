@@ -15,8 +15,12 @@ directory:
     figures/acc_vs_trunc_lambda.png  acc vs truncation penalty weight λ
                                      (only when trunc_lambda is swept)
 
-This reads only JSON — no torch / model rebuild — so it is fast and runs on a
-partial or in-progress sweep (re-run any time to refresh).
+The cross-run aggregation reads only JSON (no torch / model rebuild), so it is
+fast and runs on a partial or in-progress sweep. By default it then also renders
+the full `report_diagnostics.py` figure suite into each run's own `figures/` dir
+(one subprocess per run; report_diagnostics' default path is npz/JSON-based, so
+heavy torch imports stay deferred). Pass --skip-per-run-figures for the fast
+cross-run-only pass.
 
 Usage:
     uv run python experiments/report_sweep.py --sweep-dir results/sweeps/<sweep>_<ts>/
@@ -27,6 +31,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import subprocess
+import sys
 import warnings
 from collections import defaultdict
 from pathlib import Path
@@ -36,6 +42,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+
+# Repo root (experiments/ -> repo root); used to invoke report_diagnostics.py.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+REPORT_DIAGNOSTICS = "experiments/report_diagnostics.py"
 
 # Columns for the summary table, in display order.
 SUMMARY_COLUMNS = [
@@ -145,29 +155,65 @@ def _aggregate_by(
     return {k: (float(np.mean(v)), float(np.std(v))) for k, v in buckets.items()}
 
 
+def _mean_value_by(
+    rows: list[dict], fields: tuple[str, ...], value_field: str
+) -> dict[tuple, float]:
+    """Mean of ``value_field`` over rows, keyed by the given meta fields.
+
+    Uses the same keying/skip rules as ``_aggregate_by`` (rows missing
+    best_test_acc or any key field drop out), so the returned map lines up
+    one-to-one with ``_aggregate_by``'s keys. Used to place points at the mean
+    *achieved* parameter count of each seed-group rather than the target budget.
+    """
+    buckets: dict[tuple, list[float]] = defaultdict(list)
+    for r in rows:
+        if r.get("best_test_acc") is None:
+            continue
+        key = tuple(r.get(f) for f in fields)
+        if any(k is None for k in key):
+            continue
+        val = r.get(value_field)
+        if val is None:
+            continue
+        buckets[key].append(float(val))
+    return {k: float(np.mean(v)) for k, v in buckets.items()}
+
+
 def plot_acc_vs_params(rows: list[dict], fig_dir: Path) -> None:
-    """Best test acc vs parameter budget, one line per (observable, scaling knob).
+    """Best test acc vs *achieved* parameter count, one line per (observable, knob).
 
     Keying by scaling_knob (not just observable) keeps multi-knob sweeps from
-    collapsing two knobs into one averaged point per budget.
+    collapsing two knobs into one averaged point per budget. Accuracy is still
+    seed-averaged within each (observable, knob, target budget) group, but each
+    point's x is the group's mean *achieved* parameter count — so two knobs that
+    overshoot the same budget differently (e.g. 13,530 vs 12,722 at a 12,800
+    target) are drawn at their true sizes rather than stacked at one x.
     """
     agg = _aggregate_by(rows, ("observables", "scaling_knob", "target_params"))
     if not agg:
         print("  (no completed runs with best_test_acc — skipping acc_vs_params)")
         return
+    x_by_key = _mean_value_by(
+        rows, ("observables", "scaling_knob", "target_params"), "achieved_params"
+    )
     series = sorted({(o, k) for (o, k, _tp) in agg})
     fig, ax = plt.subplots(figsize=(7, 4.5))
     for obs, knob in series:
+        # Sort points by achieved param count (x) for a sensible line order.
         pts = sorted(
-            (tp, m, s) for (o, k, tp), (m, s) in agg.items() if o == obs and k == knob
+            (x_by_key[(o, k, tp)], m, s)
+            for (o, k, tp), (m, s) in agg.items()
+            if o == obs and k == knob and (o, k, tp) in x_by_key
         )
+        if not pts:
+            continue
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
         es = [p[2] for p in pts]
         ax.errorbar(xs, ys, yerr=es, marker="o", capsize=3, label=f"{obs}/{knob}")
-    ax.set_xlabel("Target parameter budget")
+    ax.set_xlabel("Achieved parameter count")
     ax.set_ylabel("Best test accuracy")
-    ax.set_title("Accuracy vs parameter budget by observable / scaling knob")
+    ax.set_title("Accuracy vs achieved parameter count by observable / scaling knob")
     ax.grid(alpha=0.3)
     ax.legend(title="observable / knob")
     fig.tight_layout()
@@ -183,6 +229,11 @@ def plot_acc_by_observable(rows: list[dict], fig_dir: Path) -> None:
     if not agg:
         print("  (no completed runs with best_test_acc — skipping acc_by_observable)")
         return
+    # Achieved param count per group, annotated on each bar (the budget grouping
+    # is categorical, but a group's two knobs can have different achieved sizes).
+    achieved = _mean_value_by(
+        rows, ("observables", "scaling_knob", "target_params"), "achieved_params"
+    )
     cats = sorted({(o, k) for (o, k, _tp) in agg})
     budgets = sorted({tp for (_o, _k, tp) in agg})
     x = np.arange(len(cats))
@@ -192,14 +243,22 @@ def plot_acc_by_observable(rows: list[dict], fig_dir: Path) -> None:
     for i, tp in enumerate(budgets):
         means = [agg.get((o, k, tp), (np.nan, 0.0))[0] for (o, k) in cats]
         errs = [agg.get((o, k, tp), (np.nan, 0.0))[1] for (o, k) in cats]
-        ax.bar(x + i * width, means, width, yerr=errs, capsize=3, label=f"{tp:,}")
+        bars = ax.bar(x + i * width, means, width, yerr=errs, capsize=3, label=f"{tp:,}")
+        for (o, k), bar in zip(cats, bars):
+            n = achieved.get((o, k, tp))
+            if n is not None and not np.isnan(bar.get_height()):
+                ax.annotate(
+                    f"{int(round(n)):,}",
+                    (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                    ha="center", va="bottom", fontsize=6, rotation=90,
+                )
     ax.set_xticks(x + width * (len(budgets) - 1) / 2)
     ax.set_xticklabels([f"{o}/{k}" for (o, k) in cats], rotation=15, ha="right")
     ax.set_xlabel("Observable preset / scaling knob")
     ax.set_ylabel("Best test accuracy")
-    ax.set_title("Accuracy by observable / scaling knob")
+    ax.set_title("Accuracy by observable / scaling knob (bar labels = achieved params)")
     ax.grid(alpha=0.3, axis="y")
-    ax.legend(title="target params")
+    ax.legend(title="target param budget")
     fig.tight_layout()
     out = fig_dir / "acc_by_observable.png"
     fig.savefig(out, dpi=150)
@@ -219,6 +278,8 @@ def plot_acc_by_scaling_knob(rows: list[dict], fig_dir: Path) -> None:
     if len(knobs) < 2:
         print("  (need ≥2 scaling_knob values — skipping acc_by_scaling_knob)")
         return
+    # Achieved param count per (knob, budget), averaged over observables, for bar labels.
+    achieved = _mean_value_by(rows, ("scaling_knob", "target_params"), "achieved_params")
     budgets = sorted({tp for (_k, tp) in agg})
     x = np.arange(len(knobs))
     width = 0.8 / max(len(budgets), 1)
@@ -227,14 +288,22 @@ def plot_acc_by_scaling_knob(rows: list[dict], fig_dir: Path) -> None:
     for i, tp in enumerate(budgets):
         means = [agg.get((k, tp), (np.nan, 0.0))[0] for k in knobs]
         errs = [agg.get((k, tp), (np.nan, 0.0))[1] for k in knobs]
-        ax.bar(x + i * width, means, width, yerr=errs, capsize=3, label=f"{tp:,}")
+        bars = ax.bar(x + i * width, means, width, yerr=errs, capsize=3, label=f"{tp:,}")
+        for k, bar in zip(knobs, bars):
+            n = achieved.get((k, tp))
+            if n is not None and not np.isnan(bar.get_height()):
+                ax.annotate(
+                    f"{int(round(n)):,}",
+                    (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                    ha="center", va="bottom", fontsize=6, rotation=90,
+                )
     ax.set_xticks(x + width * (len(budgets) - 1) / 2)
     ax.set_xticklabels(knobs)
     ax.set_xlabel("Scaling knob")
     ax.set_ylabel("Best test accuracy")
-    ax.set_title("Accuracy by scaling knob (grouped by parameter budget)")
+    ax.set_title("Accuracy by scaling knob (bar labels = achieved params)")
     ax.grid(alpha=0.3, axis="y")
-    ax.legend(title="target params")
+    ax.legend(title="target param budget")
     fig.tight_layout()
     out = fig_dir / "acc_by_scaling_knob.png"
     fig.savefig(out, dpi=150)
@@ -277,11 +346,39 @@ def plot_acc_vs_trunc_lambda(rows: list[dict], fig_dir: Path) -> None:
     print(f"  ✓ {out}")
 
 
+def render_per_run_figures(sweep_dir: Path, rows: list[dict]) -> None:
+    """Render the full report_diagnostics figure suite for every run in the sweep.
+
+    One `report_diagnostics.py --run-dir <run>` subprocess per run (its default
+    path is npz/JSON-based, so heavy torch imports stay deferred). Each is wrapped
+    so one failure doesn't abort the rest.
+    """
+    print(f"\nRendering per-run figure suites for {len(rows)} run(s)...")
+    for r in rows:
+        run_dir = sweep_dir / r["run_name"]
+        if not run_dir.is_dir():
+            warnings.warn(f"run dir missing, skipping: {run_dir}", RuntimeWarning)
+            continue
+        cmd = [sys.executable, REPORT_DIAGNOSTICS, "--run-dir", str(run_dir)]
+        try:
+            subprocess.run(cmd, cwd=REPO_ROOT, check=True)
+        except subprocess.CalledProcessError as e:
+            warnings.warn(
+                f"report_diagnostics failed for {r['run_name']}: exit {e.returncode}",
+                RuntimeWarning,
+            )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--sweep-dir", type=str, required=True,
         help="sweep directory written by experiments/sweep.py",
+    )
+    parser.add_argument(
+        "--skip-per-run-figures", action="store_true",
+        help="skip rendering report_diagnostics for each run "
+             "(cross-run figures + tables only — the fast JSON-only pass)",
     )
     args = parser.parse_args()
 
@@ -309,6 +406,9 @@ def main() -> None:
             fn(rows, fig_dir)
         except Exception as e:  # one bad figure must not abort the rest
             warnings.warn(f"{fn.__name__} failed: {type(e).__name__}: {e}", RuntimeWarning)
+
+    if not args.skip_per_run_figures:
+        render_per_run_figures(sweep_dir, rows)
 
 
 if __name__ == "__main__":
