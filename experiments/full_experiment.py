@@ -65,6 +65,7 @@ from cv_quixer.config.schema import (
     ObservableSpec,
     QuantumConfig,
     TrainingConfig,
+    auto_gate_bound,
 )
 from cv_quixer.data.mnist import PatchedDataset
 from cv_quixer.evaluation.diagnostics import (
@@ -248,6 +249,16 @@ parser.add_argument(
     help=f"Fock truncation penalty weight added to the CE loss "
     f"(default TRUNC_LAMBDA={TRUNC_LAMBDA})",
 )
+parser.add_argument(
+    "--gate-param-bound",
+    type=str,
+    default=None,
+    help="soft-clip magnitude gate params (squeeze r, displacement re/im) to "
+    "(-b, b) via b*tanh(x/b), preventing the degenerate over-leakage that NaNs "
+    "heads at high num_heads. 'auto' = cutoff-aware photon budget "
+    "asinh(sqrt(cutoff-1)) (recommended); or pass an explicit float; default off. "
+    "Not checkpoint-compatible with unbounded.",
+)
 args = parser.parse_args()
 
 if args.train_fraction is not None and args.train_limit is not None:
@@ -276,6 +287,16 @@ if args.trunc_lambda is not None:
     TRUNC_LAMBDA = args.trunc_lambda
 if args.seed is not None:
     SEED = args.seed
+
+# Resolve the gate-param bound: 'auto' → cutoff-aware photon budget, else a float,
+# else None (off). Resolved to a concrete value here so config.json is reproducible.
+if args.gate_param_bound is None:
+    GATE_PARAM_BOUND = None
+elif args.gate_param_bound == "auto":
+    GATE_PARAM_BOUND = auto_gate_bound(CUTOFF_DIM)
+    print(f"gate_param_bound: {GATE_PARAM_BOUND:.4f}  (auto for cutoff_dim={CUTOFF_DIM})\n")
+else:
+    GATE_PARAM_BOUND = float(args.gate_param_bound)
 
 # Resolve the observable readout (sweep axis 2). A named preset gives a clean
 # `observables_name` for run naming / history meta; ad-hoc JSON is labelled
@@ -323,6 +344,7 @@ quantum_cfg = QuantumConfig(
     dtype="complex64",
     trunc_penalty="norm",
     trunc_lambda=TRUNC_LAMBDA,
+    gate_param_bound=GATE_PARAM_BOUND,
     target_params=TARGET_PARAMS,
     scaling_knob=SCALING_KNOB,
     readout_observables=readout_observables,

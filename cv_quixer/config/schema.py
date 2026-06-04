@@ -1,5 +1,15 @@
+import math
 from dataclasses import dataclass, field, fields
 from typing import NamedTuple, Optional, Union
+
+
+def auto_gate_bound(cutoff_dim: int) -> float:
+    """Photon-budget soft-clip bound for the magnitude gate params at a given Fock
+    cutoff. Keeps squeezed-vacuum mean photon number sinh²(r) at ~cutoff_dim-1
+    (the representable budget), which also keeps displacement under budget
+    (⟨n⟩ = 2·b² < cutoff_dim-1). ≈1.54 at cutoff 6, 1.82 at cutoff 10.
+    """
+    return math.asinh(math.sqrt(max(cutoff_dim - 1, 1)))
 
 
 @dataclass
@@ -143,6 +153,18 @@ class QuantumConfig:
 
     # Matrix polynomial degree for LCU attention (P(M) = Σ c_j M^j, j=0..d)
     poly_degree: int = 2           # keep ≤ 4; d=2 or d=3 recommended
+
+    # Soft-clip on the magnitude gate params (squeeze r, displacement re/im) via
+    # b·tanh(x/b), keeping them in (-b, b). This stops the gates from driving the
+    # state far past the Fock cutoff, where the truncated sub-isometries become
+    # numerically degenerate and NaN heads (seen at high num_heads). None = off
+    # (no clip; exact historic behaviour, checkpoint-compatible); a bounded model
+    # is NOT weight-compatible with an unbounded one. Choose b at the representable
+    # photon budget: `auto_gate_bound(cutoff_dim)` = asinh(√(cutoff-1)) ≈ 1.54 at
+    # cutoff 6 (so squeezed-vacuum ⟨n⟩ ≈ cutoff-1). Avoid large b (~4 → ⟨n⟩≈745 at
+    # cutoff 6, the degenerate regime). full_experiment.py's `--gate-param-bound
+    # auto` resolves this to a concrete float for the run's cutoff.
+    gate_param_bound: Optional[float] = None
 
     # Auto-scaling: set target_params > 0 to binary-search `scaling_knob` (an
     # integer architecture field) so the built model's trainable-param count hits

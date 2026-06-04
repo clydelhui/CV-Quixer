@@ -5,6 +5,8 @@ keep simulation time tractable. The Fock backend scales as cutoff_dim^num_modes,
 so large values make tests prohibitively slow.
 """
 
+import math
+
 import torch
 import pytest
 from unittest.mock import MagicMock, patch
@@ -1217,3 +1219,61 @@ class TestMultiLayer:
         assert offset == _op_plan_param_count(_build_op_plan(2), m, "linear")
         names = {name for name, _, _ in l2}
         assert "I0_bs_theta" in names and "L1_squeeze_r" in names
+
+
+class TestGateParamBound:
+    """Soft-clip on magnitude gate params (squeeze r, displacement re/im) keeps
+    the analytic Fock matrices from overflowing in complex64 — the cause of NaN
+    heads at high num_heads. Default (None) is off.
+    """
+
+    def _head(self, bound):
+        cfg = QuantumConfig(
+            num_modes=2, cutoff_dim=6, num_heads=1,
+            cnn_channels_1=4, cnn_channels_2=8, cnn_kernel_size=3,
+            decoder_hidden_dim=16, poly_degree=2, dtype="complex64",
+            trunc_penalty="norm", gate_param_bound=bound,
+        )
+        return HyperCVAttentionHead(patch_size=7, num_patches=16, config=cfg)
+
+    def test_default_is_off(self):
+        assert QuantumConfig(num_modes=2, cutoff_dim=4).gate_param_bound is None
+
+    def test_auto_gate_bound_matches_photon_budget(self):
+        from cv_quixer.config.schema import auto_gate_bound
+        assert auto_gate_bound(6) == pytest.approx(1.5444, abs=1e-3)
+        # squeezed-vacuum mean photon at the bound == cutoff-1 (representable budget)
+        for D in (4, 6, 10):
+            assert math.sinh(auto_gate_bound(D)) ** 2 == pytest.approx(D - 1, rel=1e-6)
+
+    def test_bound_keeps_extreme_gate_params_finite(self):
+        torch.manual_seed(0)
+        head = self._head(bound=4.0)
+        # Force the hypernetwork to emit absurd gate params (would overflow the
+        # squeeze/displacement Fock matrices in complex64 without the clip).
+        with torch.no_grad():
+            head.hypernetwork.linear.bias.fill_(200.0)
+        patches = torch.randn(16, 49)
+        readout, _, success_prob, trunc = head(patches)
+        assert torch.isfinite(readout).all()
+        assert torch.isfinite(trunc)
+        assert torch.isfinite(success_prob)
+        (readout.sum() + trunc).backward()
+        grads = [p.grad for p in head.parameters() if p.grad is not None]
+        assert grads and all(torch.isfinite(g).all() for g in grads)
+
+    def test_clip_applied_in_gate_application(self):
+        # Direct (no vmap / no post-selection): applying the per-patch unitary with
+        # large gate params, bounded vs unbounded, must give DIFFERENT states (so
+        # the clip is wired in, not a no-op) while the bounded one stays finite.
+        head_b = self._head(bound=2.0)
+        head_n = self._head(bound=None)
+        D, m = 6, 2
+        dev, dt = torch.device("cpu"), head_b.torch_dtype
+        gp = _op_plan_param_count(_build_op_plan(head_b.num_layers), m, "linear")
+        params = torch.full((gp,), 8.0)          # squeeze/disp ~8 >> bound 2
+        vac = FockState.vacuum(m, D, dev, dt)
+        sb = head_b._apply_patch_gates_to_state(params, vac, dev, dt)
+        sn = head_n._apply_patch_gates_to_state(params, vac, dev, dt)
+        assert torch.isfinite(sb.data).all()
+        assert not torch.allclose(sb.data, sn.data)

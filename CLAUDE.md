@@ -504,6 +504,7 @@ hard-wired to `num_modes`. See `QuantumConfig.readout_observables` /
 | `scaling_knob` | `"num_heads"` | Integer QuantumConfig field auto-scaled toward `target_params` (e.g. `num_heads`, `cnn_channels_2`, `num_modes`, `num_layers` — all monotonic in param count). `num_heads` is the default (robust across budgets; `cnn_channels_2` accuracy degrades with scale) |
 | `trunc_penalty` | `"none"` | `"none"`, `"norm"`, or `"photon_number"` |
 | `trunc_lambda` | 0.01 | Truncation penalty loss weight |
+| `gate_param_bound` | `None` | Soft-clip magnitude gate params (squeeze r, displacement re/im) to `(-b, b)` via `b·tanh(x/b)` — stops gates driving the state far past the cutoff (the NaN-head cause at high `num_heads`). `None` = off (not checkpoint-compatible with a bounded model). `full_experiment.py --gate-param-bound auto` → `auto_gate_bound(cutoff)=asinh(√(cutoff-1))` (the representable photon budget; ≈1.54 at cutoff 6). Avoid large b (~4 → ⟨n⟩≈745, the degenerate regime). |
 | `readout_observable` | `None` | Legacy single-string selector: `"quadrature_x"`, `"photon_number"`, or `"pnr_distribution"`. Mutually exclusive with `readout_observables` |
 | `readout_observables` | `None` | Canonical `list[ObservableSpec]`. Mutually exclusive with `readout_observable`. Both `None` → default ⟨x̂⟩ per mode |
 

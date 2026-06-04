@@ -138,6 +138,13 @@ _GATE_SEQUENCE: tuple[GateOp, ...] = (
     GateOp("kerr",    ("kappa",),       "mode", _apply_kerr),
 )
 
+# Gate params whose MAGNITUDE can overflow the analytic Fock matrices in
+# complex64 (squeeze r → cosh/sinh r; displacement re/im → exp(-|α|²/2)·αⁿ → 0·∞).
+# When QuantumConfig.gate_param_bound is set, these are soft-clipped to (-b, b);
+# angles (phi, theta) are periodic and Kerr kappa is a diagonal phase, so neither
+# overflows and both are left untouched. See `_apply_patch_gates_to_state`.
+_BOUNDED_GATE_PARAMS: frozenset[str] = frozenset({"r", "re", "im"})
+
 
 # Interferometer inserted *between* consecutive layers when num_layers > 1: a
 # beamsplitter column + per-mode rotation (the same `bs`/`rot` ops the in-layer
@@ -554,6 +561,11 @@ class _CVHeadBase(nn.Module):
         self.num_layers = config.num_layers
         self._op_plan = _build_op_plan(config.num_layers)
 
+        # Optional soft-clip on magnitude gate params (overflow guard). Trace-time
+        # constant (plain float / None), so the branch in _apply_patch_gates_to_state
+        # resolves once under vmap.
+        self._gate_bound = config.gate_param_bound
+
         self.lcu_coeffs = LCUSumCoefficients(num_patches)
         self.poly_coeffs = PolynomialCoefficients(config.poly_degree)
         self.circuit = CVCircuit(config.num_modes, config.cutoff_dim)
@@ -624,6 +636,14 @@ class _CVHeadBase(nn.Module):
                 idx += n_sites
             for site_idx, site in enumerate(sites):
                 slc = {p: param_vectors[p][site_idx] for p in op.param_names}
+                # Soft-clip magnitude params to (-b, b) so squeeze/displacement
+                # can't overflow the Fock matrices: b·tanh(x/b) (≈ x near 0, slope 1
+                # at 0). Off when gate_param_bound is None (trace-time constant).
+                if self._gate_bound is not None:
+                    b = self._gate_bound
+                    for p in op.param_names:
+                        if p in _BOUNDED_GATE_PARAMS:
+                            slc[p] = b * torch.tanh(slc[p] / b)
                 state = op.apply(self.circuit, state, slc, site, D, device, dtype)
 
         return state
