@@ -111,7 +111,14 @@ def load_rows(sweep_dir: Path, eval_name: str) -> tuple[list[dict], list[str]]:
                 "n_samples": pc.get("n_samples"),
                 "elapsed_sec": pc.get("elapsed_sec"),
             })
-        sub_run_dirs.extend(res.get("sub_run_dirs", []))
+        # Derive the per-cutoff D{NN}/ dirs from the LOCAL filesystem rather than
+        # trusting results.json's `sub_run_dirs` — those are absolute paths baked
+        # at eval time (e.g. cluster paths), which break after the run is rsynced
+        # to another machine. The local eval dir is right here next to results.json.
+        local_eval_dir = run_dir / "eval" / eval_name
+        sub_run_dirs.extend(
+            str(p) for p in sorted(local_eval_dir.glob("D*")) if p.is_dir()
+        )
     if not rows:
         warnings.warn(
             f"No results.json found under {sweep_dir}/*/eval/{eval_name}/ — "
