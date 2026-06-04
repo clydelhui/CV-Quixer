@@ -103,6 +103,8 @@ def build_manifest(args: argparse.Namespace) -> dict:
         common += ["--train-fraction", str(args.train_fraction)]
     if args.test_fraction is not None:
         common += ["--test-fraction", str(args.test_fraction)]
+    if args.gate_param_bound is not None:
+        common += ["--gate-param-bound", str(args.gate_param_bound)]
     if args.wandb:
         common += ["--wandb", "--wandb-group", f"{args.sweep_name}_{timestamp}"]
 
@@ -242,6 +244,12 @@ def main() -> None:
     parser.add_argument(
         "--subset-seed", type=int, default=42,
         help="data-subset seed shared by every run (apples-to-apples)",
+    )
+    parser.add_argument(
+        "--gate-param-bound", type=str, default=None,
+        help="forwarded to every run's full_experiment.py: soft-clip the magnitude "
+        "gate params ('auto' = cutoff-aware photon budget, or a float). Off by "
+        "default. A fixed setting, not a grid axis.",
     )
     # --- orchestration ----------------------------------------------------
     parser.add_argument("--sweep-name", type=str, default="sweep")
