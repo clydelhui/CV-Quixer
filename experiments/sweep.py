@@ -58,32 +58,56 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 FULL_EXPERIMENT = "experiments/full_experiment.py"
 RUN_SWEEP_SH = "scripts/run_sweep.sh"
 
+# Manual architecture axes: directly-set QuantumConfig knobs (no auto-scaling).
+# Each tuple is (dest, full_experiment_flag, run_name_marker, help). `dest` is the
+# argparse destination (matches full_experiment.py's flag), `marker` keeps run
+# directory names short + collision-free. These coexist with the budget axes
+# (--target-params/--scaling-knob); the chosen scaling_knob is still auto-scaled.
+ARCH_AXES: tuple[tuple[str, str, str, str], ...] = (
+    ("num_heads", "--num-heads", "nh", "parallel CV attention heads"),
+    ("num_modes", "--num-modes", "nm", "bosonic modes"),
+    ("cutoff_dim", "--cutoff-dim", "cd", "Fock cutoff D"),
+    ("poly_degree", "--poly-degree", "pd", "matrix polynomial degree d"),
+    ("cnn_channels_1", "--cnn-channels-1", "c1", "first conv output channels"),
+    ("cnn_channels_2", "--cnn-channels-2", "c2", "second conv output channels"),
+    ("cnn_kernel_size", "--cnn-kernel-size", "ck", "conv kernel size"),
+    ("decoder_hidden_dim", "--decoder-hidden-dim", "dh", "decoder MLP hidden width"),
+    ("cnn_num_conv_layers", "--cnn-num-conv-layers", "ncl", "total CNN conv layers"),
+    ("hypernet_num_linear_layers", "--hypernet-num-linear-layers", "hll",
+     "total hypernet DNN linear layers"),
+    ("decoder_num_layers", "--decoder-num-layers", "dnl", "total decoder linear layers"),
+    ("cvqnn_num_layers", "--cvqnn-num-layers", "cw", "CVQNN block W depth L_W (0 = no W)"),
+)
 
-def _run_name(
-    target_params: int,
-    observables: str,
-    seed: int,
-    num_layers: int,
-    scaling_knob: str,
-    trunc_lambda: float | None,
-) -> str:
-    """Encode a grid point as a filesystem-safe run-directory name.
 
-    The ``__knob-{knob}`` marker is omitted for the historic default
-    ``cnn_channels_2`` and the ``__L{n}`` suffix is omitted at ``num_layers == 1``,
-    so single-knob / single-layer sweeps keep their historic run-directory names
-    while multi-knob grids stay collision-free. A ``__tl{λ}`` marker is appended
-    only when ``trunc_lambda`` is explicitly swept (``None`` ⇒ inherit
-    full_experiment.py's default, no marker).
+def _run_name(point: dict) -> str:
+    """Encode a grid point (a dict of axis→value) as a filesystem-safe run name.
+
+    Budget mode (``target_params`` set) keeps its historic base ``p{tp}__obs-…``
+    plus the ``__knob-{knob}`` marker (omitted for the historic ``cnn_channels_2``);
+    manual mode (``target_params`` is ``None``) uses a ``manual__obs-…`` base. The
+    ``__L{n}`` / ``__tl{λ}`` markers and one short marker per active manual arch
+    axis (e.g. ``__nh6``) are appended only when that axis is set, so single-axis
+    sweeps keep short names and multi-axis grids stay collision-free.
     """
-    base = f"p{target_params}__obs-{observables}"
-    if scaling_knob != "cnn_channels_2":
-        base += f"__knob-{scaling_knob}"
-    base += f"__seed{seed}"
-    if num_layers != 1:
-        base += f"__L{num_layers}"
-    if trunc_lambda is not None:
-        base += f"__tl{trunc_lambda}"
+    tp = point["target_params"]
+    obs = point["observables"]
+    if tp is not None:
+        base = f"p{tp}__obs-{obs}"
+        if point["scaling_knob"] != "cnn_channels_2":
+            base += f"__knob-{point['scaling_knob']}"
+    else:
+        base = f"manual__obs-{obs}"
+    base += f"__seed{point['seed']}"
+    if point["num_layers"] != 1:
+        base += f"__L{point['num_layers']}"
+    if point["trunc_lambda"] is not None:
+        base += f"__tl{point['trunc_lambda']}"
+    if point.get("decoder_hidden_mult") is not None:
+        base += f"__dhm{point['decoder_hidden_mult']}"
+    for dest, _flag, marker, _help in ARCH_AXES:
+        if point.get(dest) is not None:
+            base += f"__{marker}{point[dest]}"
     return base
 
 
@@ -108,56 +132,75 @@ def build_manifest(args: argparse.Namespace) -> dict:
     if args.wandb:
         common += ["--wandb", "--wandb-group", f"{args.sweep_name}_{timestamp}"]
 
-    # trunc_lambda is an optional axis: when not given, iterate a single None so
-    # the flag is omitted and behaviour is byte-identical to a no-axis sweep.
+    # Optional axes iterate a single None when not given, so the corresponding
+    # flag is omitted and behaviour is byte-identical to a no-axis sweep.
+    #   - budget mode: target_params + scaling_knob are set (auto-scaling).
+    #   - manual mode: target_params is None ⇒ no --target-params/--scaling-knob.
+    target_params = args.target_params if args.target_params else [None]
+    scaling_knobs = args.scaling_knob if args.scaling_knob else [None]
     trunc_lambdas = args.trunc_lambda if args.trunc_lambda else [None]
+    # decoder_hidden_mult is a float axis (like trunc_lambda), not an int ARCH_AXES.
+    decoder_hidden_mults = args.decoder_hidden_mult if args.decoder_hidden_mult else [None]
+    arch_values = {dest: (getattr(args, dest) or [None]) for dest, *_ in ARCH_AXES}
+
+    # Ordered axis names + their value-lists for one flat Cartesian product.
+    axis_names = (
+        ["target_params", "observables", "seed", "num_layers", "scaling_knob",
+         "trunc_lambda", "decoder_hidden_mult"]
+        + [dest for dest, *_ in ARCH_AXES]
+    )
+    axis_value_lists = (
+        [target_params, args.observables, args.seeds, args.num_layers,
+         scaling_knobs, trunc_lambdas, decoder_hidden_mults]
+        + [arch_values[dest] for dest, *_ in ARCH_AXES]
+    )
 
     runs: list[dict] = []
-    for idx, (tp, obs, seed, n_layers, knob, tl) in enumerate(
-        itertools.product(
-            args.target_params, args.observables, args.seeds,
-            args.num_layers, args.scaling_knob, trunc_lambdas,
-        )
-    ):
-        run_name = _run_name(tp, obs, seed, n_layers, knob, tl)
+    for idx, combo in enumerate(itertools.product(*axis_value_lists)):
+        point = dict(zip(axis_names, combo))
+        run_name = _run_name(point)
         run_args = [
-            "--target-params", str(tp),
-            "--observables", obs,
-            "--seed", str(seed),
-            "--num-layers", str(n_layers),
-            "--scaling-knob", knob,
+            "--observables", point["observables"],
+            "--seed", str(point["seed"]),
+            "--num-layers", str(point["num_layers"]),
             "--run-name", run_name,
             *common,
         ]
-        if tl is not None:
-            run_args += ["--trunc-lambda", str(tl)]
-        runs.append(
-            {
-                "index": idx,
-                "run_name": run_name,
-                "target_params": tp,
-                "observables": obs,
-                "seed": seed,
-                "num_layers": n_layers,
-                "scaling_knob": knob,
-                "trunc_lambda": tl,
-                "args": run_args,
-            }
-        )
+        # Budget mode: emit --target-params + --scaling-knob (auto-scaling).
+        if point["target_params"] is not None:
+            run_args = (
+                ["--target-params", str(point["target_params"]),
+                 "--scaling-knob", point["scaling_knob"]]
+                + run_args
+            )
+        if point["trunc_lambda"] is not None:
+            run_args += ["--trunc-lambda", str(point["trunc_lambda"])]
+        if point["decoder_hidden_mult"] is not None:
+            run_args += ["--decoder-hidden-mult", str(point["decoder_hidden_mult"])]
+        # Manual arch axes: emit each set field directly.
+        for dest, flag, _marker, _help in ARCH_AXES:
+            if point[dest] is not None:
+                run_args += [flag, str(point[dest])]
+        runs.append({"index": idx, "run_name": run_name, **point, "args": run_args})
+
+    axes = {
+        "target_params": list(args.target_params or []),
+        "observables": list(args.observables),
+        "seeds": list(args.seeds),
+        "num_layers": list(args.num_layers),
+        "scaling_knob": list(args.scaling_knob or []),
+        "trunc_lambda": list(args.trunc_lambda or []),
+        "decoder_hidden_mult": list(args.decoder_hidden_mult or []),
+    }
+    for dest, *_ in ARCH_AXES:
+        axes[dest] = list(getattr(args, dest) or [])
 
     return {
         "sweep_name": args.sweep_name,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "sweeps_root": str(args.sweeps_root),
         "sweep_dir": str(sweep_dir),
-        "axes": {
-            "target_params": list(args.target_params),
-            "observables": list(args.observables),
-            "seeds": list(args.seeds),
-            "num_layers": list(args.num_layers),
-            "scaling_knob": list(args.scaling_knob),
-            "trunc_lambda": list(args.trunc_lambda or []),
-        },
+        "axes": axes,
         "common_args": common,
         "n_runs": len(runs),
         "runs": runs,
@@ -200,9 +243,14 @@ def main() -> None:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     # --- grid axes --------------------------------------------------------
+    # Two modes (combinable per-run for fixed-field budget sweeps):
+    #   budget — --target-params [+ --scaling-knob] auto-scales a knob to a budget.
+    #   manual — set architecture knobs directly (the ARCH_AXES below); no scaling.
+    # At least one of {--target-params, an ARCH_AXES flag} is required.
     parser.add_argument(
-        "--target-params", type=int, nargs="+", required=True,
-        help="one or more parameter budgets (auto-scales cnn_channels_2 per run)",
+        "--target-params", type=int, nargs="+", default=None,
+        help="budget mode: one or more parameter budgets (auto-scales --scaling-knob "
+        "per run). Omit for a manual sweep that sets architecture knobs directly.",
     )
     parser.add_argument(
         "--observables", type=str, nargs="+", default=["xpxsps"],
@@ -219,18 +267,30 @@ def main() -> None:
         "a stacked gate sequence + a BS→Rot interferometer",
     )
     parser.add_argument(
-        "--scaling-knob", type=str, nargs="+", required=True,
-        help="REQUIRED: one or more QuantumConfig fields to auto-scale toward "
-        "each --target-params (grid axis; forwarded to full_experiment.py per "
-        "run). No default — pass it explicitly so the budget knob is never "
-        "silently chosen. Use num_heads for quantum / quantum_shared width, "
-        "cnn_channels_2 for the CNN-width knob.",
+        "--scaling-knob", type=str, nargs="+", default=None,
+        help="budget mode only: one or more QuantumConfig fields to auto-scale "
+        "toward each --target-params (grid axis). Required when --target-params is "
+        "given (no silent default). Use num_heads for quantum / quantum_shared "
+        "width, cnn_channels_2 for the CNN-width knob.",
     )
     parser.add_argument(
         "--trunc-lambda", type=float, nargs="+", default=None,
         help="one or more Fock truncation penalty weights (grid axis). Omit to "
         "inherit full_experiment.py's default (no extra runs, no name marker).",
     )
+    parser.add_argument(
+        "--decoder-hidden-mult", type=float, nargs="+", default=None,
+        help="manual grid axis: one or more decoder-hidden-dim multipliers c "
+        "(decoder_hidden_dim = round(c * decoder_in_dim)). Mutually exclusive with "
+        "the --decoder-hidden-dim axis.",
+    )
+    # Manual architecture axes (no auto-scaling). Each is nargs='+', default None
+    # ⇒ inherit full_experiment.py's value (single 'inherit' point, no name marker).
+    for dest, flag, _marker, helptxt in ARCH_AXES:
+        parser.add_argument(
+            flag, type=int, nargs="+", default=None,
+            help=f"manual grid axis: {helptxt} (forwarded to full_experiment.py)",
+        )
     # --- shared run settings (identical across the grid) ------------------
     parser.add_argument(
         "--model", type=str, default="quantum",
@@ -269,6 +329,28 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Require at least one budget axis or one manual arch axis, so a sweep can
+    # never be silently empty / under-specified. decoder_hidden_mult is a manual
+    # axis too.
+    any_arch_axis = (
+        any(getattr(args, dest) for dest, *_ in ARCH_AXES)
+        or bool(args.decoder_hidden_mult)
+    )
+    if not args.target_params and not any_arch_axis:
+        parser.error(
+            "specify either --target-params (budget mode) or at least one manual "
+            "architecture axis (e.g. --num-heads / --num-modes / --poly-degree)."
+        )
+    if args.decoder_hidden_dim and args.decoder_hidden_mult:
+        parser.error(
+            "--decoder-hidden-dim and --decoder-hidden-mult are mutually exclusive."
+        )
+    # The budget knob must be explicit whenever a budget is given.
+    if args.target_params and not args.scaling_knob:
+        parser.error("--scaling-knob is required when --target-params is given.")
+    if args.scaling_knob and not args.target_params:
+        parser.error("--scaling-knob is only valid together with --target-params.")
+
     launch = "none" if args.dry_run else args.launch
 
     manifest = build_manifest(args)
@@ -285,6 +367,11 @@ def main() -> None:
     print(f"  num_layers:    {manifest['axes']['num_layers']}")
     print(f"  scaling_knob:  {manifest['axes']['scaling_knob']}")
     print(f"  trunc_lambda:  {manifest['axes']['trunc_lambda']}")
+    if manifest["axes"].get("decoder_hidden_mult"):
+        print(f"  decoder_hidden_mult: {manifest['axes']['decoder_hidden_mult']}")
+    for dest, *_ in ARCH_AXES:
+        if manifest["axes"].get(dest):
+            print(f"  {dest}:{' ' * max(1, 13 - len(dest))}{manifest['axes'][dest]}")
     print(f"  manifest:      {manifest_path}")
     for run in manifest["runs"]:
         print(f"    [{run['index']}] {run['run_name']}")

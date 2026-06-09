@@ -49,13 +49,19 @@ uv run python experiments/full_experiment.py \
     --epochs 1 --train-fraction 0.1 --test-fraction 0.1 \
     --target-params 8000 --observables xp
 
-# Hyperparameter sweep: grid over param budgets × observable presets (× seeds).
-# --dry-run writes the manifest only; --launch local runs sequentially here;
-# --launch slurm submits a job array (see scripts/run_sweep.sh).
-# --scaling-knob is REQUIRED (no default — pass it explicitly per sweep).
+# Hyperparameter sweep — two modes. --dry-run writes the manifest only;
+# --launch local runs sequentially here; --launch slurm submits a job array.
+# BUDGET mode: grid over param budgets × observables (× seeds). --scaling-knob is
+# required here (no default — name the budget knob explicitly).
 uv run python experiments/sweep.py \
     --target-params 8000 13760 20000 --observables x xpxsps pnr \
     --scaling-knob num_heads \
+    --epochs 3 --train-fraction 0.1 --test-fraction 0.1 --dry-run
+
+# MANUAL mode: set architecture knobs directly as grid axes (no auto-scaling).
+# At least one budget or manual axis is required; the two modes can coexist.
+uv run python experiments/sweep.py \
+    --num-heads 4 6 --num-modes 2 3 --decoder-num-layers 2 3 --observables xpxsps \
     --epochs 3 --train-fraction 0.1 --test-fraction 0.1 --dry-run
 
 # Aggregate a finished/partial sweep into a thesis table + comparison plots
@@ -133,8 +139,9 @@ failed figure warns but does not abort the rest; `sanity_checks` runs first):
 
 #### Hyperparameter sweeps
 
-Two sweep axes are exposed on `full_experiment.py` directly (defaults preserve
-the canonical single-run behaviour exactly):
+Sweep axes are exposed on `full_experiment.py` directly — the budget axes
+(`--target-params`/`--scaling-knob`) and every architecture knob as a direct flag
+(manual mode). Defaults preserve the canonical single-run behaviour exactly:
 
 | Flag | Default | Effect |
 |---|---|---|
@@ -144,6 +151,8 @@ the canonical single-run behaviour exactly):
 | `--observables NAME` | `xpxsps` | named observable preset (see below) |
 | `--observables-json STR` | — | ad-hoc `ObservableSpec` JSON; requires `--run-name` |
 | `--seed N` | 42 | training seed (vary for repeats / error bars) |
+| direct arch flags | frozen-model values | `--num-modes`, `--cutoff-dim`, `--num-heads`, `--cnn-channels-1/-2`, `--cnn-kernel-size`, `--decoder-hidden-dim`, `--poly-degree`, `--cnn-num-conv-layers`, `--hypernet-num-linear-layers`, `--decoder-num-layers` — set any QuantumConfig knob directly (manual mode, no auto-scaling). Honoured even with `--target-params` set, except the chosen `--scaling-knob`. `--cutoff-dim` also resizes the `pnr`/`xpxsps_pnr` plans + the `auto` gate bound |
+| `--decoder-hidden-mult C` | off | size the decoder hidden width as `round(C × in_dim)` instead of a fixed value (see `decoder_hidden_mult`). Mutually exclusive with `--decoder-hidden-dim` |
 | `--run-name STR` | `full_fashionmnist_<ts>` | run-dir name |
 | `--runs-root PATH` | `results/runs` | parent dir (sweeps pass `results/sweeps/<sweep>`) |
 | `--wandb` / `--wandb-group` / `--wandb-tags` | off | W&B logging (see below) |
@@ -157,16 +166,30 @@ resolving limit, `PNR_MAX_PHOTON`), `xpxsps_pnr` (xpxsps + pnr combined →
 targets the *total* count, the observable choice barely shifts the budget — the
 two axes are cleanly separable.
 
-`experiments/sweep.py` fans a Cartesian grid (`--target-params … --observables …
---seeds … --num-layers … --scaling-knob …`) into independent `full_experiment.py`
-runs, one process per grid point. `--scaling-knob` is **required** (no default —
-every sweep must name the budget knob explicitly, e.g. `num_heads` for
-quantum / quantum_shared width). It writes
-`results/sweeps/<sweep_name>_<ts>/sweep_manifest.json`
-and per-run sub-dirs named `p{params}__obs-{preset}__seed{seed}` (with a
-`__knob-{knob}` marker when the knob isn't the historic `cnn_channels_2`, and a
-`__L{n}` suffix when `num_layers > 1`; each a full run dir). All
-runs share `--subset-seed` + fractions so they see the identical data subset.
+`experiments/sweep.py` fans a Cartesian grid into independent `full_experiment.py`
+runs, one process per grid point, in **two combinable modes**:
+
+- **Budget mode** — `--target-params … --scaling-knob …` (+ `--observables`,
+  `--seeds`, `--num-layers`): each run auto-scales the named knob to a param
+  budget. `--scaling-knob` is **required when `--target-params` is given** (no
+  default — name the budget knob explicitly). Run dirs are named
+  `p{params}__obs-{preset}__seed{seed}` (`__knob-{knob}` marker unless the historic
+  `cnn_channels_2`; `__L{n}` when `num_layers > 1`).
+- **Manual mode** — set architecture knobs **directly** as grid axes (no
+  auto-scaling): `--num-heads`, `--num-modes`, `--cutoff-dim`, `--poly-degree`,
+  `--cnn-channels-1`, `--cnn-channels-2`, `--cnn-kernel-size`,
+  `--decoder-hidden-dim`, `--cnn-num-conv-layers`, `--hypernet-num-linear-layers`,
+  `--decoder-num-layers`, `--decoder-hidden-mult` (each `nargs='+'`; the same flags
+  exist on `full_experiment.py` for single runs; `--decoder-hidden-mult` is
+  mutually exclusive with `--decoder-hidden-dim`). Run dirs are named
+  `manual__obs-{preset}__seed{seed}` plus a short marker per active axis
+  (`__nh6`, `__nm3`, `__pd2`, `__ncl3`, `__hll2`, `__dnl3`, `__dhm1.0`, …).
+
+At least one of `--target-params` or a manual axis is required; they can coexist
+(fix some fields manually while auto-scaling one knob). It writes
+`results/sweeps/<sweep_name>_<ts>/sweep_manifest.json` and per-run sub-dirs (each a
+full run dir). All runs share `--subset-seed` + fractions so they see the identical
+data subset.
 `--launch local` runs them sequentially; `--launch slurm` submits
 `scripts/run_sweep.sh` as a job array (`#SBATCH --array`, one task per grid
 point; the per-arch CUDA venv is auto-built once via `scripts/setup_cuda_env.sh`'s
@@ -174,9 +197,12 @@ flock — no manual pre-build); `--dry-run` writes the manifest only.
 
 `experiments/report_sweep.py --sweep-dir <dir>` scans the sweep (JSON only — no
 torch), emitting `summary.csv` + `summary.md` (one row/run: target/achieved
-params, observable preset, best/final acc, runtime) and `figures/acc_vs_params.png`
-+ `figures/acc_by_observable.png` (cross-run figures plot the *achieved* param
-count). It then **also renders the full `report_diagnostics.py` figure suite for
+params, observable preset, the resolved architecture knobs, best/final acc,
+runtime) and `figures/acc_vs_params.png` + `figures/acc_by_observable.png`
+(cross-run figures plot the *achieved* param count), plus one
+`figures/acc_vs_<field>.png` per architecture field that *varies* across the runs
+(the manual-sweep figure — e.g. `acc_vs_num_heads.png`; absent fields / constant
+fields are skipped). It then **also renders the full `report_diagnostics.py` figure suite for
 every run by default** (one subprocess per run; `report_diagnostics`'s default
 path is npz/JSON-based, so heavy torch imports stay deferred); pass
 `--skip-per-run-figures` for the fast cross-run-only pass.
@@ -374,7 +400,8 @@ experiments/
 ├── report_sweep.py        Cross-run sweep table (summary.csv/md) + plots + per-run diagnostics
 ├── report_sweep_compare.py  Overlay ≥2 sweeps (e.g. quantum vs quantum_shared) → combined table + cross-sweep figures
 ├── report_cutoff_sweep.py Cross-run cutoff table + figures/cutoff/ + per-cutoff diagnostics
-└── report_diagnostics.py  All figures (training curves + diagnostics) from a full_experiment run
+├── report_diagnostics.py  All figures (training curves + diagnostics) from a full_experiment run
+└── migrate_add_cvqnn_field.py  One-shot: bake cvqnn_num_layers=0 into pre-W run config.json (so old checkpoints reload as pre-W models)
 
 scripts/
 ├── run_mini_experiment.sh        SLURM batch job for mini_experiment
@@ -412,6 +439,12 @@ HyperCVAttention  (num_heads independent heads, batched with vmap):
         Apply depth-L unitary U_i (L stacked layers, L−1 interferometers between):
           [ Squeeze(r,φ) → Beamsplitter mesh(θ,φ) → Rotate(φ) → Displace(α) → Kerr(κ) ]   ×L
           interleaved with  [ Beamsplitter mesh(θ,φ) → Rotate(φ) ]   ×(L−1)
+    post-select renorm: |ψ⟩ ← P(M)|ψ⟩ / ‖P(M)|ψ⟩‖       # heralded QSVT output
+    CVQNN block W:  |ψ⟩ ← W|ψ⟩ / ‖W|ψ⟩‖                   # fixed per-head Killoran circuit
+      # W = [ Beamsplitter(θ,φ) → Rotate(φ) → Squeeze(r,φ) → Beamsplitter(θ,φ)
+      #       → Rotate(φ) → Displace(α) → Kerr(κ) ] × L_W   (canonical 2-interferometer form)
+      # owned nn.Parameters (input-independent), small-random init (W≈I); L_W=0 ⇒ no W
+      # leakage 1−‖W|ψ⟩‖² tracked separately and penalised by cvqnn_trunc_lambda
     readout ← configurable observables per `readout_observables`     # (R,)
              # each spec → x | p | x² | p² | n | prob_n on mode(s)
              # default (no config): ⟨x̂⟩ per mode → R = num_modes
@@ -454,10 +487,23 @@ hard-wired to `num_modes`. See `QuantumConfig.readout_observables` /
 - **Config system**: Experiment scripts construct the `ExperimentConfig`
   dataclasses directly in Python (no YAML at runtime). `full_experiment.py`
   writes the fully resolved config to `config.json` in its run directory;
-  `eval_cutoff_sweep.py` and `report_diagnostics.py` reconstruct
-  `ExperimentConfig` from that saved `config.json` via `dacite`. The
-  `load_config()` YAML loader and `configs/*.yaml` are kept but currently
-  unused (intended for a future revival of YAML-driven runs).
+  `eval_cutoff_sweep.py`, `report_diagnostics.py`, and `backfill_artefacts.py`
+  reconstruct `ExperimentConfig` from that saved `config.json` via the shared
+  `config.utils.experiment_config_from_dict()` helper (dacite + the CVQNN guard
+  below). The `load_config()` YAML loader and `configs/*.yaml` are kept but
+  currently unused (intended for a future revival of YAML-driven runs).
+- **CVQNN block W + pre-W migration**: the canonical model now applies a fixed
+  per-head Killoran circuit `W` to the post-polynomial state before readout
+  (`cvqnn_num_layers=1` default; see `QuantumConfig` reference and ADR-0001).
+  This is **checkpoint-incompatible with pre-W runs** when `W` is on; the frozen
+  13,530-param baseline is retired (re-run to re-establish numbers with `W`).
+  `cvqnn_num_layers=0` reproduces the pre-W model exactly (byte-identical
+  state_dict). Old runs load via a one-shot **migration** that bakes
+  `cvqnn_num_layers: 0` / `cvqnn_trunc_lambda: 0.0` into their `config.json`:
+  `uv run python experiments/migrate_add_cvqnn_field.py --runs-root results/`.
+  `experiment_config_from_dict()` carries a **loud guard** that *raises* (with a
+  hint to run the migration) on an un-migrated config rather than silently
+  defaulting `W` on — deliberately no silent "absence means 0" shim.
 - **Pure PyTorch simulation**: `cv_quixer/quantum/` is a standalone Fock-basis circuit
   simulator. Gaussian gates (rotation, displacement, squeezing, beamsplitter) use exact
   analytic Fock-basis formulas (true sub-isometries: column norms ≤ 1); only cubic phase
@@ -496,12 +542,18 @@ hard-wired to `num_modes`. See `QuantumConfig.readout_observables` /
 | `dtype` | `"complex128"` | `"complex64"` or `"complex128"` |
 | `num_heads` | 4 | Parallel CV attention heads |
 | `decoder_hidden_dim` | 64 | CVDecoder hidden layer width |
+| `decoder_hidden_mult` | `None` | If set (float > 0), size the decoder hidden width relative to its input: `decoder_hidden_dim = max(1, round(mult × in_dim))`, `in_dim = num_heads × readout_width`. Resolved in the model `__init__` after any `target_params` num_heads scaling (idempotent on reload); overrides `decoder_hidden_dim`. `None` = off |
 | `cnn_channels_1` | 8 | CNNHypernetwork first conv output channels |
 | `cnn_channels_2` | 16 | CNNHypernetwork second conv output channels (a valid `scaling_knob`, but `num_heads` is the default) |
 | `cnn_kernel_size` | 3 | Conv kernel size |
+| `cnn_num_conv_layers` | 2 | Total conv layers in the CNN stack. 2 = historic `conv1→conv2`; >2 appends `(n−2)` same-padding `C2→C2` convs (preserve `h_out`/`feature_dim`). Additive (empty `ModuleList` at 2 ⇒ unchanged state-dict keys). A valid `scaling_knob` |
+| `hypernet_num_linear_layers` | 1 | Total Linear layers in the hypernet DNN (after the 2D-PE add). 1 = historic single `feature_dim→gate_params`; >1 prepends `(n−1)` `feature_dim→feature_dim` Tanh blocks. Additive (empty at 1 ⇒ unchanged keys). A valid `scaling_knob` |
+| `decoder_num_layers` | 2 | Total Linear layers in the CVDecoder MLP. 2 = historic `Linear→ReLU→Linear` (keys `net.0`/`net.2`); >2 inserts `(n−2)` `h→h` ReLU blocks. A valid `scaling_knob` |
 | `poly_degree` | 2 | Matrix polynomial degree (keep ≤ 4) |
+| `cvqnn_num_layers` | 1 | CVQNN block W depth L_W: a fixed, per-head, trainable Killoran circuit applied to the post-polynomial (post-selected) state before readout. Each layer is the canonical two-interferometer form `(BS→R)→S→(BS→R)→D→K` (the per-patch `U_i` drops the leading interferometer, trivial on its vacuum input). Owned `nn.Parameter`s, small-random init (W≈I). **`0` disables W** → state_dict byte-identical to a pre-W model (ablation / checkpoint-compat baseline). A valid `scaling_knob` but too coarse for budget targeting |
+| `cvqnn_trunc_lambda` | 0.01 | Weight of the **separate** W truncation penalty `1 − ‖W|ψ⟩‖²` added to the training loss (independent of `trunc_lambda`/`trunc_penalty` — W's single-block leakage compounds far less than the per-patch penalty does through the polynomial powers, hence a lighter default). Free to compute (it is the norm used for the post-W renorm). `0` → tracked but not penalised |
 | `target_params` | -1 | If > 0, binary-search the configured `scaling_knob` (build-and-count) to hit this count (warns if the closest achievable is >10% off — `tol=0.10` in `utils/params.py`) |
-| `scaling_knob` | `"num_heads"` | Integer QuantumConfig field auto-scaled toward `target_params` (e.g. `num_heads`, `cnn_channels_2`, `num_modes`, `num_layers` — all monotonic in param count). `num_heads` is the default (robust across budgets; `cnn_channels_2` accuracy degrades with scale) |
+| `scaling_knob` | `"num_heads"` | Integer QuantumConfig field auto-scaled toward `target_params` (e.g. `num_heads`, `cnn_channels_2`, `num_modes`, `num_layers`, the three depth fields above — all monotonic in param count). `num_heads` is the default (robust across budgets; `cnn_channels_2` accuracy degrades with scale). The build-and-count search in `utils/params.autoscale_to_target` tolerates knobs with a minimum > 1 (e.g. `decoder_num_layers ≥ 2`): out-of-range trials are skipped, never crash |
 | `trunc_penalty` | `"none"` | `"none"`, `"norm"`, or `"photon_number"` |
 | `trunc_lambda` | 0.01 | Truncation penalty loss weight |
 | `gate_param_bound` | `None` | Soft-clip magnitude gate params (squeeze r, displacement re/im) to `(-b, b)` via `b·tanh(x/b)` — stops gates driving the state far past the cutoff (the NaN-head cause at high `num_heads`). `None` = off (not checkpoint-compatible with a bounded model). `full_experiment.py --gate-param-bound auto` → `auto_gate_bound(cutoff)=asinh(√(cutoff-1))` (the representable photon budget; ≈1.54 at cutoff 6). Avoid large b (~4 → ⟨n⟩≈745, the degenerate regime). |
@@ -558,21 +610,27 @@ output paths (see below) rather than reading every `TrainingConfig` field.
 
 ### full_experiment.py constants
 
-Default is the frozen best p12800 L2 sweep point: num_modes=2, cutoff_dim=6,
-num_heads=4, num_layers=2, poly_degree=3, cnn_channels_2=8, trunc norm λ=0.1,
-`xpxsps` observables → **13,530 params** (`TARGET_PARAMS=-1` so the architecture
-is built verbatim, no auto-scaling). Trained on the full 60k/10k split.
-CLI-overridable: `--epochs`, `--train-fraction`, `--test-fraction`, `--resume`,
-`--target-params` (re-enables auto-scaling on `--scaling-knob`, default `num_heads`).
+Default is the frozen best p12800 L2 sweep point **plus the CVQNN block W**
+(`cvqnn_num_layers=1`): num_modes=2, cutoff_dim=6, num_heads=4, num_layers=2,
+poly_degree=3, cnn_channels_2=8, trunc norm λ=0.1, `xpxsps` observables
+(`TARGET_PARAMS=-1` so the architecture is built verbatim, no auto-scaling).
+Adding `W` makes this **checkpoint-incompatible with pre-W runs** and shifts the
+param count off the historic 13,530 (set `--cvqnn-num-layers 0` to reproduce the
+exact pre-W model). Trained on the full 60k/10k split. CLI-overridable:
+`--epochs`, `--train-fraction`, `--test-fraction`, `--resume`, `--target-params`
+(re-enables auto-scaling on `--scaling-knob`, default `num_heads`),
+`--cvqnn-num-layers`, `--cvqnn-trunc-lambda`.
 
 | Constant | Value | Description |
 |---|---|---|
 | `EPOCHS` | 3 | Default epochs (~75-90 min/epoch V100, ~30-45 min/epoch A100) |
 | `BATCH_SIZE` | 64 | Batch size |
-| `TARGET_PARAMS` | -1 | Auto-scaling off → frozen 13,530-param architecture. Set >0 to binary-search `SCALING_KNOB` |
+| `TARGET_PARAMS` | -1 | Auto-scaling off → frozen architecture. Set >0 to binary-search `SCALING_KNOB` |
 | `SCALING_KNOB` | `"num_heads"` | Knob auto-scaled toward `--target-params` when enabled |
 | `NUM_LAYERS` | 2 | Per-patch circuit depth L |
-| `TRUNC_LAMBDA` | 0.1 | Fock truncation penalty weight |
+| `TRUNC_LAMBDA` | 0.1 | Fock truncation penalty weight (per-patch) |
+| `CVQNN_NUM_LAYERS` | 1 | CVQNN block W depth L_W (0 = disabled / pre-W ablation) |
+| `CVQNN_TRUNC_LAMBDA` | 0.01 | Weight of the separate W truncation penalty |
 | `CHECKPOINT_INTERVAL` | 1 | Versioned `epoch_NNNN.pt` every N epochs |
 | `MA_WINDOW` | 50 | Moving-average window for per-batch plots |
 
@@ -656,3 +714,17 @@ together:
 | `comparison.csv` / `comparison.md` | One row per run across all `--sweep-dir`s, tagged with `sweep_label` + `model`. |
 | `figures/acc_vs_params_compare.png` | Best test acc vs achieved params (colour = model, marker = scaling knob). |
 | `figures/acc_by_params_compare.png` | Grouped bars: model/knob at each target budget (bar labels = achieved params). |
+
+## Agent skills
+
+### Issue tracker
+
+Issues and PRDs are tracked as GitHub issues via the `gh` CLI (repo `clydelhui/CV-Quixer`). See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Canonical default labels — `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.

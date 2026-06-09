@@ -8,9 +8,12 @@ The CV quantum head encodes each image patch into a parametric Gaussian +
 Kerr unitary (Killoran et al. 2019 ansatz: `S → BS → R → D → K`) emitted by
 a CNN hypernetwork. Across the patch sequence the head implements a linear
 combination of unitaries (LCU) and a real-coefficient matrix polynomial
-`P(M) = Σ_j c_j Mʲ`, producing configurable per-mode observable readouts
+`P(M) = Σ_j c_j Mʲ`. The post-polynomial state is then transformed by a **CVQNN
+block `W`** — a fixed, per-head, trainable canonical Killoran circuit
+(`(BS→R)→S→(BS→R)→D→K`, owned parameters, `cvqnn_num_layers` layers; set
+`0` to disable) — before configurable per-mode observable readouts
 (`x`, `p`, `x²`, `p²`, `n`, or photon-number-resolving `prob_n`; default ⟨x̂⟩
-per mode) that feed a small classical MLP decoder. All Fock-basis simulation is
+per mode) feed a small classical MLP decoder. All Fock-basis simulation is
 **pure PyTorch** (no PennyLane at training time), so gradients flow through
 standard `torch.autograd`.
 
@@ -73,7 +76,7 @@ cv_quixer/
 ├── models/
 │   ├── base.py         BaseVisionTransformer (shared interface)
 │   ├── classical/      Classical ViT wrapper
-│   └── quantum/        CV-Quixer (CNN hypernet, LCU, polynomial, multi-head)
+│   └── quantum/        CV-Quixer (CNN hypernet, LCU, polynomial, CVQNN block W, multi-head)
 ├── config/         schema.py: ExperimentConfig dataclasses + ObservableSpec;
 │                   observable_presets.py: named readout presets
 │                   (utils.py load_config() YAML loader — legacy, unused)
@@ -120,6 +123,12 @@ uv run pytest tests/
 * **Configurable readout** — `QuantumConfig.readout_observables` selects any
   mix of `x`, `p`, `x²`, `p²`, `n`, and photon-number-resolving `prob_n`
   observables per mode (defaults to ⟨x̂⟩ per mode).
+* **CVQNN block `W`** — a fixed, per-head, trainable canonical Killoran circuit
+  applied to the post-polynomial state before readout (`cvqnn_num_layers`,
+  default 1; `0` disables it and reproduces the pre-W model exactly). Its
+  truncation leakage is penalised separately via `cvqnn_trunc_lambda`. Enabling
+  `W` is checkpoint-incompatible with pre-W runs — migrate old run configs with
+  `experiments/migrate_add_cvqnn_field.py` (see CLAUDE.md / ADR-0001).
 * **No Trainer class** — each experiment script owns its training loop and
   drives models only through `BaseVisionTransformer`; `build_model(config)`
   is the only model factory.

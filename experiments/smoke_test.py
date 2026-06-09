@@ -80,8 +80,8 @@ def run_one(readout_observable: str) -> None:
     print(f"\nForward shape OK — logits: {tuple(logits_check.shape)}")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    print(f"\n{'Epoch':<6} {'CE loss':<12} {'Trunc loss':<14} {'Total loss'}")
-    print("─" * 46)
+    print(f"\n{'Epoch':<6} {'CE loss':<12} {'Trunc loss':<14} {'CVQNN trunc':<14} {'Total loss'}")
+    print("─" * 62)
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
@@ -90,13 +90,19 @@ def run_one(readout_observable: str) -> None:
 
         out = model(patches, return_trunc_loss=True)
         logits, trunc_loss = out.logits, out.trunc_loss
+        cvqnn_trunc_loss = out.cvqnn_trunc_loss
         ce_loss = F.cross_entropy(logits, labels)
-        total_loss = ce_loss + quantum_cfg.trunc_lambda * trunc_loss
+        total_loss = (
+            ce_loss
+            + quantum_cfg.trunc_lambda * trunc_loss
+            + quantum_cfg.cvqnn_trunc_lambda * cvqnn_trunc_loss
+        )
 
         total_loss.backward()
         optimizer.step()
 
-        print(f"{epoch:<6} {ce_loss.item():<12.4f} {trunc_loss.item():<14.4f} {total_loss.item():.4f}")
+        print(f"{epoch:<6} {ce_loss.item():<12.4f} {trunc_loss.item():<14.4f} "
+              f"{cvqnn_trunc_loss.item():<14.6f} {total_loss.item():.4f}")
 
     missing = [n for n, p in model.named_parameters() if p.requires_grad and p.grad is None]
     if missing:

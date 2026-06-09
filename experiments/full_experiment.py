@@ -75,6 +75,7 @@ from cv_quixer.evaluation.diagnostics import (
     quantum_diagnostics,
     save_test_images_once,
     snapshot_coefficients,
+    snapshot_cvqnn_params,
 )
 from cv_quixer.models import build_model
 from cv_quixer.utils import print_parameter_table
@@ -98,6 +99,22 @@ SEED = 42
 CHECKPOINT_INTERVAL = 1  # versioned epoch_NNNN.pt every N epochs
 DEFAULT_OBSERVABLES = "xpxsps"  # x, p, x², p² per mode
 TRUNC_LAMBDA = 0.1  # Fock truncation penalty weight (added to CE loss)
+CVQNN_NUM_LAYERS = 1   # CVQNN block W depth L_W (0 = disabled / pre-W ablation)
+CVQNN_TRUNC_LAMBDA = 0.01  # weight of the separate W truncation penalty (added to CE loss)
+# Architecture knobs of the frozen 13,530-param model. Each is overridable by the
+# matching CLI flag below for manual (no-auto-scale) runs / sweeps; defaults here
+# reproduce the frozen architecture verbatim.
+NUM_MODES = 2
+NUM_HEADS = 4              # resolved value of the frozen model (auto-scaled only with --target-params)
+CNN_CHANNELS_1 = 8
+CNN_CHANNELS_2 = 8         # resolved value of the frozen model
+CNN_KERNEL_SIZE = 3
+DECODER_HIDDEN_DIM = 32
+DECODER_HIDDEN_MULT = None  # if set (float >0), decoder_hidden_dim = round(mult * decoder_in_dim)
+POLY_DEGREE = 3
+CNN_NUM_CONV_LAYERS = 2          # total conv layers in the CNN stack
+HYPERNET_NUM_LINEAR_LAYERS = 1   # total Linear layers in the hypernet DNN
+DECODER_NUM_LAYERS = 2           # total Linear layers in the decoder MLP
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +192,47 @@ parser.add_argument(
     "L-1 BS→Rot interferometers between them. Deepening L raises the param "
     "count, so it may also be used as a --scaling-knob.",
 )
+# --- direct architecture knobs (manual mode; override the frozen-model values) ---
+# Each defaults to None → inherit the frozen-model constant above. Set any of
+# these to build an explicit architecture without --target-params auto-scaling
+# (they are honoured even when --target-params is set, except the chosen
+# --scaling-knob, which the binary search overrides).
+parser.add_argument("--num-modes", type=int, default=None,
+                    help=f"bosonic modes (default {NUM_MODES})")
+parser.add_argument("--cutoff-dim", type=int, default=None,
+                    help=f"Fock cutoff D (default {CUTOFF_DIM}); also sizes the "
+                    "pnr/xpxsps_pnr observable plans and 'auto' gate bound")
+parser.add_argument("--num-heads", type=int, default=None,
+                    help=f"parallel CV attention heads (default {NUM_HEADS})")
+parser.add_argument("--cnn-channels-1", type=int, default=None,
+                    help=f"first conv output channels (default {CNN_CHANNELS_1})")
+parser.add_argument("--cnn-channels-2", type=int, default=None,
+                    help=f"second conv output channels (default {CNN_CHANNELS_2})")
+parser.add_argument("--cnn-kernel-size", type=int, default=None,
+                    help=f"conv kernel size (default {CNN_KERNEL_SIZE})")
+parser.add_argument("--decoder-hidden-dim", type=int, default=None,
+                    help=f"decoder MLP hidden width (default {DECODER_HIDDEN_DIM}); "
+                    "mutually exclusive with --decoder-hidden-mult")
+parser.add_argument("--decoder-hidden-mult", type=float, default=None,
+                    help="size the decoder hidden width relative to its input as "
+                    "round(mult * decoder_in_dim), where decoder_in_dim = num_heads * "
+                    "readout_width (resolved after any --target-params scaling). "
+                    "Mutually exclusive with --decoder-hidden-dim")
+parser.add_argument("--poly-degree", type=int, default=None,
+                    help=f"matrix polynomial degree d (default {POLY_DEGREE})")
+parser.add_argument("--cnn-num-conv-layers", type=int, default=None,
+                    help=f"total conv layers in the CNN stack (default "
+                    f"{CNN_NUM_CONV_LAYERS}); >2 appends same-padding C2→C2 convs")
+parser.add_argument("--hypernet-num-linear-layers", type=int, default=None,
+                    help=f"total Linear layers in the hypernet DNN (default "
+                    f"{HYPERNET_NUM_LINEAR_LAYERS}); >1 prepends feature→feature blocks")
+parser.add_argument("--decoder-num-layers", type=int, default=None,
+                    help=f"total Linear layers in the decoder MLP (default "
+                    f"{DECODER_NUM_LAYERS}); >2 inserts extra hidden blocks")
+parser.add_argument("--cvqnn-num-layers", type=int, default=None,
+                    help=f"CVQNN block W depth L_W (default {CVQNN_NUM_LAYERS}); "
+                    f"0 disables W (pre-W ablation, checkpoint-compatible). A "
+                    f"valid --scaling-knob, but too coarse for budget targeting.")
 parser.add_argument(
     "--observables",
     type=str,
@@ -250,6 +308,13 @@ parser.add_argument(
     f"(default TRUNC_LAMBDA={TRUNC_LAMBDA})",
 )
 parser.add_argument(
+    "--cvqnn-trunc-lambda",
+    type=float,
+    default=None,
+    help=f"weight of the separate CVQNN block (W) truncation penalty added to "
+    f"the CE loss (default CVQNN_TRUNC_LAMBDA={CVQNN_TRUNC_LAMBDA})",
+)
+parser.add_argument(
     "--gate-param-bound",
     type=str,
     default=None,
@@ -261,6 +326,8 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
+if args.decoder_hidden_dim is not None and args.decoder_hidden_mult is not None:
+    parser.error("--decoder-hidden-dim and --decoder-hidden-mult are mutually exclusive")
 if args.train_fraction is not None and args.train_limit is not None:
     parser.error("--train-fraction and --train-limit are mutually exclusive")
 if args.test_fraction is not None and args.test_limit is not None:
@@ -285,8 +352,38 @@ if args.num_layers is not None:
     NUM_LAYERS = args.num_layers
 if args.trunc_lambda is not None:
     TRUNC_LAMBDA = args.trunc_lambda
+if args.cvqnn_trunc_lambda is not None:
+    CVQNN_TRUNC_LAMBDA = args.cvqnn_trunc_lambda
 if args.seed is not None:
     SEED = args.seed
+# Direct architecture overrides (manual mode). Applied before the gate-bound /
+# observable resolution below so --cutoff-dim feeds both.
+if args.num_modes is not None:
+    NUM_MODES = args.num_modes
+if args.cutoff_dim is not None:
+    CUTOFF_DIM = args.cutoff_dim
+if args.num_heads is not None:
+    NUM_HEADS = args.num_heads
+if args.cnn_channels_1 is not None:
+    CNN_CHANNELS_1 = args.cnn_channels_1
+if args.cnn_channels_2 is not None:
+    CNN_CHANNELS_2 = args.cnn_channels_2
+if args.cnn_kernel_size is not None:
+    CNN_KERNEL_SIZE = args.cnn_kernel_size
+if args.decoder_hidden_dim is not None:
+    DECODER_HIDDEN_DIM = args.decoder_hidden_dim
+if args.decoder_hidden_mult is not None:
+    DECODER_HIDDEN_MULT = args.decoder_hidden_mult
+if args.poly_degree is not None:
+    POLY_DEGREE = args.poly_degree
+if args.cnn_num_conv_layers is not None:
+    CNN_NUM_CONV_LAYERS = args.cnn_num_conv_layers
+if args.hypernet_num_linear_layers is not None:
+    HYPERNET_NUM_LINEAR_LAYERS = args.hypernet_num_linear_layers
+if args.decoder_num_layers is not None:
+    DECODER_NUM_LAYERS = args.decoder_num_layers
+if args.cvqnn_num_layers is not None:
+    CVQNN_NUM_LAYERS = args.cvqnn_num_layers
 
 # Resolve the gate-param bound: 'auto' → cutoff-aware photon budget, else a float,
 # else None (off). Resolved to a concrete value here so config.json is reproducible.
@@ -331,16 +428,21 @@ data_cfg = DataConfig(
     data_root="data/",
 )
 quantum_cfg = QuantumConfig(
-    num_modes=2,
+    num_modes=NUM_MODES,
     num_layers=NUM_LAYERS,
     cutoff_dim=CUTOFF_DIM,
-    num_heads=4,            # fixed at the resolved 13,530-param value (the scaling
-                            # seed only when --target-params re-enables auto-scaling)
-    cnn_channels_1=8,
-    cnn_channels_2=8,       # the value the autoscaler resolved for the 13,530 model
-    cnn_kernel_size=3,
-    decoder_hidden_dim=32,
-    poly_degree=3,
+    num_heads=NUM_HEADS,   # frozen-model value unless --num-heads / --target-params
+    cnn_channels_1=CNN_CHANNELS_1,
+    cnn_channels_2=CNN_CHANNELS_2,
+    cnn_kernel_size=CNN_KERNEL_SIZE,
+    decoder_hidden_dim=DECODER_HIDDEN_DIM,
+    decoder_hidden_mult=DECODER_HIDDEN_MULT,
+    poly_degree=POLY_DEGREE,
+    cnn_num_conv_layers=CNN_NUM_CONV_LAYERS,
+    hypernet_num_linear_layers=HYPERNET_NUM_LINEAR_LAYERS,
+    decoder_num_layers=DECODER_NUM_LAYERS,
+    cvqnn_num_layers=CVQNN_NUM_LAYERS,
+    cvqnn_trunc_lambda=CVQNN_TRUNC_LAMBDA,
     dtype="complex64",
     trunc_penalty="norm",
     trunc_lambda=TRUNC_LAMBDA,
@@ -608,8 +710,24 @@ history["meta"]["num_layers"] = int(
     getattr(getattr(model, "config", None), "num_layers", config.quantum.num_layers)
 )
 history["meta"]["trunc_lambda"] = float(TRUNC_LAMBDA)
+history["meta"]["cvqnn_trunc_lambda"] = float(CVQNN_TRUNC_LAMBDA)
 history["meta"]["seed"] = int(SEED)
 history["meta"]["model"] = str(args.model)
+# Resolved architecture knobs (post auto-scaling), so report_sweep.py can table /
+# plot manual-sweep axes without re-reading config.json. Read from model.config
+# (the resolved config) with config.quantum as the fallback.
+_resolved_q = getattr(model, "config", None) or config.quantum
+for _field in (
+    "num_modes", "num_heads", "cutoff_dim", "poly_degree",
+    "cnn_channels_1", "cnn_channels_2", "cnn_kernel_size", "decoder_hidden_dim",
+    "cnn_num_conv_layers", "hypernet_num_linear_layers", "decoder_num_layers",
+    "cvqnn_num_layers",
+):
+    history["meta"][_field] = int(getattr(_resolved_q, _field))
+# decoder_hidden_mult is a float|None (the input that produced the resolved
+# decoder_hidden_dim above), kept separately from the int-cast loop.
+_dhm = getattr(_resolved_q, "decoder_hidden_mult", None)
+history["meta"]["decoder_hidden_mult"] = None if _dhm is None else float(_dhm)
 
 
 # ---------------------------------------------------------------------------
@@ -644,22 +762,23 @@ def _grad_l2_norm(parameters) -> float:
     return float(torch.norm(torch.stack(norms), 2).item())
 
 
-def train_epoch(epoch: int) -> float:
-    """One epoch of training. Returns the mean per-sample truncation loss
-    measured across training batches (cheap in-epoch summary, no extra pass).
+def train_epoch(epoch: int) -> tuple[float, float]:
+    """One epoch of training. Returns the mean per-sample truncation losses
+    (per-patch, CVQNN-block W) measured across training batches (cheap in-epoch
+    summary, no extra pass).
 
     The epoch-level CE loss and accuracy are NOT computed here — they are
     produced after this function returns by running the post-epoch model on
     the full training set in eval mode, which avoids the running-average
     bias of mixing early-batch (under-trained) and late-batch predictions.
 
-    Per-batch CE / trunc / total loss / batch acc / grad norm are still
-    appended to history["batch"] so the per-batch diagnostic plots are
+    Per-batch CE / trunc / cvqnn-trunc / total loss / batch acc / grad norm are
+    still appended to history["batch"] so the per-batch diagnostic plots are
     unchanged.
     """
     global global_step
     model.train()
-    total_trunc, total = 0.0, 0
+    total_trunc, total_cvqnn_trunc, total = 0.0, 0.0, 0
     _logged_first_batch_mem = False
     for patches, labels in tqdm(
         train_loader, desc=f"Epoch {epoch:>3}/{EPOCHS}", leave=False, unit="batch"
@@ -668,8 +787,13 @@ def train_epoch(epoch: int) -> float:
         optimizer.zero_grad()
         out = model(patches, return_trunc_loss=True)
         logits, trunc_loss = out.logits, out.trunc_loss
+        cvqnn_trunc_loss = out.cvqnn_trunc_loss
         ce_loss = F.cross_entropy(logits, labels)
-        loss = ce_loss + quantum_cfg.trunc_lambda * trunc_loss
+        loss = (
+            ce_loss
+            + quantum_cfg.trunc_lambda * trunc_loss
+            + quantum_cfg.cvqnn_trunc_lambda * cvqnn_trunc_loss
+        )
         loss.backward()
 
         grad_norm = _grad_l2_norm(model.parameters())
@@ -689,6 +813,7 @@ def train_epoch(epoch: int) -> float:
         batch_acc = (preds == labels).sum().item() / n
 
         total_trunc += trunc_loss.item() * n
+        total_cvqnn_trunc += cvqnn_trunc_loss.item() * n
         total += n
 
         global_step += 1
@@ -696,11 +821,12 @@ def train_epoch(epoch: int) -> float:
         history["batch"]["epoch"].append(epoch)
         history["batch"]["train_loss"].append(float(ce_loss.item()))
         history["batch"]["trunc_loss"].append(float(trunc_loss.item()))
+        history["batch"]["cvqnn_trunc_loss"].append(float(cvqnn_trunc_loss.item()))
         history["batch"]["total_loss"].append(float(loss.item()))
         history["batch"]["batch_acc"].append(float(batch_acc))
         history["batch"]["grad_norm"].append(float(grad_norm))
 
-    return total_trunc / total
+    return total_trunc / total, total_cvqnn_trunc / total
 
 
 # Figure generation lives in `experiments/report_diagnostics.py` — run it
@@ -719,9 +845,10 @@ def save_history() -> None:
 
 print(
     f"{'Epoch':<7} {'Train loss':<12} {'Train acc':<11} "
-    f"{'Test loss':<11} {'Test acc':<11} {'Trunc loss':<12} {'Peak mem':<11} {'Time'}"
+    f"{'Test loss':<11} {'Test acc':<11} {'Trunc loss':<12} {'CVQNN trunc':<13} "
+    f"{'Peak mem':<11} {'Time'}"
 )
-print("─" * 88)
+print("─" * 101)
 
 # Per-epoch peak GPU memory is recorded under this key (CUDA only).
 history["epoch"].setdefault("peak_mem_mb", [])
@@ -740,7 +867,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
     t0 = time.time()
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
-    trunc_loss = train_epoch(epoch)
+    trunc_loss, cvqnn_trunc_loss = train_epoch(epoch)
     train_eval = evaluate(model, train_eval_loader, device,
                           progress="train eval")
     test_eval = evaluate(model, test_loader, device,
@@ -764,6 +891,8 @@ for epoch in range(start_epoch, EPOCHS + 1):
     history["epoch"]["test_acc"].append(test_acc)
     history["epoch"]["trunc_loss"].append(trunc_loss)
     history["epoch"]["test_trunc_loss"].append(float(test_eval["trunc_loss"]))
+    history["epoch"]["cvqnn_trunc_loss"].append(cvqnn_trunc_loss)
+    history["epoch"]["test_cvqnn_trunc_loss"].append(float(test_eval["cvqnn_trunc_loss"]))
 
     log_metrics(
         {
@@ -774,6 +903,8 @@ for epoch in range(start_epoch, EPOCHS + 1):
             "epoch/test_acc": test_acc,
             "epoch/trunc_loss": trunc_loss,
             "epoch/test_trunc_loss": float(test_eval["trunc_loss"]),
+            "epoch/cvqnn_trunc_loss": cvqnn_trunc_loss,
+            "epoch/test_cvqnn_trunc_loss": float(test_eval["cvqnn_trunc_loss"]),
         },
         use_wandb=config.use_wandb,
     )
@@ -794,6 +925,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
     )
 
     lcu_snap, poly_snap = snapshot_coefficients(model)
+    cvqnn_snap = snapshot_cvqnn_params(model)   # None when cvqnn_num_layers == 0
 
     t_diag = time.time()
     try:
@@ -803,6 +935,8 @@ for epoch in range(start_epoch, EPOCHS + 1):
         )
         diag_raw["lcu_coeffs"] = lcu_snap
         diag_raw["poly_coeffs"] = poly_snap
+        if cvqnn_snap is not None:
+            diag_raw["cvqnn_params"] = cvqnn_snap
         np.savez_compressed(diag_dir / f"epoch_{epoch:04d}.npz", **diag_raw)
         diag_status = f"  (diag {time.time() - t_diag:.1f}s)"
     except Exception as e:
@@ -816,10 +950,10 @@ for epoch in range(start_epoch, EPOCHS + 1):
             "Saving only lcu/poly snapshots for this epoch.",
             RuntimeWarning,
         )
-        np.savez_compressed(
-            diag_dir / f"epoch_{epoch:04d}.npz",
-            lcu_coeffs=lcu_snap, poly_coeffs=poly_snap,
-        )
+        _fallback_diag = {"lcu_coeffs": lcu_snap, "poly_coeffs": poly_snap}
+        if cvqnn_snap is not None:
+            _fallback_diag["cvqnn_params"] = cvqnn_snap
+        np.savez_compressed(diag_dir / f"epoch_{epoch:04d}.npz", **_fallback_diag)
         diag_status = "  (diag skipped)"
 
     elapsed = time.time() - t0
@@ -827,7 +961,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
     print(
         f"{epoch:<7} {train_loss:<12.4f} {train_acc:<11.3f} "
         f"{test_loss:<11.4f} {test_acc:<11.3f} {trunc_loss:<12.4f} "
-        f"{mem_str:<11} {elapsed:.1f}s{diag_status}"
+        f"{cvqnn_trunc_loss:<13.6f} {mem_str:<11} {elapsed:.1f}s{diag_status}"
     )
 
     # Checkpoints

@@ -46,13 +46,13 @@ import sys
 import warnings
 from pathlib import Path
 
-import dacite
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from cv_quixer.config.schema import ExperimentConfig
+from cv_quixer.config.utils import experiment_config_from_dict
 from cv_quixer.data.mnist import PatchedDataset
 from cv_quixer.evaluation.diagnostics import (
     ensure_history_schema,
@@ -185,11 +185,7 @@ def main() -> None:
 
     with open(config_path) as f:
         config_dict = json.load(f)
-    config: ExperimentConfig = dacite.from_dict(
-        data_class=ExperimentConfig,
-        data=config_dict,
-        config=dacite.Config(strict=False),
-    )
+    config: ExperimentConfig = experiment_config_from_dict(config_dict)
     with open(history_path) as f:
         history = json.load(f)
     ensure_history_schema(history)

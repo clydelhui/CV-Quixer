@@ -47,10 +47,22 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REPORT_DIAGNOSTICS = "experiments/report_diagnostics.py"
 
+# Resolved architecture knobs recorded in history["meta"] by full_experiment.py.
+# Surfaced per-run in the table and used as the candidate axes for the
+# acc-vs-hyperparam figures (any that vary across runs). num_layers is loaded
+# separately (it predates this list) but is included here as a figure candidate.
+ARCH_META_FIELDS = [
+    "num_modes", "num_heads", "cutoff_dim", "poly_degree",
+    "cnn_channels_1", "cnn_channels_2", "cnn_kernel_size", "decoder_hidden_dim",
+    "cnn_num_conv_layers", "hypernet_num_linear_layers", "decoder_num_layers",
+    "decoder_hidden_mult",
+]
+
 # Columns for the summary table, in display order.
 SUMMARY_COLUMNS = [
     "run_name", "model", "observables", "target_params", "achieved_params",
     "scaling_knob", "num_layers", "trunc_lambda", "seed",
+    *ARCH_META_FIELDS,
     "best_test_acc", "best_epoch", "final_test_acc",
     "final_train_acc", "n_epochs", "total_runtime_sec", "device",
 ]
@@ -104,7 +116,7 @@ def _load_run(run_dir: Path) -> dict | None:
     if best is None and test_acc:
         best = max(test_acc)
 
-    return {
+    row = {
         "run_name": run_dir.name,
         "model": _resolve_model(run_dir, meta),
         "observables": meta.get("observables_name"),
@@ -124,6 +136,11 @@ def _load_run(run_dir: Path) -> dict | None:
         "total_runtime_sec": meta.get("total_runtime_sec"),
         "device": meta.get("device"),
     }
+    # Resolved architecture knobs (present for runs from the manual-sweep-aware
+    # full_experiment.py; None for older runs — safely omitted from figures).
+    for field in ARCH_META_FIELDS:
+        row[field] = meta.get(field)
+    return row
 
 
 def load_sweep(sweep_dir: Path) -> list[dict]:
@@ -378,6 +395,50 @@ def plot_acc_vs_trunc_lambda(rows: list[dict], fig_dir: Path) -> None:
     print(f"  ✓ {out}")
 
 
+def plot_acc_vs_hyperparam(rows: list[dict], fig_dir: Path) -> None:
+    """One ``acc_vs_<field>.png`` per architecture field that varies across runs.
+
+    The figure for manual-hyperparameter sweeps: for every candidate field
+    (``ARCH_META_FIELDS`` + ``num_layers``) that takes ≥2 distinct non-None values,
+    plot seed-averaged best test accuracy (± std) against that field's value, one
+    line per (observable, scaling_knob). Fields constant across the sweep, or
+    absent (older runs), are skipped. When several arch axes vary at once, the
+    others are averaged into each point (widening the ± band) — read alongside the
+    per-run ``summary.csv`` for the exact grid.
+    """
+    candidates = ARCH_META_FIELDS + ["num_layers"]
+    for field in candidates:
+        distinct = {
+            r.get(field) for r in rows
+            if r.get(field) is not None and r.get("best_test_acc") is not None
+        }
+        if len(distinct) < 2:
+            continue
+        agg = _aggregate_by(rows, ("observables", "scaling_knob", field))
+        if not agg:
+            continue
+        series = sorted({(o, k) for (o, k, _v) in agg})
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        for obs, knob in series:
+            pts = sorted(
+                (v, m, s) for (o, k, v), (m, s) in agg.items() if (o, k) == (obs, knob)
+            )
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            es = [p[2] for p in pts]
+            ax.errorbar(xs, ys, yerr=es, marker="o", capsize=3, label=f"{obs}/{knob}")
+        ax.set_xlabel(field)
+        ax.set_ylabel("Best test accuracy")
+        ax.set_title(f"Accuracy vs {field}")
+        ax.grid(alpha=0.3)
+        ax.legend(title="observable / knob")
+        fig.tight_layout()
+        out = fig_dir / f"acc_vs_{field}.png"
+        fig.savefig(out, dpi=150)
+        plt.close(fig)
+        print(f"  ✓ {out}")
+
+
 def render_per_run_figures(sweep_dir: Path, rows: list[dict]) -> None:
     """Render the full report_diagnostics figure suite for every run in the sweep.
 
@@ -391,7 +452,7 @@ def render_per_run_figures(sweep_dir: Path, rows: list[dict]) -> None:
         if not run_dir.is_dir():
             warnings.warn(f"run dir missing, skipping: {run_dir}", RuntimeWarning)
             continue
-        cmd = [sys.executable, REPORT_DIAGNOSTICS, "--run-dir", str(run_dir)]
+        cmd = [sys.executable, "-u", REPORT_DIAGNOSTICS, "--run-dir", str(run_dir)]
         try:
             subprocess.run(cmd, cwd=REPO_ROOT, check=True)
         except subprocess.CalledProcessError as e:
@@ -414,6 +475,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Line-buffer stdout so progress streams live even when piped / redirected /
+    # captured (non-TTY block-buffers by default, making the run look hung).
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+
     sweep_dir = Path(args.sweep_dir)
     if not sweep_dir.is_dir():
         parser.error(f"--sweep-dir does not exist: {sweep_dir}")
@@ -433,6 +499,7 @@ def main() -> None:
         plot_acc_by_observable,
         plot_acc_by_scaling_knob,
         plot_acc_vs_trunc_lambda,
+        plot_acc_vs_hyperparam,
     ):
         try:
             fn(rows, fig_dir)

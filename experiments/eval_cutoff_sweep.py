@@ -56,7 +56,6 @@ from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 
-import dacite
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -66,6 +65,7 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from cv_quixer.config.schema import ExperimentConfig
+from cv_quixer.config.utils import experiment_config_from_dict
 from cv_quixer.data.mnist import PatchedDataset
 from cv_quixer.evaluation.diagnostics import (
     evaluate,
@@ -153,11 +153,7 @@ if not config_json.is_file():
 with open(config_json) as f:
     cfg_raw = json.load(f)
 
-config: ExperimentConfig = dacite.from_dict(
-    data_class=ExperimentConfig,
-    data=cfg_raw,
-    config=dacite.Config(strict=False),
-)
+config: ExperimentConfig = experiment_config_from_dict(cfg_raw)
 
 # Pin the resolved cnn_channels_2 by disabling further auto-scaling.
 quantum_cfg_base = replace(config.quantum, target_params=-1)

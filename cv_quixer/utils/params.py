@@ -188,7 +188,16 @@ def autoscale_to_target(
 
     def count(value: int) -> int:
         trial = dataclasses.replace(config, **{trigger_field: -1, knob: value})
-        return count_parameters(build_fn(trial))
+        try:
+            return count_parameters(build_fn(trial))
+        except ValueError:
+            # The search probes small knob values (from 1 up); a knob with a
+            # minimum > 1 (e.g. decoder_num_layers >= 2, cnn_num_conv_layers >= 2)
+            # raises for trials below its range. Treat those as "below target" so
+            # the search steps up into the valid range instead of crashing — the
+            # selected value is always a real, valid build (>= target). hi_cap
+            # still bounds a knob that genuinely never reaches the budget.
+            return -1
 
     # Expand an upper bound until the budget is reachable (or proven out of reach).
     hi = 1

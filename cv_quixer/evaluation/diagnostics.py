@@ -34,6 +34,7 @@ EPOCH_KEYS: tuple[str, ...] = (
     "train_loss", "train_acc",
     "test_loss",  "test_acc",
     "trunc_loss", "test_trunc_loss",
+    "cvqnn_trunc_loss", "test_cvqnn_trunc_loss",
     "elapsed_sec",
 )
 
@@ -58,8 +59,8 @@ def new_history(n_params: int, device: str) -> dict:
         "epoch": {k: [] for k in EPOCH_KEYS},
         "batch": {
             "step":       [], "epoch":      [],
-            "train_loss": [], "trunc_loss": [], "total_loss": [],
-            "batch_acc":  [], "grad_norm":  [],
+            "train_loss": [], "trunc_loss": [], "cvqnn_trunc_loss": [],
+            "total_loss": [], "batch_acc":  [], "grad_norm":  [],
         },
         "meta": {
             "best_test_acc": None, "best_epoch": None,
@@ -209,6 +210,23 @@ def snapshot_coefficients(model) -> tuple[np.ndarray, np.ndarray]:
     return lcu, poly
 
 
+def snapshot_cvqnn_params(model) -> np.ndarray | None:
+    """CVQNN block (W) gate params per head — JSON-friendly array, or None.
+
+    Returns:
+        (num_heads, cvqnn_param_count) float32 — the learned W gate-param vector
+        per head. ``None`` when the model has no W block (cvqnn_num_layers == 0,
+        each head's ``cvqnn_params`` is None), so callers can skip writing the key.
+    """
+    chunks = []
+    for head in model.cv_attention.heads:
+        params = getattr(head, "cvqnn_params", None)
+        if params is None:
+            return None
+        chunks.append(params.detach().cpu())
+    return torch.stack(chunks).numpy().astype(np.float32)
+
+
 # ---------------------------------------------------------------------------
 # Quantum diagnostics (gate-param distributions, state norms, photon numbers)
 # ---------------------------------------------------------------------------
@@ -332,6 +350,8 @@ def evaluate(model, loader, device, num_classes: int = 10,
         acc            — overall accuracy
         trunc_loss     — mean per-sample truncation loss (eval-time; 0 if the
                          model's trunc_penalty is "none")
+        cvqnn_trunc_loss — mean per-sample CVQNN block (W) truncation leakage
+                         (eval-time; 0 if cvqnn_num_layers == 0)
         y_true         — int64 (N,) ground-truth labels
         y_pred         — int64 (N,) argmax predictions
         y_probs        — float32 (N, num_classes) softmax probabilities
@@ -341,7 +361,7 @@ def evaluate(model, loader, device, num_classes: int = 10,
                          activations (used for the post-hoc t-SNE plot)
     """
     model.eval()
-    total_loss, total_trunc, correct, total = 0.0, 0.0, 0, 0
+    total_loss, total_trunc, total_cvqnn_trunc, correct, total = 0.0, 0.0, 0.0, 0, 0
     y_true_chunks: list[torch.Tensor] = []
     y_pred_chunks: list[torch.Tensor] = []
     y_prob_chunks: list[torch.Tensor] = []
@@ -359,6 +379,10 @@ def evaluate(model, loader, device, num_classes: int = 10,
         logits, readouts = out.logits, out.readouts
         if out.trunc_loss is not None:
             total_trunc += out.trunc_loss.item() * labels.size(0)
+        # out.cvqnn_trunc_loss is independent of trunc_penalty; None only on a
+        # non-CV model (no return_trunc_loss support) — guard anyway.
+        if out.cvqnn_trunc_loss is not None:
+            total_cvqnn_trunc += out.cvqnn_trunc_loss.item() * labels.size(0)
         total_loss += F.cross_entropy(logits, labels).item() * labels.size(0)
         preds = logits.argmax(dim=-1)
         correct += (preds == labels).sum().item()
@@ -388,6 +412,7 @@ def evaluate(model, loader, device, num_classes: int = 10,
         "loss":          total_loss / total,
         "acc":           correct / total,
         "trunc_loss":    total_trunc / total,
+        "cvqnn_trunc_loss": total_cvqnn_trunc / total,
         "y_true":        y_true,
         "y_pred":        y_pred,
         "y_probs":       y_probs,

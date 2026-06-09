@@ -144,15 +144,57 @@ class QuantumConfig:
     # Multi-head attention
     num_heads: int = 4            # parallel CV attention heads
     decoder_hidden_dim: int = 64  # hidden dim of readout→logits MLP
+    # Optional: size decoder_hidden_dim relative to the decoder's input width
+    # in_dim = num_heads × readout_width, as decoder_hidden_dim = max(1,
+    # round(decoder_hidden_mult × in_dim)). Resolved at model build time (after
+    # any target_params auto-scaling of num_heads), overriding decoder_hidden_dim.
+    # None = off (use the static decoder_hidden_dim). Float ⇒ not a scaling_knob.
+    decoder_hidden_mult: Optional[float] = None
+    # Total Linear layers in the CVDecoder MLP. 2 = the historic
+    # Linear(in→h)→ReLU→Linear(h→classes); >2 inserts (decoder_num_layers-2)
+    # extra h→h ReLU hidden blocks. A valid (monotonic) scaling_knob.
+    decoder_num_layers: int = 2
 
-    # CNN hypernetwork: Conv(1→C1) → Conv(C1→C2) → flatten → 2D PE → Linear → gate params
-    # No padding; spatial output: h_out = patch_size - 2*(cnn_kernel_size - 1)
+    # CNN hypernetwork: Conv(1→C1) → Conv(C1→C2) → [extra C2→C2 convs] → flatten
+    # → 2D PE → [extra feature_dim→feature_dim linears] → Linear → gate params.
+    # The two channel-transition convs use no padding (spatial output
+    # h_out = patch_size - 2*(cnn_kernel_size - 1)); any extra convs use
+    # same-padding so they preserve h_out / feature_dim.
     cnn_channels_1: int = 8    # output channels of first conv layer
     cnn_channels_2: int = 16   # output channels of second conv layer (a valid scaling_knob, but num_heads is the default)
     cnn_kernel_size: int = 3   # kernel size for both conv layers
+    # Total conv layers in the CNN stack. 2 = the historic conv1→conv2; >2
+    # appends (cnn_num_conv_layers-2) same-padding C2→C2 convs. A valid scaling_knob.
+    cnn_num_conv_layers: int = 2
+    # Total Linear layers in the hypernetwork DNN section (after the 2D-PE add).
+    # 1 = the historic single feature_dim→gate_params projection; >1 prepends
+    # (hypernet_num_linear_layers-1) feature_dim→feature_dim Tanh blocks before the
+    # final projection. A valid scaling_knob.
+    hypernet_num_linear_layers: int = 1
 
     # Matrix polynomial degree for LCU attention (P(M) = Σ c_j M^j, j=0..d)
     poly_degree: int = 2           # keep ≤ 4; d=2 or d=3 recommended
+
+    # CVQNN block W applied to the post-polynomial (post-selected) state before
+    # observable readout — a fixed, per-image, trainable Killoran-style circuit
+    # with owned nn.Parameters (input-independent), distinct from the
+    # hypernetwork-emitted per-patch unitaries U_i. Each W layer is the canonical
+    # two-interferometer Killoran form (BS→R)→S→(BS→R)→D→K (the per-patch U_i
+    # drops the leading interferometer, trivial on its vacuum input; W acts on a
+    # non-vacuum state so it is restored). Zero-init ⇒ W=I at start.
+    #   cvqnn_num_layers = 0 disables W entirely → state_dict byte-identical to a
+    #     pre-W model (the clean ablation baseline / checkpoint-compat switch).
+    #   A valid (monotonic) scaling_knob, but too coarse for budget targeting —
+    #     keep num_heads the budget knob; use this as a capacity/ablation axis.
+    cvqnn_num_layers: int = 1
+    # Weight of the SEPARATE W truncation penalty 1 - ‖W|ψ⟩‖² added to the
+    # training loss (independent of trunc_lambda / trunc_penalty — W's leakage is
+    # a distinct concern, always computed since it is the norm used for the
+    # post-W renormalisation). Defaulted an order below the per-patch
+    # trunc_lambda because W's single-block leakage compounds far less than the
+    # per-patch penalty does through the polynomial powers. 0 → tracked but not
+    # penalised.
+    cvqnn_trunc_lambda: float = 0.01
 
     # Soft-clip on the magnitude gate params (squeeze r, displacement re/im) via
     # b·tanh(x/b), keeping them in (-b, b). This stops the gates from driving the
@@ -202,6 +244,16 @@ class QuantumConfig:
             raise ValueError(
                 f"scaling_knob={self.scaling_knob!r} must name an integer "
                 f"QuantumConfig field; valid choices: {sorted(valid_knobs)}"
+            )
+
+        if self.decoder_hidden_mult is not None and self.decoder_hidden_mult <= 0:
+            raise ValueError(
+                f"decoder_hidden_mult must be > 0, got {self.decoder_hidden_mult}"
+            )
+
+        if self.cvqnn_num_layers < 0:
+            raise ValueError(
+                f"cvqnn_num_layers must be >= 0, got {self.cvqnn_num_layers}"
             )
 
         if (

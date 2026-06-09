@@ -149,7 +149,7 @@ fig_dir.mkdir(parents=True, exist_ok=True)
 history: dict[str, list] = {
     "train_loss": [], "train_acc": [],
     "test_loss":  [], "test_acc":  [],
-    "trunc_loss": [],
+    "trunc_loss": [], "cvqnn_trunc_loss": [],
 }
 
 start_epoch = 1
@@ -162,9 +162,9 @@ if _args.resume:
     print(f"Resumed from {_args.resume}  (continuing from epoch {start_epoch})\n")
 
 
-def train_epoch(epoch: int) -> tuple[float, float, float]:
+def train_epoch(epoch: int) -> tuple[float, float, float, float]:
     model.train()
-    total_ce, total_trunc, correct, total = 0.0, 0.0, 0, 0
+    total_ce, total_trunc, total_cvqnn_trunc, correct, total = 0.0, 0.0, 0.0, 0, 0
     for patches, labels in tqdm(
         train_loader, desc=f"Epoch {epoch:>3}/{EPOCHS}", leave=False, unit="batch"
     ):
@@ -172,18 +172,25 @@ def train_epoch(epoch: int) -> tuple[float, float, float]:
         optimizer.zero_grad()
         out = model(patches, return_trunc_loss=True)
         logits, trunc_loss = out.logits, out.trunc_loss
+        cvqnn_trunc_loss = out.cvqnn_trunc_loss
         ce_loss = F.cross_entropy(logits, labels)
-        loss = ce_loss + quantum_cfg.trunc_lambda * trunc_loss
+        loss = (
+            ce_loss
+            + quantum_cfg.trunc_lambda * trunc_loss
+            + quantum_cfg.cvqnn_trunc_lambda * cvqnn_trunc_loss
+        )
         loss.backward()
         optimizer.step()
 
         n = labels.size(0)
-        total_ce    += ce_loss.item() * n
-        total_trunc += trunc_loss.item() * n
-        correct     += (logits.argmax(dim=-1) == labels).sum().item()
-        total       += n
+        total_ce          += ce_loss.item() * n
+        total_trunc       += trunc_loss.item() * n
+        total_cvqnn_trunc += cvqnn_trunc_loss.item() * n
+        correct           += (logits.argmax(dim=-1) == labels).sum().item()
+        total             += n
 
-    return total_ce / total, total_trunc / total, correct / total
+    return (total_ce / total, total_trunc / total,
+            total_cvqnn_trunc / total, correct / total)
 
 
 @torch.no_grad()
@@ -205,14 +212,14 @@ def evaluate() -> tuple[float, float]:
 # ---------------------------------------------------------------------------
 
 print(f"{'Epoch':<7} {'Train loss':<12} {'Train acc':<11} "
-      f"{'Test loss':<11} {'Test acc':<11} {'Trunc loss':<12} {'Time'}")
-print("─" * 76)
+      f"{'Test loss':<11} {'Test acc':<11} {'Trunc loss':<12} {'CVQNN trunc':<13} {'Time'}")
+print("─" * 89)
 
 run_start = time.time()
 
 for epoch in range(start_epoch, EPOCHS + 1):
     t0 = time.time()
-    train_loss, trunc_loss, train_acc = train_epoch(epoch)
+    train_loss, trunc_loss, cvqnn_trunc_loss, train_acc = train_epoch(epoch)
     test_loss, test_acc = evaluate()
     elapsed = time.time() - t0
 
@@ -221,9 +228,11 @@ for epoch in range(start_epoch, EPOCHS + 1):
     history["test_loss"].append(test_loss)
     history["test_acc"].append(test_acc)
     history["trunc_loss"].append(trunc_loss)
+    history["cvqnn_trunc_loss"].append(cvqnn_trunc_loss)
 
     print(f"{epoch:<7} {train_loss:<12.4f} {train_acc:<11.3f} "
-          f"{test_loss:<11.4f} {test_acc:<11.3f} {trunc_loss:<12.4f} {elapsed:.1f}s")
+          f"{test_loss:<11.4f} {test_acc:<11.3f} {trunc_loss:<12.4f} "
+          f"{cvqnn_trunc_loss:<13.6f} {elapsed:.1f}s")
 
     if epoch % CHECKPOINT_INTERVAL == 0:
         torch.save({
@@ -267,9 +276,10 @@ ax_acc.set_ylabel("Accuracy")
 ax_acc.set_title("Accuracy")
 ax_acc.legend()
 
-ax_trunc.plot(epochs_x, history["trunc_loss"], label="trunc loss", color="tab:orange")
+ax_trunc.plot(epochs_x, history["trunc_loss"], label="per-patch trunc loss", color="tab:orange")
+ax_trunc.plot(epochs_x, history["cvqnn_trunc_loss"], label="CVQNN (W) trunc loss", color="tab:green")
 ax_trunc.set_xlabel("Epoch")
-ax_trunc.set_ylabel("Avg per-patch truncation loss")
+ax_trunc.set_ylabel("Avg truncation loss")
 ax_trunc.set_title("Truncation Loss")
 ax_trunc.legend()
 

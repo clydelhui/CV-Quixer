@@ -134,28 +134,28 @@ class TestHyperCVAttentionHead:
             patch_size=7, num_patches=16, config=small_quantum_config,
         )
         patches = torch.randn(16, 49)   # 16 patches of 7×7 pixels
-        readout, _, _, _ = head(patches)
+        readout, _, _, _, _ = head(patches)
         assert readout.shape == (small_quantum_config.num_modes,)
 
     def test_readout_is_real(self, small_quantum_config):
         head = HyperCVAttentionHead(
             patch_size=7, num_patches=16, config=small_quantum_config,
         )
-        readout, _, _, _ = head(torch.randn(16, 49))
+        readout, _, _, _, _ = head(torch.randn(16, 49))
         assert not readout.is_complex()
 
     def test_state_data_is_tensor(self, small_quantum_config):
         head = HyperCVAttentionHead(
             patch_size=7, num_patches=16, config=small_quantum_config,
         )
-        _, state_data, _, _ = head(torch.randn(16, 49))
+        _, state_data, _, _, _ = head(torch.randn(16, 49))
         assert isinstance(state_data, torch.Tensor)
 
     def test_success_prob_positive(self, small_quantum_config):
         head = HyperCVAttentionHead(
             patch_size=7, num_patches=16, config=small_quantum_config,
         )
-        _, _, success_prob, _ = head(torch.randn(16, 49))
+        _, _, success_prob, _, _ = head(torch.randn(16, 49))
         assert success_prob.item() > 0
 
 
@@ -591,7 +591,7 @@ class TestM1M2TruncFusion:
             head.poly_coeffs.c.data[1] = 0.5   # make `result` depend on the LCU pass
         patches = torch.randn(16, 49)
 
-        _, _, _, fused = head(patches)
+        _, _, _, fused, _ = head(patches)
         helper = head._compute_patch_trunc_loss(
             patches, self._vacuum_flat(2, 4, head.torch_dtype),
             torch.device("cpu"), head.torch_dtype,
@@ -609,7 +609,7 @@ class TestM1M2TruncFusion:
             head, "_compute_patch_trunc_loss",
             wraps=head._compute_patch_trunc_loss,
         ) as spy:
-            _, _, _, tl = head(patches)
+            _, _, _, tl, _ = head(patches)
         assert spy.call_count == 0
         assert tl.dim() == 0 and not tl.is_complex()
         assert tl.item() == 0.0
@@ -617,7 +617,7 @@ class TestM1M2TruncFusion:
         head_n = HyperCVAttentionHead(
             patch_size=7, num_patches=16, config=self._config("norm"),
         )
-        _, _, _, tl_n = head_n(patches)
+        _, _, _, tl_n, _ = head_n(patches)
         assert tl.dtype == tl_n.dtype
         assert tl.device == tl_n.device
 
@@ -636,8 +636,8 @@ class TestM1M2TruncFusion:
             head_norm.poly_coeffs.c.data[1] = 0.5
         patches = torch.randn(16, 49)
 
-        r0, s0, sp0, _ = head_none(patches)
-        r1, s1, sp1, _ = head_norm(patches)
+        r0, s0, sp0, _, _ = head_none(patches)
+        r1, s1, sp1, _, _ = head_norm(patches)
         assert torch.allclose(r0, r1, atol=1e-10)
         assert torch.allclose(s0, s1, atol=1e-10)
         assert torch.allclose(sp0, sp1, atol=1e-10)
@@ -660,14 +660,14 @@ class TestM1M2TruncFusion:
                     h.poly_coeffs.c.data[1] = 0.5
             patches = torch.randn(3, 16, 49)
 
-            readouts, states, sps, tl = attn(patches)
+            readouts, states, sps, tl, _ = attn(patches)
 
             B = patches.shape[0]
             man_r, man_s, man_sp, man_tl = [], [], [], []
             for head in attn.heads:
                 rb, sb, spb, tlb = [], [], [], []
                 for b in range(B):
-                    r, s, sp, t = head(patches[b])
+                    r, s, sp, t, _ = head(patches[b])
                     rb.append(r)
                     sb.append(s)
                     spb.append(sp)
@@ -704,7 +704,7 @@ class TestM1M2TruncFusion:
         attn = HyperCVAttention(patch_size=7, num_patches=16, config=cfg)
         patches = torch.randn(2, 16, 49)
 
-        readouts, _, _, trunc_loss = attn(patches)
+        readouts, _, _, trunc_loss, _ = attn(patches)
         # Depend on both the readout path and the trunc path so the gradient
         # exercises every head's hypernetwork + coefficient parameters.
         (readouts.sum() + trunc_loss).backward()
@@ -728,7 +728,7 @@ class TestM1M2TruncFusion:
             head, "_compute_patch_trunc_loss",
             wraps=head._compute_patch_trunc_loss,
         ) as spy:
-            _, _, _, tl = head(patches)
+            _, _, _, tl, _ = head(patches)
         assert spy.call_count == 1
 
         helper = head._compute_patch_trunc_loss(
@@ -806,7 +806,7 @@ class TestM3PostSelection:
             head.poly_coeffs.c.data.copy_(torch.tensor(coeffs))
         patches = torch.randn(16, 49)
 
-        readout, _, success_prob, _ = head(patches)
+        readout, _, success_prob, _, _ = head(patches)
         assert torch.isfinite(readout).all(), name
         assert torch.isfinite(success_prob).all(), name
 
@@ -855,7 +855,7 @@ class TestM3PostSelection:
             head.poly_coeffs.c.data.zero_()
         patches = torch.randn(16, 49)
 
-        readout, state_data, success_prob, _ = head(patches)
+        readout, state_data, success_prob, _, _ = head(patches)
         assert success_prob.item() == 0.0
         assert torch.all(state_data == 0)
         assert torch.all(readout == 0)
@@ -955,8 +955,13 @@ class TestAutoScaling:
         # count (=13050) the pre-refactor closed-form formula produced for the
         # canonical full config, so existing runs stay comparable. Captured 2026-05-31.
         # scaling_knob is passed explicitly (the default is now num_heads) so this
-        # keeps pinning the cnn_channels_2 resolution specifically.
-        model = CVQuixer(self._quantum(scaling_knob="cnn_channels_2"), self._data())
+        # keeps pinning the cnn_channels_2 resolution specifically. cvqnn_num_layers=0
+        # pins the *pre-W* architecture this count was captured for (the CVQNN block
+        # post-dates it); the W-on count is necessarily different.
+        model = CVQuixer(
+            self._quantum(scaling_knob="cnn_channels_2", cvqnn_num_layers=0),
+            self._data(),
+        )
         assert model.config.cnn_channels_2 == 14
         assert count_parameters(model) == 13050
 
@@ -1254,7 +1259,7 @@ class TestGateParamBound:
         with torch.no_grad():
             head.hypernetwork.linear.bias.fill_(200.0)
         patches = torch.randn(16, 49)
-        readout, _, success_prob, trunc = head(patches)
+        readout, _, success_prob, trunc, _ = head(patches)
         assert torch.isfinite(readout).all()
         assert torch.isfinite(trunc)
         assert torch.isfinite(success_prob)
@@ -1277,3 +1282,117 @@ class TestGateParamBound:
         sn = head_n._apply_patch_gates_to_state(params, vac, dev, dt)
         assert torch.isfinite(sb.data).all()
         assert not torch.allclose(sb.data, sn.data)
+
+
+class TestArchitectureDepth:
+    """Configurable depth (cnn_num_conv_layers / hypernet_num_linear_layers /
+    decoder_num_layers) is additive: defaults reproduce the historic architecture
+    byte-for-byte (same state-dict keys, checkpoint-compatible), and deeper values
+    build, forward, add parameters, and receive gradients."""
+
+    def _patches(self, data_cfg, batch=2):
+        patch_dim = data_cfg.patch_size ** 2
+        num_patches = (data_cfg.image_size // data_cfg.patch_size) ** 2
+        return torch.randn(batch, num_patches, patch_dim)
+
+    def test_defaults_preserve_state_dict_keys(self, small_quantum_config, tiny_data_config):
+        """At default depth, no extra_convs/hidden_linears keys exist and the
+        decoder keys are exactly the historic net.0/net.2 — so existing
+        checkpoints still load."""
+        model = CVQuixer(small_quantum_config, tiny_data_config)
+        keys = set(model.state_dict().keys())
+        assert not any("extra_convs" in k for k in keys)
+        assert not any("hidden_linears" in k for k in keys)
+        decoder_keys = sorted(k for k in keys if k.startswith("decoder.net"))
+        assert decoder_keys == [
+            "decoder.net.0.bias", "decoder.net.0.weight",
+            "decoder.net.2.bias", "decoder.net.2.weight",
+        ]
+
+    def test_deep_config_builds_and_adds_params(self, small_quantum_config, tiny_data_config):
+        import dataclasses
+        base = CVQuixer(small_quantum_config, tiny_data_config)
+        deep_cfg = dataclasses.replace(
+            small_quantum_config,
+            cnn_num_conv_layers=4,
+            hypernet_num_linear_layers=3,
+            decoder_num_layers=4,
+        )
+        deep = CVQuixer(deep_cfg, tiny_data_config)
+        keys = set(deep.state_dict().keys())
+        assert any("extra_convs" in k for k in keys)
+        assert any("hidden_linears" in k for k in keys)
+        # decoder keeps net.0/net.2 and appends deeper layers
+        assert {"decoder.net.0.weight", "decoder.net.4.weight"} <= keys
+        assert count_parameters(deep) > count_parameters(base)
+
+    def test_deep_config_forward_and_grad(self, small_quantum_config, tiny_data_config):
+        import dataclasses
+        import torch.nn.functional as F
+        deep_cfg = dataclasses.replace(
+            small_quantum_config,
+            cnn_num_conv_layers=3,
+            hypernet_num_linear_layers=2,
+            decoder_num_layers=3,
+        )
+        model = CVQuixer(deep_cfg, tiny_data_config)
+        patches = self._patches(tiny_data_config)
+        logits = model(patches)
+        assert logits.shape == (2, tiny_data_config.num_classes)
+        assert not torch.isnan(logits).any()
+        loss = F.cross_entropy(logits, torch.randint(0, tiny_data_config.num_classes, (2,)))
+        loss.backward()
+        # The new depth modules must be connected to the autograd graph.
+        deep_params = [
+            p for n, p in model.named_parameters()
+            if "extra_convs" in n or "hidden_linears" in n
+        ]
+        assert deep_params
+        assert all(p.grad is not None for p in deep_params)
+
+    def test_shared_variant_deepens(self, small_quantum_config, tiny_data_config):
+        import dataclasses
+        deep_cfg = dataclasses.replace(
+            small_quantum_config,
+            cnn_num_conv_layers=3,
+            hypernet_num_linear_layers=2,
+        )
+        model = SharedCVQuixer(deep_cfg, tiny_data_config)
+        keys = set(model.state_dict().keys())
+        assert any("extra_convs" in k for k in keys)
+        assert any("hidden_linears" in k for k in keys)
+        logits = model(self._patches(tiny_data_config))
+        assert logits.shape == (2, tiny_data_config.num_classes)
+
+    def test_depth_fields_are_valid_scaling_knobs(self):
+        """Each new int field is auto-accepted as a scaling_knob by __post_init__."""
+        for knob in ("cnn_num_conv_layers", "hypernet_num_linear_layers", "decoder_num_layers"):
+            QuantumConfig(num_modes=2, cutoff_dim=4, scaling_knob=knob)  # must not raise
+
+    def test_decoder_hidden_mult_sizes_decoder(self, small_quantum_config, tiny_data_config):
+        """decoder_hidden_mult = c resolves decoder_hidden_dim = max(1, round(c*in_dim))."""
+        import dataclasses
+        from cv_quixer.models.quantum.cv_attention import _readout_total_dim
+        cfg = dataclasses.replace(small_quantum_config, decoder_hidden_mult=2.0)
+        model = CVQuixer(cfg, tiny_data_config)
+        in_dim = cfg.num_heads * _readout_total_dim(cfg._observable_plan)
+        expected = max(1, round(2.0 * in_dim))
+        assert model.config.decoder_hidden_dim == expected
+        assert model.decoder.net[0].out_features == expected
+
+    def test_decoder_hidden_mult_reload_idempotent(self, small_quantum_config, tiny_data_config):
+        """Rebuilding from the resolved config (asdict round-trip) is idempotent."""
+        import dataclasses
+        cfg = dataclasses.replace(small_quantum_config, decoder_hidden_mult=1.5)
+        m1 = CVQuixer(cfg, tiny_data_config)
+        m2 = CVQuixer(m1.config, tiny_data_config)
+        assert m1.config.decoder_hidden_dim == m2.config.decoder_hidden_dim
+
+    def test_decoder_hidden_mult_must_be_positive(self):
+        with pytest.raises(ValueError, match="decoder_hidden_mult must be > 0"):
+            QuantumConfig(num_modes=2, cutoff_dim=4, decoder_hidden_mult=0.0)
+
+    def test_decoder_hidden_mult_default_off(self, small_quantum_config, tiny_data_config):
+        """Default (None) leaves decoder_hidden_dim at its configured static value."""
+        model = CVQuixer(small_quantum_config, tiny_data_config)
+        assert model.config.decoder_hidden_dim == small_quantum_config.decoder_hidden_dim

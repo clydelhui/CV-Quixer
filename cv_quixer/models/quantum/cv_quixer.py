@@ -19,6 +19,7 @@ target.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import NamedTuple, Optional
 
 import torch
@@ -47,6 +48,7 @@ class CVQuixerOut(NamedTuple):
 
     logits: torch.Tensor
     trunc_loss: Optional[torch.Tensor] = None
+    cvqnn_trunc_loss: Optional[torch.Tensor] = None
     readouts: Optional[torch.Tensor] = None
     states: Optional[list[torch.Tensor]] = None
     success_probs: Optional[list[torch.Tensor]] = None
@@ -58,23 +60,32 @@ class CVQuixerOut(NamedTuple):
 
 
 class CVDecoder(nn.Module):
-    """Two-layer MLP: concatenated head readouts → class logits.
+    """MLP: concatenated head readouts → class logits.
 
     Args:
         in_dim:      Total readout width = num_heads × len(observable_plan),
                      where observable_plan is the expanded per-head sequence
                      of (type, mode, n) entries derived from QuantumConfig.
-        hidden_dim:  Width of the hidden layer.
+        hidden_dim:  Width of the hidden layer(s).
         num_classes: Number of output classes.
+        num_layers:  Total Linear layers. 2 (default) = the historic
+                     Linear(in→h)→ReLU→Linear(h→classes), whose state-dict keys
+                     (``net.0``/``net.2``) are preserved. >2 inserts
+                     (num_layers-2) extra hidden h→h ReLU blocks before the
+                     output layer (appending ``net.4`` ...).
     """
 
-    def __init__(self, in_dim: int, hidden_dim: int, num_classes: int) -> None:
+    def __init__(
+        self, in_dim: int, hidden_dim: int, num_classes: int, num_layers: int = 2
+    ) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, num_classes),
-        )
+        if num_layers < 2:
+            raise ValueError(f"decoder num_layers must be >= 2, got {num_layers}")
+        layers: list[nn.Module] = [nn.Linear(in_dim, hidden_dim), nn.ReLU()]
+        for _ in range(num_layers - 2):
+            layers += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]
+        layers.append(nn.Linear(hidden_dim, num_classes))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Decode readouts to logits.
@@ -138,6 +149,11 @@ class _CVQuixerBase(BaseVisionTransformer):
               logits:        (B, num_classes) — always populated.
               trunc_loss:    scalar — populated when return_trunc_loss=True
                              and trunc_penalty != "none" (else None).
+              cvqnn_trunc_loss: scalar — the CVQNN block's truncation leakage
+                             (1 − ‖W|ψ⟩‖²), populated when return_trunc_loss=True
+                             (0 when cvqnn_num_layers == 0). Independent of
+                             trunc_penalty; weighted by cvqnn_trunc_lambda in
+                             the training loss.
               readouts:      (B, num_heads * len(observable_plan)) — populated
                              when return_readouts=True.
               states:        list[Tensor] — populated when return_states=True.
@@ -151,7 +167,9 @@ class _CVQuixerBase(BaseVisionTransformer):
                 "the model is pending."
             )
 
-        readouts, states, success_probs, trunc_loss = self.cv_attention(patches)
+        readouts, states, success_probs, trunc_loss, cvqnn_trunc_loss = (
+            self.cv_attention(patches)
+        )
         logits = self.decoder(readouts)                           # (B, num_classes)
 
         if not (return_trunc_loss or return_readouts or return_states):
@@ -164,10 +182,39 @@ class _CVQuixerBase(BaseVisionTransformer):
                 if return_trunc_loss and self.trunc_penalty != "none"
                 else None
             ),
+            # W's penalty is its own concern, independent of trunc_penalty — it is
+            # always computed (it is the norm used for the post-W renorm) and is 0
+            # when cvqnn_num_layers == 0. Surfaced whenever trunc loss is requested.
+            cvqnn_trunc_loss=(
+                cvqnn_trunc_loss.to(logits.device)
+                if return_trunc_loss
+                else None
+            ),
             readouts=readouts if return_readouts else None,
             states=states if return_states else None,
             success_probs=success_probs if return_states else None,
         )
+
+
+# ---------------------------------------------------------------------------
+# Shared config resolution
+# ---------------------------------------------------------------------------
+
+
+def _resolve_decoder_hidden(config: QuantumConfig) -> QuantumConfig:
+    """Resolve ``decoder_hidden_dim`` from ``decoder_hidden_mult`` if set.
+
+    With ``decoder_hidden_mult = c``, the decoder hidden width is sized relative
+    to its input ``in_dim = num_heads × readout_width`` as
+    ``decoder_hidden_dim = max(1, round(c × in_dim))``. Called *after* any
+    ``target_params`` auto-scaling so ``num_heads`` is final; returns the config
+    unchanged when the multiplier is None. Deterministic ⇒ idempotent on reload.
+    """
+    if config.decoder_hidden_mult is None:
+        return config
+    in_dim = config.num_heads * _readout_total_dim(config._observable_plan)
+    hidden = max(1, round(config.decoder_hidden_mult * in_dim))
+    return dataclasses.replace(config, decoder_hidden_dim=hidden)
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +276,10 @@ class CVQuixer(_CVQuixerBase):
                 step=step,
             )
 
+        # Size the decoder hidden dim relative to its input, if requested (after
+        # auto-scaling, so num_heads — and thus the decoder input width — is final).
+        config = _resolve_decoder_hidden(config)
+
         self.config = config
         self.cv_attention = HyperCVAttention(patch_size, num_patches, config)
         per_head_dim = _readout_total_dim(config._observable_plan)
@@ -236,12 +287,14 @@ class CVQuixer(_CVQuixerBase):
             in_dim=config.num_heads * per_head_dim,
             hidden_dim=config.decoder_hidden_dim,
             num_classes=data_config.num_classes,
+            num_layers=config.decoder_num_layers,
         )
 
         # Kept for truncation loss computation in forward()
         self._circuit = CVCircuit(config.num_modes, config.cutoff_dim)
         self.trunc_penalty = config.trunc_penalty
         self.trunc_lambda = config.trunc_lambda
+        self.cvqnn_trunc_lambda = config.cvqnn_trunc_lambda
 
     # forward() is inherited from _CVQuixerBase.
 
@@ -293,6 +346,10 @@ class SharedCVQuixer(_CVQuixerBase):
                 step=1,
             )
 
+        # Size the decoder hidden dim relative to its input, if requested (after
+        # auto-scaling, so num_heads — and thus the decoder input width — is final).
+        config = _resolve_decoder_hidden(config)
+
         self.config = config
         self.cv_attention = SharedCVAttention(patch_size, num_patches, config)
         per_head_dim = _readout_total_dim(config._observable_plan)
@@ -300,11 +357,13 @@ class SharedCVQuixer(_CVQuixerBase):
             in_dim=config.num_heads * per_head_dim,
             hidden_dim=config.decoder_hidden_dim,
             num_classes=data_config.num_classes,
+            num_layers=config.decoder_num_layers,
         )
 
         # Kept for truncation loss computation in forward()
         self._circuit = CVCircuit(config.num_modes, config.cutoff_dim)
         self.trunc_penalty = config.trunc_penalty
         self.trunc_lambda = config.trunc_lambda
+        self.cvqnn_trunc_lambda = config.cvqnn_trunc_lambda
 
     # forward() is inherited from _CVQuixerBase.

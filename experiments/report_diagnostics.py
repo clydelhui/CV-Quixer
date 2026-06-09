@@ -31,10 +31,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import warnings
 from pathlib import Path
 
-import dacite
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -42,6 +42,7 @@ import numpy as np
 from tqdm import tqdm
 
 from cv_quixer.config.schema import ExperimentConfig
+from cv_quixer.config.utils import experiment_config_from_dict
 from cv_quixer.evaluation.labels import class_names
 
 # Heavy / torch-dependent imports (build_model, PatchedDataset, DataLoader,
@@ -258,11 +259,7 @@ def load_run(run_dir: Path, epoch_arg: str) -> dict:
 
     with open(config_path) as f:
         config_dict = json.load(f)
-    config: ExperimentConfig = dacite.from_dict(
-        data_class=ExperimentConfig,
-        data=config_dict,
-        config=dacite.Config(strict=False),
-    )
+    config: ExperimentConfig = experiment_config_from_dict(config_dict)
 
     with open(history_path) as f:
         history = json.load(f)
@@ -562,6 +559,29 @@ def plot_training_curves(run: dict) -> None:
         fig.savefig(fig_dir / "trunc_loss_curve.png", dpi=150)
         plt.close(fig)
         print("  ✓ trunc_loss_curve.png")
+
+    # Per-epoch CVQNN block (W) truncation loss — the separate 1 − ‖W|ψ⟩‖²
+    # leakage, tracked independently of the per-patch trunc loss above. Absent
+    # (empty) for pre-W runs / cvqnn_num_layers == 0, in which case this is
+    # skipped.
+    cvqnn_trunc = eh.get("cvqnn_trunc_loss") or []
+    test_cvqnn_trunc = eh.get("test_cvqnn_trunc_loss") or []
+    if cvqnn_trunc or test_cvqnn_trunc:
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        if cvqnn_trunc:
+            ax.plot(epoch_x[:len(cvqnn_trunc)], cvqnn_trunc,
+                    label="train CVQNN trunc loss", color="tab:green", marker="o")
+        if test_cvqnn_trunc:
+            ax.plot(epoch_x[:len(test_cvqnn_trunc)], test_cvqnn_trunc,
+                    label="test CVQNN trunc loss", color="tab:red", marker="s")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Mean CVQNN (W) truncation loss")
+        ax.set_title("CVQNN block (W) truncation loss (per epoch) — from training log")
+        ax.legend(); ax.grid(alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(fig_dir / "cvqnn_trunc_loss_curve.png", dpi=150)
+        plt.close(fig)
+        print("  ✓ cvqnn_trunc_loss_curve.png")
 
     # Per-class accuracy curve (test) — derived per epoch from predictions.
     per_class = np.stack(
@@ -904,6 +924,43 @@ def plot_hypernet_gate_histograms(run: dict) -> None:
     print("  ✓ hypernet_gate_param_histograms.png")
 
 
+def plot_cvqnn_param_values(run: dict) -> None:
+    """Per-head CVQNN block (W) learned gate-param values, vs the identity (0).
+
+    W's params are fixed (input-independent) per head, so we plot the raw learned
+    vector per head as a stem/bar — how far each gate param has drifted from the
+    near-identity small-random init directly answers "is W doing anything?".
+    Absent for pre-W runs / cvqnn_num_layers == 0 (no `cvqnn_params` key), which
+    is skipped (not an error).
+    """
+    diag = run["diagnostics"]
+    if diag is None or "cvqnn_params" not in diag:
+        print("  - no `cvqnn_params` in diagnostics/ (cvqnn_num_layers == 0?) "
+              "→ skipping cvqnn_param_values")
+        return
+    arr = np.asarray(diag["cvqnn_params"])   # (num_heads, cvqnn_param_count)
+    if arr.ndim != 2 or arr.size == 0:
+        print("  - empty `cvqnn_params` → skipping cvqnn_param_values")
+        return
+    num_heads, n_param = arr.shape
+    x = np.arange(n_param)
+    fig, axes = plt.subplots(num_heads, 1,
+                             figsize=(max(6, 0.25 * n_param), 1.8 * num_heads),
+                             squeeze=False)
+    for h in range(num_heads):
+        ax = axes[h, 0]
+        ax.axhline(0.0, color="gray", lw=0.8, ls="--")  # identity reference
+        ax.bar(x, arr[h], color="tab:purple", alpha=0.8)
+        ax.set_ylabel(f"head {h}", fontsize=8)
+        ax.tick_params(axis="both", labelsize=6)
+    axes[-1, 0].set_xlabel("W gate-param index (plan order)", fontsize=8)
+    fig.suptitle(f"CVQNN block (W) gate-param values vs identity (epoch {run['epoch']})")
+    fig.tight_layout()
+    fig.savefig(run["fig_dir"] / "cvqnn_param_values.png", dpi=150)
+    plt.close(fig)
+    print("  ✓ cvqnn_param_values.png")
+
+
 def plot_photon_number_per_mode(run: dict) -> None:
     diag = run["diagnostics"]
     if diag is None or "mean_photon_number" not in diag:
@@ -1153,6 +1210,12 @@ def main() -> None:
                              "to verify the two paths agree.")
     args = parser.parse_args()
 
+    # Line-buffer stdout so progress streams live even when piped / redirected /
+    # captured (incl. as report_sweep's subprocess) — non-TTY block-buffers by
+    # default, making the run look hung.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+
     if args.multi_run and not args.run_dir:
         multi_run_sample_efficiency(Path("."))
         return
@@ -1179,6 +1242,7 @@ def main() -> None:
         ("top_k_accuracy",                 plot_top_k_accuracy),
         ("calibration_reliability",        plot_calibration_reliability),
         ("hypernet_gate_param_histograms", plot_hypernet_gate_histograms),
+        ("cvqnn_param_values",             plot_cvqnn_param_values),
         ("photon_number_per_mode",         plot_photon_number_per_mode),
         ("state_norm_histogram",           plot_state_norm_histogram),
         ("lcu_coefficients_heatmap",       plot_lcu_coefficients_heatmap),
