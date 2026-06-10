@@ -196,6 +196,28 @@ class QuantumConfig:
     # penalised.
     cvqnn_trunc_lambda: float = 0.01
 
+    # Seq-to-seq stacked model (model="quantum_stacked" only — the canonical
+    # quantum/quantum_shared models ignore these four fields; see ADR-0002).
+    # Number of uniform seq-to-seq blocks. Does NOT count the optional final
+    # aggregator block (pooling="quixer"); >= 1 is enforced — a 0-block model
+    # with an aggregator on raw patches is exactly the existing CVQuixer, which
+    # remains the sole owner of that configuration. A valid (monotonic)
+    # scaling_knob, but too coarse for budget targeting.
+    num_seq2seq_blocks: int = 1
+    # How the final block's N tokens become the decoder input: "mean" pools over
+    # positions; "quixer" appends a canonical seq-to-one aggregator block
+    # (vacuum input, no query unitaries). Both end at the same H×R decoder width.
+    pooling: str = "mean"
+    # Identity residual x + block(x) from block 2 onward (block 1's input/output
+    # widths differ, so it never has one). False = pure-pipeline ablation.
+    block_residual: bool = True
+    # Weight of the SEPARATE query truncation penalty mean_i(1 - ‖U_{q,i}|0⟩‖²)
+    # added to the training loss. Like cvqnn_trunc_lambda (and unlike the
+    # compounding per-patch trunc_lambda), query leakage is a single-application
+    # leak — the query unitary fires once per position, before the polynomial —
+    # hence the lighter default. 0 → tracked but not penalised.
+    query_trunc_lambda: float = 0.01
+
     # Soft-clip on the magnitude gate params (squeeze r, displacement re/im) via
     # b·tanh(x/b), keeping them in (-b, b). This stops the gates from driving the
     # state far past the Fock cutoff, where the truncated sub-isometries become
@@ -254,6 +276,19 @@ class QuantumConfig:
         if self.cvqnn_num_layers < 0:
             raise ValueError(
                 f"cvqnn_num_layers must be >= 0, got {self.cvqnn_num_layers}"
+            )
+
+        if self.num_seq2seq_blocks < 1:
+            raise ValueError(
+                f"num_seq2seq_blocks must be >= 1, got {self.num_seq2seq_blocks}"
+            )
+        if self.pooling not in ("mean", "quixer"):
+            raise ValueError(
+                f"pooling must be 'mean' or 'quixer', got {self.pooling!r}"
+            )
+        if self.query_trunc_lambda < 0:
+            raise ValueError(
+                f"query_trunc_lambda must be >= 0, got {self.query_trunc_lambda}"
             )
 
         if (

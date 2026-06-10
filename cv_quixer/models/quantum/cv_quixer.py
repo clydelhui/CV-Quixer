@@ -52,6 +52,10 @@ class CVQuixerOut(NamedTuple):
     readouts: Optional[torch.Tensor] = None
     states: Optional[list[torch.Tensor]] = None
     success_probs: Optional[list[torch.Tensor]] = None
+    # Query-unitary truncation leakage mean_i(1 − ‖U_{q,i}|0⟩‖²) — only the
+    # seq-to-seq stacked model has query unitaries, so the canonical models
+    # leave this None (the stream does not exist for them, ADR-0002).
+    query_trunc_loss: Optional[torch.Tensor] = None
 
 
 # ---------------------------------------------------------------------------

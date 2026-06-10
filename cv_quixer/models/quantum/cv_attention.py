@@ -377,6 +377,10 @@ class CNNHypernetwork(nn.Module):
         num_layers:    Per-patch circuit depth L. The output width is the full
                        op-plan size (L gate sequences + L-1 BS->Rot
                        interferometers); L=1 reproduces the single-layer width.
+        param_count_multiplier: Emit this many op-plan-sized parameter vectors
+                       per patch (concatenated). 1 (default) = the historic
+                       single U_i vector; the seq-to-seq heads use 2 (key slice
+                       + query slice, ADR-0002).
     """
 
     def __init__(
@@ -391,6 +395,7 @@ class CNNHypernetwork(nn.Module):
         num_layers: int = 1,
         cnn_num_conv_layers: int = 2,
         hypernet_num_linear_layers: int = 1,
+        param_count_multiplier: int = 1,
     ) -> None:
         super().__init__()
         if cnn_num_conv_layers < 2:
@@ -411,7 +416,7 @@ class CNNHypernetwork(nn.Module):
         feature_dim = cnn_channels_2 * h_out * h_out
         gate_params = _op_plan_param_count(
             _build_op_plan(num_layers), num_modes, bs_topology
-        )
+        ) * param_count_multiplier
 
         self.conv1 = nn.Conv2d(1, cnn_channels_1, cnn_kernel_size)
         self.conv2 = nn.Conv2d(cnn_channels_1, cnn_channels_2, cnn_kernel_size)
@@ -633,6 +638,11 @@ class _CVHeadBase(nn.Module):
         # both _apply_patch_gates_to_state and the hypernetwork output width.
         self.num_layers = config.num_layers
         self._op_plan = _build_op_plan(config.num_layers)
+        # Per-patch gate-param vector width for one U_i (the seq-to-seq heads
+        # emit 2× this: key slice + query slice).
+        self._gate_param_width = _op_plan_param_count(
+            self._op_plan, config.num_modes, config.bs_topology
+        )
 
         # Optional soft-clip on magnitude gate params (overflow guard). Trace-time
         # constant (plain float / None), so the branch in _apply_patch_gates_to_state
@@ -825,17 +835,39 @@ class _CVHeadBase(nn.Module):
             (D^num_modes,). If True: a tuple ``(result, norm_sq_sum)`` where
             ``norm_sq_sum`` is a real 0-dim tensor equal to Σ_i ‖U_i|v⟩‖².
         """
+        # Batched per-patch param net — all N patches in one call — then the
+        # params-based core (shared with the seq-to-seq path, which precomputes
+        # its key params once and reuses them across all query positions).
+        all_params = self._features_to_params(patches).to(device)  # (N, gp)
+        return self._apply_lcu_params_to_vector(
+            all_params, v, device, dtype, accumulate_norm_sq=accumulate_norm_sq
+        )
+
+    def _apply_lcu_params_to_vector(
+        self,
+        all_params: torch.Tensor,
+        v: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+        *,
+        accumulate_norm_sq: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Params-based core of ``_apply_lcu_to_vector``.
+
+        Identical contract, but takes the precomputed per-patch gate parameters
+        ``all_params`` of shape (N, gate_param_width) instead of recomputing them
+        from features — the seq-to-seq block applies one key-param set to N
+        different query states, so the param net must run once, outside the
+        per-position vmap.
+        """
         D, m = self.cutoff_dim, self.num_modes
-        N = patches.shape[0]
+        N = all_params.shape[0]
         b = self.lcu_coeffs().to(device)                       # (N,) complex
 
-        # 1. Batched per-patch param net — all N patches in one call.
-        all_params = self._features_to_params(patches).to(device)  # (N, gp)
-
-        # 2. Vmap per-patch gate application over N. The shared input vector
-        #    `v_data` is broadcast (in_dims=None); device/dtype are trace-time
-        #    constants. Nests inside the batch vmap, which itself nests inside
-        #    the head vmap in HyperCVAttention (head → batch → patch).
+        # Vmap per-patch gate application over N. The shared input vector
+        # `v_data` is broadcast (in_dims=None); device/dtype are trace-time
+        # constants. Nests inside the batch vmap, which itself nests inside
+        # the head vmap in HyperCVAttention (head → batch → patch).
         v_data = v.reshape((D,) * m)
         apply_one = lambda p: self._apply_patch_gates_to_data(
             p, v_data, device, dtype
@@ -932,26 +964,128 @@ class _CVHeadBase(nn.Module):
             success_prob: Scalar — ‖P(M)|ψ⟩‖² (QSVT post-selection probability).
             avg_trunc_loss: Scalar in [0, 1] — only when ``want_trunc`` is True.
         """
+        # Param net runs once here (not once per polynomial pass) and feeds the
+        # params-based core shared with the seq-to-seq path.
+        all_params = self._features_to_params(patches).to(device)  # (N, gp)
+        return self._apply_polynomial_iterative_params(
+            all_params, state_flat, device, dtype, want_trunc=want_trunc
+        )
+
+    def _apply_polynomial_iterative_params(
+        self,
+        all_params: torch.Tensor,
+        state_flat: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+        *,
+        want_trunc: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Params-based core of ``_apply_polynomial_iterative``.
+
+        Identical contract, but takes precomputed per-patch gate parameters
+        (N, gate_param_width). With ``want_trunc`` the fused first-pass summary
+        measures the LCU terms' leakage on the *actual input state*
+        ``state_flat`` (the vacuum for the canonical/aggregator heads, a query
+        state in a seq-to-seq block — ADR-0002).
+        """
         c = self.poly_coeffs().to(device)   # (d+1,) real — move to quantum device
         result = torch.zeros_like(state_flat)
-        vacuum_norm_sq = torch.zeros((), device=device, dtype=self._real_dtype)
+        input_norm_sq = torch.zeros((), device=device, dtype=self._real_dtype)
         v = state_flat
         for j in range(len(c)):
             result = result + c[j].to(dtype) * v
             if j < len(c) - 1:
                 if want_trunc and j == 0:
-                    # First pass: v is the vacuum. Fuse the trunc summary here
-                    # so U_i|0⟩ is computed once, not twice (audit M2).
-                    v, vacuum_norm_sq = self._apply_lcu_to_vector(
-                        patches, v, device, dtype, accumulate_norm_sq=True
+                    # First pass: v is the polynomial's input state. Fuse the
+                    # trunc summary here so U_i|v⟩ is computed once, not twice.
+                    v, input_norm_sq = self._apply_lcu_params_to_vector(
+                        all_params, v, device, dtype, accumulate_norm_sq=True
                     )
                 else:
-                    v = self._apply_lcu_to_vector(patches, v, device, dtype)
+                    v = self._apply_lcu_params_to_vector(all_params, v, device, dtype)
         success_prob = (result.abs() ** 2).sum()
         if want_trunc:
-            avg_trunc_loss = 1.0 - vacuum_norm_sq / float(patches.shape[0])
+            avg_trunc_loss = 1.0 - input_norm_sq / float(all_params.shape[0])
             return result, success_prob, avg_trunc_loss
         return result, success_prob
+
+    def _postselect_renorm(
+        self, out_unnorm: torch.Tensor, norm_sq: torch.Tensor
+    ) -> torch.Tensor:
+        """Guarded renormalisation to a unit-norm state.
+
+        Clamp the *divisor* (not the result) so the division is always finite —
+        this keeps the scaled state's gradient finite even when ``norm_sq`` is
+        exactly 0 (0/0). torch.where then forces a failed renormalisation to an
+        exactly-zero state; because the scaled state is finite, the where-branch
+        gradient is 0·grad = 0 (not 0·NaN), so a near-zero-norm element
+        contributes a zero gradient instead of a ~1/√ε explosion. Shared by the
+        post-selection, CVQNN, and query-state renorms.
+        """
+        safe = norm_sq.clamp(min=_SUCCESS_PROB_FLOOR)
+        scaled = out_unnorm / safe.sqrt()
+        return torch.where(
+            norm_sq > _SUCCESS_PROB_FLOOR,
+            scaled,
+            torch.zeros_like(out_unnorm),
+        )
+
+    def _apply_cvqnn(
+        self,
+        out_norm: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply the CVQNN block W to a unit-norm flat state and renormalise.
+
+        Returns ``(out_w_flat, w_trunc_loss)`` where ``w_trunc_loss`` is W's
+        truncation leakage 1 − ‖W|ψ⟩‖² captured *before* the renorm (it feeds the
+        separate cvqnn_trunc_lambda penalty). ``cvqnn_num_layers`` is a
+        trace-time constant, so exactly one branch is traced under vmap; at
+        L_W == 0 this is the identity with a zero leakage scalar.
+        """
+        if self.cvqnn_num_layers == 0:
+            return out_norm, torch.zeros((), device=device, dtype=self._real_dtype)
+
+        D, n = self.cutoff_dim, self.num_modes
+        pre_w_state = FockState(out_norm.reshape((D,) * n), n, D)
+        # Move W params to the quantum device (CPU under MPS, which lacks the
+        # float64 the analytic gate matrices use). vmap-safe (per-head slice).
+        cvqnn_params = self.cvqnn_params.to(device)
+        w_state = self._apply_gate_plan(
+            self._cvqnn_plan, cvqnn_params, pre_w_state, device, dtype
+        )
+        w_flat = w_state.data.reshape(-1)
+        w_norm_sq = (w_flat.abs() ** 2).sum()
+        w_trunc_loss = 1.0 - w_norm_sq
+        return self._postselect_renorm(w_flat, w_norm_sq), w_trunc_loss
+
+    def _measure_plan(self, output_state: FockState) -> torch.Tensor:
+        """Measure the configured observable plan, in plan order.
+
+        Plan order is the source of truth for the readout vector layout —
+        legacy alias translation preserves the pre-refactor ordering so
+        checkpoints remain bit-compatible. Result stays on the quantum device.
+        """
+        readout_values: list[torch.Tensor] = []
+        for spec in self._observable_plan:
+            if spec.type == "x":
+                readout_values.append(self.circuit.measure_quadrature_x(spec.mode, output_state))
+            elif spec.type == "p":
+                readout_values.append(self.circuit.measure_quadrature_p(spec.mode, output_state))
+            elif spec.type == "x_squared":
+                readout_values.append(self.circuit.measure_quadrature_x_squared(spec.mode, output_state))
+            elif spec.type == "p_squared":
+                readout_values.append(self.circuit.measure_quadrature_p_squared(spec.mode, output_state))
+            elif spec.type == "n":
+                readout_values.append(self.circuit.measure_photon_number(spec.mode, output_state))
+            elif spec.type == "prob_n":
+                readout_values.append(
+                    self.circuit.measure_prob_n_photons(spec.mode, spec.n, output_state)
+                )
+            else:
+                raise ValueError(f"Unknown observable type {spec.type!r}")
+        return torch.stack(readout_values)
 
     # ------------------------------------------------------------------
     # Forward
@@ -1028,89 +1162,24 @@ class _CVHeadBase(nn.Module):
                 patches, state_flat, quantum_device, dtype
             )
 
-        # 4. Post-selection renormalisation: divide by ‖P(M)|ψ⟩‖ to give a unit-norm state.
-        # success_prob = ‖out_unnorm‖²; deviation from 1 is the QSVT post-selection cost.
-        # Clamp the *divisor* (not the result) so the division is always finite —
-        # this keeps out_scaled's gradient finite even when success_prob is
-        # exactly 0 (0/0). torch.where then forces a failed post-selection to an
-        # exactly-zero state; because out_scaled is finite, the where-branch
-        # gradient is 0·grad = 0 (not 0·NaN), so a near-zero-norm batch element
-        # contributes a zero gradient instead of a ~1/√ε explosion.
-        safe_sp = success_prob.clamp(min=_SUCCESS_PROB_FLOOR)
-        out_scaled = out_unnorm / safe_sp.sqrt()
-        out_norm = torch.where(
-            success_prob > _SUCCESS_PROB_FLOOR,
-            out_scaled,
-            torch.zeros_like(out_unnorm),
-        )
+        # 4. Post-selection renormalisation: divide by ‖P(M)|ψ⟩‖ to give a
+        # unit-norm state. success_prob = ‖out_unnorm‖²; deviation from 1 is the
+        # QSVT post-selection cost. Guarded (see _postselect_renorm).
+        out_norm = self._postselect_renorm(out_unnorm, success_prob)
 
         # 5. CVQNN block W: apply the fixed per-image Killoran circuit to the
         # heralded (post-selected, unit-norm) state, then renormalise again
-        # before readout. W is unitary in exact CV but its truncated
-        # squeeze/displace gates are sub-isometries that leak norm, and the
-        # observable measurements are raw Tr(ρÔ) with no internal normalisation —
-        # so an un-normalised post-W state would scale every readout by the leaked
-        # norm (a truncation confound). We capture that leakage (1 − ‖W|ψ⟩‖²) as
-        # `w_trunc_loss` *before* renormalising so it can feed the separate CVQNN
-        # truncation penalty. `cvqnn_num_layers` is a trace-time constant, so
-        # exactly one branch is traced under vmap and the return signature (incl.
-        # the real 0-dim `w_trunc_loss`) is invariant. At L_W == 0 this is the
-        # identity: out_w == out_norm and w_trunc_loss == 0 (byte-identical to a
-        # pre-W model).
-        if self.cvqnn_num_layers == 0:
-            out_w = out_norm
-            w_trunc_loss = torch.zeros(
-                (), device=quantum_device, dtype=self._real_dtype
-            )
-        else:
-            pre_w_state = FockState(out_norm.reshape((D,) * n), n, D)
-            # Move W params to the quantum device (CPU under MPS, which lacks the
-            # float64 the analytic gate matrices use) — mirrors the lcu/poly
-            # `.to(quantum_device)` above. vmap-safe (per-head slice).
-            cvqnn_params = self.cvqnn_params.to(quantum_device)
-            w_state = self._apply_gate_plan(
-                self._cvqnn_plan, cvqnn_params, pre_w_state,
-                quantum_device, dtype,
-            )
-            w_flat = w_state.data.reshape(-1)
-            w_norm_sq = (w_flat.abs() ** 2).sum()
-            w_trunc_loss = 1.0 - w_norm_sq
-            # Same clamp-divisor + zero-on-failure guard as the post-selection
-            # renorm above: finite gradient even at a (near-)zero-norm element.
-            safe_wn = w_norm_sq.clamp(min=_SUCCESS_PROB_FLOOR)
-            w_scaled = w_flat / safe_wn.sqrt()
-            out_w = torch.where(
-                w_norm_sq > _SUCCESS_PROB_FLOOR,
-                w_scaled,
-                torch.zeros_like(w_flat),
-            )
+        # before readout (truncated squeeze/displace are sub-isometries that leak
+        # norm, and readout is raw Tr(ρÔ) with no internal normalisation). W's
+        # leakage feeds the separate cvqnn_trunc_lambda penalty.
+        out_w, w_trunc_loss = self._apply_cvqnn(out_norm, quantum_device, dtype)
 
         # 6. Wrap final state as FockState
         output_state = FockState(out_w.reshape((D,) * n), n, D)
 
-        # 7. Measure observable plan in order; move result back to classical device for decoder.
-        # Plan order is the source of truth for the readout vector layout —
-        # legacy alias translation preserves the pre-refactor ordering so
-        # checkpoints remain bit-compatible.
-        readout_values: list[torch.Tensor] = []
-        for spec in self._observable_plan:
-            if spec.type == "x":
-                readout_values.append(self.circuit.measure_quadrature_x(spec.mode, output_state))
-            elif spec.type == "p":
-                readout_values.append(self.circuit.measure_quadrature_p(spec.mode, output_state))
-            elif spec.type == "x_squared":
-                readout_values.append(self.circuit.measure_quadrature_x_squared(spec.mode, output_state))
-            elif spec.type == "p_squared":
-                readout_values.append(self.circuit.measure_quadrature_p_squared(spec.mode, output_state))
-            elif spec.type == "n":
-                readout_values.append(self.circuit.measure_photon_number(spec.mode, output_state))
-            elif spec.type == "prob_n":
-                readout_values.append(
-                    self.circuit.measure_prob_n_photons(spec.mode, spec.n, output_state)
-                )
-            else:
-                raise ValueError(f"Unknown observable type {spec.type!r}")
-        readout = torch.stack(readout_values).to(classical_device)
+        # 7. Measure observable plan in order; move result back to classical
+        # device for the decoder.
+        readout = self._measure_plan(output_state).to(classical_device)
         return readout, output_state.data, success_prob, avg_trunc_loss, w_trunc_loss
 
 
@@ -1269,6 +1338,48 @@ class LinearCVHead(_CVHeadBase):
 # ---------------------------------------------------------------------------
 
 
+def _stack_head_state(
+    heads: nn.ModuleList,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Stack homogeneous heads' params/buffers along a new leading head axis.
+
+    Plain ``torch.stack`` (NOT ``torch.func.stack_module_state``, which ends in
+    ``.detach()`` and would strand head gradients) keeps the stacked tensors
+    connected to each head's leaf parameter, so gradients flow back through
+    StackBackward into the head parameters the optimizer owns. Shared by the
+    seq-to-one and seq-to-seq multi-head vmap drivers.
+    """
+    per_head_p = [dict(h.named_parameters()) for h in heads]
+    per_head_b = [dict(h.named_buffers()) for h in heads]
+    stacked_p = {
+        n: torch.stack([d[n] for d in per_head_p]) for n in per_head_p[0]
+    }
+    stacked_b = {
+        n: torch.stack([d[n] for d in per_head_b]) for n in per_head_b[0]
+    }
+    return stacked_p, stacked_b
+
+
+def _warn_failed_postselection(sp: torch.Tensor, element_label: str) -> None:
+    """Warn when any success_prob fell at/below the post-selection floor.
+
+    Args:
+        sp:            Success-probability tensor of any shape.
+        element_label: Human-readable element description for the message
+                       (e.g. "head×batch" or "head×batch×position").
+    """
+    if (sp < _SUCCESS_PROB_FLOOR).any().item():
+        import warnings
+        bad = sp[sp < _SUCCESS_PROB_FLOOR]
+        warnings.warn(
+            f"{len(bad)} {element_label} element(s) have "
+            f"success_prob < {_SUCCESS_PROB_FLOOR:.0e} "
+            f"(min={bad.min().item():.2e}); post-selection failed — "
+            "those elements forced to a zero state (zero gradient).",
+            RuntimeWarning, stacklevel=3,
+        )
+
+
 def _run_heads_vmap(
     heads: nn.ModuleList,
     num_heads: int,
@@ -1300,14 +1411,7 @@ def _run_heads_vmap(
                           heads × batch (0 when cvqnn_num_layers == 0).
     """
     base = heads[0]
-    per_head_p = [dict(h.named_parameters()) for h in heads]
-    per_head_b = [dict(h.named_buffers()) for h in heads]
-    stacked_p = {
-        n: torch.stack([d[n] for d in per_head_p]) for n in per_head_p[0]
-    }
-    stacked_b = {
-        n: torch.stack([d[n] for d in per_head_b]) for n in per_head_b[0]
-    }
+    stacked_p, stacked_b = _stack_head_state(heads)
 
     def _one_element(p, b, single_features):
         return functional_call(base, (p, b), (single_features,))
@@ -1326,16 +1430,7 @@ def _run_heads_vmap(
     # state_hb            : (num_heads, B, cutoff_dim, ..., cutoff_dim)
     # sp_hb, tl_hb, wtl_hb: (num_heads, B)
 
-    if (sp_hb < _SUCCESS_PROB_FLOOR).any().item():
-        import warnings
-        bad = sp_hb[sp_hb < _SUCCESS_PROB_FLOOR]
-        warnings.warn(
-            f"{len(bad)} head×batch element(s) have "
-            f"success_prob < {_SUCCESS_PROB_FLOOR:.0e} "
-            f"(min={bad.min().item():.2e}); post-selection failed — "
-            "those elements forced to a zero state (zero gradient).",
-            RuntimeWarning, stacklevel=2,
-        )
+    _warn_failed_postselection(sp_hb, "head×batch")
 
     B = features.shape[0]
     R = readout_total_dim

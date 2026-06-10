@@ -35,7 +35,14 @@ EPOCH_KEYS: tuple[str, ...] = (
     "test_loss",  "test_acc",
     "trunc_loss", "test_trunc_loss",
     "cvqnn_trunc_loss", "test_cvqnn_trunc_loss",
+    "query_trunc_loss", "test_query_trunc_loss",
     "elapsed_sec",
+)
+
+BATCH_KEYS: tuple[str, ...] = (
+    "step", "epoch",
+    "train_loss", "trunc_loss", "cvqnn_trunc_loss", "query_trunc_loss",
+    "total_loss", "batch_acc", "grad_norm",
 )
 
 
@@ -46,6 +53,9 @@ def ensure_history_schema(h: dict) -> None:
     h.setdefault("epoch", {})
     for k in EPOCH_KEYS:
         h["epoch"].setdefault(k, [])
+    h.setdefault("batch", {})
+    for k in BATCH_KEYS:
+        h["batch"].setdefault(k, [])
 
 
 def new_history(n_params: int, device: str) -> dict:
@@ -57,11 +67,7 @@ def new_history(n_params: int, device: str) -> dict:
     """
     h = {
         "epoch": {k: [] for k in EPOCH_KEYS},
-        "batch": {
-            "step":       [], "epoch":      [],
-            "train_loss": [], "trunc_loss": [], "cvqnn_trunc_loss": [],
-            "total_loss": [], "batch_acc":  [], "grad_norm":  [],
-        },
+        "batch": {k: [] for k in BATCH_KEYS},
         "meta": {
             "best_test_acc": None, "best_epoch": None,
             "total_runtime_sec": None, "n_params": int(n_params),
@@ -227,9 +233,70 @@ def snapshot_cvqnn_params(model) -> np.ndarray | None:
     return torch.stack(chunks).numpy().astype(np.float32)
 
 
+def snapshot_stacked_coefficients(model) -> dict[str, np.ndarray]:
+    """Block-prefixed LCU/poly/W snapshots for the stacked model (ADR-0002).
+
+    One key set per stage: ``block{b}_lcu_coeffs`` / ``block{b}_poly_coeffs``
+    (+ ``block{b}_cvqnn_params`` when W is on) for each seq-to-seq block, and
+    the same under the ``agg_`` prefix for the aggregator (pooling="quixer").
+    Per-stage array shapes match the canonical ``snapshot_coefficients`` /
+    ``snapshot_cvqnn_params`` outputs.
+    """
+    out: dict[str, np.ndarray] = {}
+
+    def _stage(prefix: str, heads) -> None:
+        lcu_chunks, poly_chunks, cvqnn_chunks = [], [], []
+        for head in heads:
+            b = head.lcu_coeffs().detach().cpu()
+            lcu_chunks.append(torch.stack([b.real, b.imag], dim=-1))
+            poly_chunks.append(head.poly_coeffs().detach().cpu())
+            if head.cvqnn_params is not None:
+                cvqnn_chunks.append(head.cvqnn_params.detach().cpu())
+        out[f"{prefix}_lcu_coeffs"] = (
+            torch.stack(lcu_chunks).numpy().astype(np.float32)
+        )
+        out[f"{prefix}_poly_coeffs"] = (
+            torch.stack(poly_chunks).numpy().astype(np.float32)
+        )
+        if cvqnn_chunks:
+            out[f"{prefix}_cvqnn_params"] = (
+                torch.stack(cvqnn_chunks).numpy().astype(np.float32)
+            )
+
+    for b_idx, block in enumerate(model.blocks):
+        _stage(f"block{b_idx}", block.heads)
+    if model.aggregator_heads is not None:
+        _stage("agg", model.aggregator_heads)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Quantum diagnostics (gate-param distributions, state norms, photon numbers)
 # ---------------------------------------------------------------------------
+
+
+def _state_stats(state_batch: torch.Tensor, num_modes: int,
+                 cutoff: int) -> tuple[torch.Tensor, np.ndarray]:
+    """Per-element state norms + per-mode photon-number sums from a batched
+    state tensor whose trailing ``num_modes`` axes are the Fock axes. Any
+    leading batch-like axes are flattened into the sample population (the
+    stacked model's per-position states fold in this way, ADR-0002).
+
+    Returns:
+        norms:       (S,) real tensor — ‖ψ‖² per flattened element.
+        photon_sums: (num_modes,) float64 — Σ_elements ⟨n̂_k⟩.
+    """
+    probs = (state_batch.abs() ** 2).reshape(-1, *([cutoff] * num_modes))
+    ns = torch.arange(cutoff, device=probs.device, dtype=probs.dtype)
+    photon_sums = np.zeros(num_modes, dtype=np.float64)
+    for k in range(num_modes):
+        other_axes = tuple(
+            ax for ax in range(1, num_modes + 1) if ax != k + 1
+        )
+        p_k = probs.sum(dim=other_axes) if other_axes else probs   # (S, D)
+        photon_sums[k] = float((p_k * ns).sum().item())
+    norms = probs.flatten(start_dim=1).sum(dim=-1)                 # (S,)
+    return norms, photon_sums
 
 
 @torch.no_grad()
@@ -248,6 +315,13 @@ def quantum_diagnostics(model, loader, device,
                         + mean_photon_number) to be saved as an .npz under
                         diagnostics/epoch_NNNN.npz.
     """
+    # The stacked model has per-block heads and a different artefact schema
+    # (block-prefixed keys, ADR-0002) — dispatch to its own collector.
+    if getattr(model, "blocks", None) is not None:
+        return _stacked_quantum_diagnostics(
+            model, loader, device, progress=progress
+        )
+
     model.eval()
     attn = model.cv_attention
     num_heads = len(attn.heads)
@@ -287,18 +361,8 @@ def quantum_diagnostics(model, loader, device,
         # directly from the batched state tensor (no per-element FockState
         # construction, no reduced-density-matrix build).
         for h_idx, state_batch in enumerate(states_list):
-            probs = state_batch.abs() ** 2                # (B, D, ..., D), real
-            ns = torch.arange(
-                cutoff, device=state_batch.device, dtype=probs.dtype,
-            )
-            for k in range(num_modes):
-                other_axes = tuple(
-                    ax for ax in range(1, num_modes + 1) if ax != k + 1
-                )
-                p_k = probs.sum(dim=other_axes) if other_axes else probs  # (B, D)
-                mean_n_per_b = (p_k * ns).sum(dim=-1)                     # (B,)
-                photon_sums[h_idx, k] += float(mean_n_per_b.sum().item())
-            norms = probs.flatten(start_dim=1).sum(dim=-1)               # (B,)
+            norms, photon = _state_stats(state_batch, num_modes, cutoff)
+            photon_sums[h_idx] += photon
             state_norm_chunks[h_idx].extend(
                 float(v) for v in norms.detach().cpu().tolist()
             )
@@ -331,6 +395,119 @@ def quantum_diagnostics(model, loader, device,
     return stats_summary, mean_photon, raw
 
 
+@torch.no_grad()
+def _stacked_quantum_diagnostics(model, loader, device,
+                                 *, progress: bool | str = False
+                                 ) -> tuple[dict, np.ndarray, dict]:
+    """Stacked-model collector behind ``quantum_diagnostics`` (ADR-0002).
+
+    Gate-param samples are captured **per stage** with block-prefixed keys —
+    ``block{b}_head{h}_{gate}`` for the key slice, ``block{b}_head{h}_q_{gate}``
+    for the query slice, and ``agg_head{h}_{gate}`` for the aggregator (no
+    query slice). State norms / photon numbers describe the decoder-input
+    stage and keep the canonical key names (``head{h}_state_norms``,
+    ``mean_photon_number``); under pooling="mean" the per-position states fold
+    into the sample population.
+    """
+    model.eval()
+    cfg = model.config
+    num_heads, num_modes, cutoff = cfg.num_heads, cfg.num_modes, cfg.cutoff_dim
+    head0 = model.blocks[0].heads[0]
+    layout = gate_param_layout(num_modes, len(head0._bs_pairs), head0.num_layers)
+    gp_width = head0._gate_param_width
+    num_blocks = len(model.blocks)
+    has_agg = model.aggregator_heads is not None
+    stage_prefixes = [f"block{b}" for b in range(num_blocks)] + (
+        ["agg"] if has_agg else []
+    )
+
+    gate_outs: dict[tuple[int, int], list[torch.Tensor]] = {
+        (s, h): [] for s in range(len(stage_prefixes)) for h in range(num_heads)
+    }
+    state_norm_chunks: list[list[float]] = [[] for _ in range(num_heads)]
+    photon_sums = np.zeros((num_heads, num_modes), dtype=np.float64)
+    n_processed = 0
+
+    iterator = loader
+    if progress:
+        from tqdm import tqdm
+        desc = progress if isinstance(progress, str) else "diagnostics"
+        iterator = tqdm(loader, desc=desc, leave=False, unit="batch",
+                        mininterval=5.0)
+    for patches, _ in iterator:
+        patches = patches.to(device)
+
+        # Per-stage gate-param samples; deeper stages see the actual token
+        # sequence their block receives (block_inputs replays the stack once).
+        inputs = model.block_inputs(patches)
+        for b_idx, block in enumerate(model.blocks):
+            for h_idx, gpar in enumerate(block.gate_params_grid(inputs[b_idx])):
+                gate_outs[(b_idx, h_idx)].append(gpar.detach().cpu())
+        if has_agg:
+            for h_idx, head in enumerate(model.aggregator_heads):
+                gate_outs[(num_blocks, h_idx)].append(
+                    head._features_to_params(inputs[-1]).detach().cpu()
+                )
+
+        out = model(patches, return_states=True)
+        for h_idx, state_batch in enumerate(out.states):
+            norms, photon = _state_stats(state_batch, num_modes, cutoff)
+            photon_sums[h_idx] += photon
+            state_norm_chunks[h_idx].extend(
+                float(v) for v in norms.detach().cpu().tolist()
+            )
+    # Photon means are over the same flattened population the norms use
+    # (B per batch for aggregator states, B×N for per-position states).
+    n_processed = len(state_norm_chunks[0])
+    mean_photon = (photon_sums / max(n_processed, 1)).astype(np.float32)
+
+    def _slice_stats(flat2d: np.ndarray) -> tuple[dict, dict[str, np.ndarray]]:
+        """Per-gate stats + raw slices for one (samples, width) param matrix."""
+        gate_stats: dict = {}
+        raw_slices: dict[str, np.ndarray] = {}
+        for name, start, count in layout:
+            if count == 0:
+                gate_stats[name] = {"mean": [], "std": [], "min": [], "max": []}
+                continue
+            sl = flat2d[:, start:start + count]
+            gate_stats[name] = {
+                "mean": sl.mean(axis=0).astype(float).tolist(),
+                "std":  sl.std(axis=0).astype(float).tolist(),
+                "min":  sl.min(axis=0).astype(float).tolist(),
+                "max":  sl.max(axis=0).astype(float).tolist(),
+            }
+            raw_slices[name] = sl.astype(np.float32)
+        return gate_stats, raw_slices
+
+    stats_summary: dict = {"gate_layout": layout, "per_stage": {}}
+    raw: dict = {}
+    for s_idx, prefix in enumerate(stage_prefixes):
+        per_head_stats = []
+        for h_idx in range(num_heads):
+            flat = torch.cat(gate_outs[(s_idx, h_idx)], dim=0).numpy()
+            flat2d = flat.reshape(-1, flat.shape[-1])
+            # Seq-to-seq stages emit (key | query) slices; the aggregator emits
+            # a single canonical slice.
+            key_stats, key_raw = _slice_stats(flat2d[:, :gp_width])
+            for name, sl in key_raw.items():
+                raw[f"{prefix}_head{h_idx}_{name}"] = sl
+            head_stats = {"key": key_stats}
+            if flat2d.shape[-1] == 2 * gp_width:
+                q_stats, q_raw = _slice_stats(flat2d[:, gp_width:])
+                for name, sl in q_raw.items():
+                    raw[f"{prefix}_head{h_idx}_q_{name}"] = sl
+                head_stats["query"] = q_stats
+            per_head_stats.append(head_stats)
+        stats_summary["per_stage"][prefix] = per_head_stats
+
+    for h_idx in range(num_heads):
+        raw[f"head{h_idx}_state_norms"] = np.asarray(
+            state_norm_chunks[h_idx], dtype=np.float32
+        )
+    raw["mean_photon_number"] = mean_photon
+    return stats_summary, mean_photon, raw
+
+
 # ---------------------------------------------------------------------------
 # Per-pass evaluation
 # ---------------------------------------------------------------------------
@@ -352,6 +529,9 @@ def evaluate(model, loader, device, num_classes: int = 10,
                          model's trunc_penalty is "none")
         cvqnn_trunc_loss — mean per-sample CVQNN block (W) truncation leakage
                          (eval-time; 0 if cvqnn_num_layers == 0)
+        query_trunc_loss — mean per-sample query-unitary truncation leakage
+                         (eval-time; 0 for models without query unitaries —
+                         only the seq-to-seq stacked model has the stream)
         y_true         — int64 (N,) ground-truth labels
         y_pred         — int64 (N,) argmax predictions
         y_probs        — float32 (N, num_classes) softmax probabilities
@@ -362,6 +542,7 @@ def evaluate(model, loader, device, num_classes: int = 10,
     """
     model.eval()
     total_loss, total_trunc, total_cvqnn_trunc, correct, total = 0.0, 0.0, 0.0, 0, 0
+    total_query_trunc = 0.0
     y_true_chunks: list[torch.Tensor] = []
     y_pred_chunks: list[torch.Tensor] = []
     y_prob_chunks: list[torch.Tensor] = []
@@ -383,6 +564,10 @@ def evaluate(model, loader, device, num_classes: int = 10,
         # non-CV model (no return_trunc_loss support) — guard anyway.
         if out.cvqnn_trunc_loss is not None:
             total_cvqnn_trunc += out.cvqnn_trunc_loss.item() * labels.size(0)
+        # out.query_trunc_loss is None for models without query unitaries
+        # (only the seq-to-seq stacked model carries the stream).
+        if out.query_trunc_loss is not None:
+            total_query_trunc += out.query_trunc_loss.item() * labels.size(0)
         total_loss += F.cross_entropy(logits, labels).item() * labels.size(0)
         preds = logits.argmax(dim=-1)
         correct += (preds == labels).sum().item()
@@ -413,6 +598,7 @@ def evaluate(model, loader, device, num_classes: int = 10,
         "acc":           correct / total,
         "trunc_loss":    total_trunc / total,
         "cvqnn_trunc_loss": total_cvqnn_trunc / total,
+        "query_trunc_loss": total_query_trunc / total,
         "y_true":        y_true,
         "y_pred":        y_pred,
         "y_probs":       y_probs,
