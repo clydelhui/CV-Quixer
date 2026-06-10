@@ -77,6 +77,8 @@ ARCH_AXES: tuple[tuple[str, str, str, str], ...] = (
      "total hypernet DNN linear layers"),
     ("decoder_num_layers", "--decoder-num-layers", "dnl", "total decoder linear layers"),
     ("cvqnn_num_layers", "--cvqnn-num-layers", "cw", "CVQNN block W depth L_W (0 = no W)"),
+    ("num_seq2seq_blocks", "--num-seq2seq-blocks", "sb",
+     "seq-to-seq blocks (--model quantum_stacked, ADR-0003)"),
 )
 
 
@@ -105,6 +107,12 @@ def _run_name(point: dict) -> str:
         base += f"__tl{point['trunc_lambda']}"
     if point.get("decoder_hidden_mult") is not None:
         base += f"__dhm{point['decoder_hidden_mult']}"
+    if point.get("query_trunc_lambda") is not None:
+        base += f"__qtl{point['query_trunc_lambda']}"
+    if point.get("pooling") is not None:
+        base += f"__pool-{point['pooling']}"
+    if point.get("block_residual") == "off":
+        base += "__nores"
     for dest, _flag, marker, _help in ARCH_AXES:
         if point.get(dest) is not None:
             base += f"__{marker}{point[dest]}"
@@ -141,17 +149,24 @@ def build_manifest(args: argparse.Namespace) -> dict:
     trunc_lambdas = args.trunc_lambda if args.trunc_lambda else [None]
     # decoder_hidden_mult is a float axis (like trunc_lambda), not an int ARCH_AXES.
     decoder_hidden_mults = args.decoder_hidden_mult if args.decoder_hidden_mult else [None]
+    # Stacked-model axes (non-int, so not ARCH_AXES): query_trunc_lambda is a
+    # float axis; pooling / block_residual are choice axes.
+    query_trunc_lambdas = args.query_trunc_lambda if args.query_trunc_lambda else [None]
+    poolings = args.pooling if args.pooling else [None]
+    block_residuals = args.block_residual if args.block_residual else [None]
     arch_values = {dest: (getattr(args, dest) or [None]) for dest, *_ in ARCH_AXES}
 
     # Ordered axis names + their value-lists for one flat Cartesian product.
     axis_names = (
         ["target_params", "observables", "seed", "num_layers", "scaling_knob",
-         "trunc_lambda", "decoder_hidden_mult"]
+         "trunc_lambda", "decoder_hidden_mult", "query_trunc_lambda",
+         "pooling", "block_residual"]
         + [dest for dest, *_ in ARCH_AXES]
     )
     axis_value_lists = (
         [target_params, args.observables, args.seeds, args.num_layers,
-         scaling_knobs, trunc_lambdas, decoder_hidden_mults]
+         scaling_knobs, trunc_lambdas, decoder_hidden_mults,
+         query_trunc_lambdas, poolings, block_residuals]
         + [arch_values[dest] for dest, *_ in ARCH_AXES]
     )
 
@@ -177,6 +192,12 @@ def build_manifest(args: argparse.Namespace) -> dict:
             run_args += ["--trunc-lambda", str(point["trunc_lambda"])]
         if point["decoder_hidden_mult"] is not None:
             run_args += ["--decoder-hidden-mult", str(point["decoder_hidden_mult"])]
+        if point["query_trunc_lambda"] is not None:
+            run_args += ["--query-trunc-lambda", str(point["query_trunc_lambda"])]
+        if point["pooling"] is not None:
+            run_args += ["--pooling", point["pooling"]]
+        if point["block_residual"] is not None:
+            run_args += ["--block-residual", point["block_residual"]]
         # Manual arch axes: emit each set field directly.
         for dest, flag, _marker, _help in ARCH_AXES:
             if point[dest] is not None:
@@ -191,6 +212,9 @@ def build_manifest(args: argparse.Namespace) -> dict:
         "scaling_knob": list(args.scaling_knob or []),
         "trunc_lambda": list(args.trunc_lambda or []),
         "decoder_hidden_mult": list(args.decoder_hidden_mult or []),
+        "query_trunc_lambda": list(args.query_trunc_lambda or []),
+        "pooling": list(args.pooling or []),
+        "block_residual": list(args.block_residual or []),
     }
     for dest, *_ in ARCH_AXES:
         axes[dest] = list(getattr(args, dest) or [])
@@ -284,6 +308,23 @@ def main() -> None:
         "(decoder_hidden_dim = round(c * decoder_in_dim)). Mutually exclusive with "
         "the --decoder-hidden-dim axis.",
     )
+    parser.add_argument(
+        "--query-trunc-lambda", type=float, nargs="+", default=None,
+        help="grid axis (--model quantum_stacked): one or more query-unitary "
+        "truncation penalty weights. Omit to inherit full_experiment.py's default.",
+    )
+    parser.add_argument(
+        "--pooling", type=str, nargs="+", default=None,
+        choices=["mean", "quixer"],
+        help="grid axis (--model quantum_stacked): one or more pooling modes "
+        "('mean' | 'quixer'). Omit to inherit full_experiment.py's default.",
+    )
+    parser.add_argument(
+        "--block-residual", type=str, nargs="+", default=None,
+        choices=["on", "off"],
+        help="grid axis (--model quantum_stacked): residual wiring on/off "
+        "('off' marks the run dir __nores). Omit to inherit the default.",
+    )
     # Manual architecture axes (no auto-scaling). Each is nargs='+', default None
     # ⇒ inherit full_experiment.py's value (single 'inherit' point, no name marker).
     for dest, flag, _marker, helptxt in ARCH_AXES:
@@ -294,9 +335,10 @@ def main() -> None:
     # --- shared run settings (identical across the grid) ------------------
     parser.add_argument(
         "--model", type=str, default="quantum",
-        choices=["quantum", "quantum_shared", "classical"],
+        choices=["quantum", "quantum_shared", "quantum_stacked", "classical"],
         help="model variant for every run (forwarded to full_experiment.py; "
-        "'quantum_shared' auto-scales on num_heads)",
+        "'quantum_shared' auto-scales on num_heads; 'quantum_stacked' is the "
+        "seq-to-seq stacked model, ADR-0003)",
     )
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--train-fraction", type=float, default=None)
@@ -369,6 +411,9 @@ def main() -> None:
     print(f"  trunc_lambda:  {manifest['axes']['trunc_lambda']}")
     if manifest["axes"].get("decoder_hidden_mult"):
         print(f"  decoder_hidden_mult: {manifest['axes']['decoder_hidden_mult']}")
+    for _ax in ("query_trunc_lambda", "pooling", "block_residual"):
+        if manifest["axes"].get(_ax):
+            print(f"  {_ax}: {manifest['axes'][_ax]}")
     for dest, *_ in ARCH_AXES:
         if manifest["axes"].get(dest):
             print(f"  {dest}:{' ' * max(1, 13 - len(dest))}{manifest['axes'][dest]}")

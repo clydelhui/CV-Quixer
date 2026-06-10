@@ -55,7 +55,9 @@ ARCH_META_FIELDS = [
     "num_modes", "num_heads", "cutoff_dim", "poly_degree",
     "cnn_channels_1", "cnn_channels_2", "cnn_kernel_size", "decoder_hidden_dim",
     "cnn_num_conv_layers", "hypernet_num_linear_layers", "decoder_num_layers",
-    "decoder_hidden_mult",
+    "decoder_hidden_mult", "cvqnn_num_layers",
+    # Stacked-model axes (ADR-0003); absent on older runs → skipped.
+    "num_seq2seq_blocks", "pooling", "block_residual",
 ]
 
 # Columns for the summary table, in display order.

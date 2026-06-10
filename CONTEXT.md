@@ -11,6 +11,13 @@ The input-dependent Killoran-style gate sequence (`S → BS → R → D → K`) 
 patch's token, with gate parameters emitted by the CNN hypernetwork. One `U_i` per patch.
 _Avoid_: patch circuit, token unitary.
 
+**Query unitary** (`U_{q,i}`):
+The input-dependent gate sequence that prepares position i's query state
+`U_{q,i}|0⟩` in the seq-to-seq block. Emitted by the same hypernetwork embedding
+as the per-patch unitary `U_i` (a second projection of the shared patch
+embedding, mirroring classical attention's Q/K split). One `U_{q,i}` per patch.
+_Avoid_: query circuit, query state (that is `U_{q,i}|0⟩`, not the unitary).
+
 **LCU**:
 The linear combination of per-patch unitaries `M = Σ_i b_i U_i`, with trainable complex
 coefficients `b_i`. Not materialised as a matrix.
@@ -45,9 +52,26 @@ LCU of unitaries `M`. Derivable from the learned coefficients; one scalar per he
 _Avoid_: normalisation constant (ambiguous with state renormalisation).
 
 **Head**:
-One `(LCU + Polynomial + CVQNN block + readout)` pipeline. The model runs `num_heads`
-independent heads in parallel and concatenates their readouts.
+One `(LCU + Polynomial + CVQNN block + readout)` pipeline. Each block (or the
+whole model, for the non-stacked variants) runs `num_heads` independent heads in
+parallel and concatenates their readouts. In a seq-to-seq block a head emits one
+readout per position (one query state each); elsewhere it emits a single readout.
 _Avoid_: channel, attention head (it is CV, not dot-product attention).
+
+**Seq-to-seq block**:
+One CV-Quixer attention stage that maps an N-token sequence to an N-token
+sequence. All positions share each head's LCU, polynomial, and CVQNN block;
+position i differs only in its query state — its output token is the readout of
+`W · P(M) · U_{q,i}|0⟩`. Stackable; the first block consumes raw patches, deeper
+blocks consume the previous block's tokens.
+_Avoid_: attention layer, mixer block, token block.
+
+**Aggregator block**:
+The optional final seq-to-one stage of a stacked model: a canonical CV-Quixer
+head (vacuum input, no query unitaries) consuming the last seq-to-seq block's
+token sequence and emitting a single readout vector. The alternative to
+mean-pooling over positions.
+_Avoid_: pooling block, readout block.
 
 **Readout**:
 The vector of observable expectation values (`⟨x̂⟩`, `⟨p̂⟩`, `⟨n̂⟩`, …) measured on the

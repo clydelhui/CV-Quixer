@@ -76,6 +76,7 @@ from cv_quixer.evaluation.diagnostics import (
     save_test_images_once,
     snapshot_coefficients,
     snapshot_cvqnn_params,
+    snapshot_stacked_coefficients,
 )
 from cv_quixer.models import build_model
 from cv_quixer.utils import print_parameter_table
@@ -101,6 +102,11 @@ DEFAULT_OBSERVABLES = "xpxsps"  # x, p, x², p² per mode
 TRUNC_LAMBDA = 0.1  # Fock truncation penalty weight (added to CE loss)
 CVQNN_NUM_LAYERS = 1   # CVQNN block W depth L_W (0 = disabled / pre-W ablation)
 CVQNN_TRUNC_LAMBDA = 0.01  # weight of the separate W truncation penalty (added to CE loss)
+# Seq-to-seq stacked model (--model quantum_stacked only; ADR-0003).
+NUM_SEQ2SEQ_BLOCKS = 1     # seq-to-seq blocks (excludes the optional aggregator)
+POOLING = "mean"           # "mean" | "quixer" (append an aggregator block)
+BLOCK_RESIDUAL = True      # identity residual x + block(x) from block 2 onward
+QUERY_TRUNC_LAMBDA = 0.01  # weight of the separate query-unitary truncation penalty
 # Architecture knobs of the frozen 13,530-param model. Each is overridable by the
 # matching CLI flag below for manual (no-auto-scale) runs / sweeps; defaults here
 # reproduce the frozen architecture verbatim.
@@ -233,6 +239,30 @@ parser.add_argument("--cvqnn-num-layers", type=int, default=None,
                     help=f"CVQNN block W depth L_W (default {CVQNN_NUM_LAYERS}); "
                     f"0 disables W (pre-W ablation, checkpoint-compatible). A "
                     f"valid --scaling-knob, but too coarse for budget targeting.")
+# --- seq-to-seq stacked model knobs (--model quantum_stacked only) ---------
+parser.add_argument("--num-seq2seq-blocks", type=int, default=None,
+                    help=f"seq-to-seq blocks in the stacked model (default "
+                    f"{NUM_SEQ2SEQ_BLOCKS}; >= 1; excludes the optional "
+                    f"aggregator block). A valid --scaling-knob, but coarse.")
+parser.add_argument("--pooling", type=str, default=None,
+                    choices=["mean", "quixer"],
+                    help=f"how the stacked model's final tokens reach the "
+                    f"decoder (default {POOLING!r}): 'mean' pools over "
+                    f"positions; 'quixer' appends a canonical seq-to-one "
+                    f"aggregator block.")
+parser.add_argument("--block-residual", type=str, default=None,
+                    choices=["on", "off"],
+                    help=f"identity residual x + block(x) from block 2 onward "
+                    f"(default {'on' if BLOCK_RESIDUAL else 'off'}; 'off' = "
+                    f"pure-pipeline ablation).")
+parser.add_argument(
+    "--query-trunc-lambda",
+    type=float,
+    default=None,
+    help=f"weight of the separate query-unitary truncation penalty added to "
+    f"the CE loss (default QUERY_TRUNC_LAMBDA={QUERY_TRUNC_LAMBDA}; stacked "
+    f"model only)",
+)
 parser.add_argument(
     "--observables",
     type=str,
@@ -260,10 +290,11 @@ parser.add_argument(
     "--model",
     type=str,
     default="quantum",
-    choices=["quantum", "quantum_shared", "classical"],
+    choices=["quantum", "quantum_shared", "quantum_stacked", "classical"],
     help="model variant: 'quantum' (per-head CNN hypernetworks, default), "
     "'quantum_shared' (shared patch CNN + per-head linears; defaults "
-    "--scaling-knob to num_heads), or 'classical'.",
+    "--scaling-knob to num_heads), 'quantum_stacked' (seq-to-seq blocks, "
+    "ADR-0003), or 'classical'.",
 )
 # --- run organisation -----------------------------------------------------
 parser.add_argument(
@@ -384,6 +415,14 @@ if args.decoder_num_layers is not None:
     DECODER_NUM_LAYERS = args.decoder_num_layers
 if args.cvqnn_num_layers is not None:
     CVQNN_NUM_LAYERS = args.cvqnn_num_layers
+if args.num_seq2seq_blocks is not None:
+    NUM_SEQ2SEQ_BLOCKS = args.num_seq2seq_blocks
+if args.pooling is not None:
+    POOLING = args.pooling
+if args.block_residual is not None:
+    BLOCK_RESIDUAL = args.block_residual == "on"
+if args.query_trunc_lambda is not None:
+    QUERY_TRUNC_LAMBDA = args.query_trunc_lambda
 
 # Resolve the gate-param bound: 'auto' → cutoff-aware photon budget, else a float,
 # else None (off). Resolved to a concrete value here so config.json is reproducible.
@@ -443,6 +482,10 @@ quantum_cfg = QuantumConfig(
     decoder_num_layers=DECODER_NUM_LAYERS,
     cvqnn_num_layers=CVQNN_NUM_LAYERS,
     cvqnn_trunc_lambda=CVQNN_TRUNC_LAMBDA,
+    num_seq2seq_blocks=NUM_SEQ2SEQ_BLOCKS,
+    pooling=POOLING,
+    block_residual=BLOCK_RESIDUAL,
+    query_trunc_lambda=QUERY_TRUNC_LAMBDA,
     dtype="complex64",
     trunc_penalty="norm",
     trunc_lambda=TRUNC_LAMBDA,
@@ -721,9 +764,15 @@ for _field in (
     "num_modes", "num_heads", "cutoff_dim", "poly_degree",
     "cnn_channels_1", "cnn_channels_2", "cnn_kernel_size", "decoder_hidden_dim",
     "cnn_num_conv_layers", "hypernet_num_linear_layers", "decoder_num_layers",
-    "cvqnn_num_layers",
+    "cvqnn_num_layers", "num_seq2seq_blocks",
 ):
     history["meta"][_field] = int(getattr(_resolved_q, _field))
+# Stacked-model coordinates (inert for the other models; ADR-0003).
+history["meta"]["pooling"] = str(getattr(_resolved_q, "pooling", "mean"))
+history["meta"]["block_residual"] = bool(
+    getattr(_resolved_q, "block_residual", True)
+)
+history["meta"]["query_trunc_lambda"] = float(QUERY_TRUNC_LAMBDA)
 # decoder_hidden_mult is a float|None (the input that produced the resolved
 # decoder_hidden_dim above), kept separately from the int-cast loop.
 _dhm = getattr(_resolved_q, "decoder_hidden_mult", None)
@@ -762,9 +811,10 @@ def _grad_l2_norm(parameters) -> float:
     return float(torch.norm(torch.stack(norms), 2).item())
 
 
-def train_epoch(epoch: int) -> tuple[float, float]:
+def train_epoch(epoch: int) -> tuple[float, float, float]:
     """One epoch of training. Returns the mean per-sample truncation losses
-    (per-patch, CVQNN-block W) measured across training batches (cheap in-epoch
+    (per-patch, CVQNN-block W, query-unitary — the last is 0 for models
+    without query unitaries) measured across training batches (cheap in-epoch
     summary, no extra pass).
 
     The epoch-level CE loss and accuracy are NOT computed here — they are
@@ -778,7 +828,7 @@ def train_epoch(epoch: int) -> tuple[float, float]:
     """
     global global_step
     model.train()
-    total_trunc, total_cvqnn_trunc, total = 0.0, 0.0, 0
+    total_trunc, total_cvqnn_trunc, total_query_trunc, total = 0.0, 0.0, 0.0, 0
     _logged_first_batch_mem = False
     for patches, labels in tqdm(
         train_loader, desc=f"Epoch {epoch:>3}/{EPOCHS}", leave=False, unit="batch"
@@ -788,11 +838,19 @@ def train_epoch(epoch: int) -> tuple[float, float]:
         out = model(patches, return_trunc_loss=True)
         logits, trunc_loss = out.logits, out.trunc_loss
         cvqnn_trunc_loss = out.cvqnn_trunc_loss
+        # None for models without query unitaries (only the stacked model has
+        # the stream); a zero stand-in keeps the logging path uniform.
+        query_trunc_loss = (
+            out.query_trunc_loss
+            if out.query_trunc_loss is not None
+            else torch.zeros((), device=logits.device)
+        )
         ce_loss = F.cross_entropy(logits, labels)
         loss = (
             ce_loss
             + quantum_cfg.trunc_lambda * trunc_loss
             + quantum_cfg.cvqnn_trunc_lambda * cvqnn_trunc_loss
+            + quantum_cfg.query_trunc_lambda * query_trunc_loss
         )
         loss.backward()
 
@@ -814,6 +872,7 @@ def train_epoch(epoch: int) -> tuple[float, float]:
 
         total_trunc += trunc_loss.item() * n
         total_cvqnn_trunc += cvqnn_trunc_loss.item() * n
+        total_query_trunc += query_trunc_loss.item() * n
         total += n
 
         global_step += 1
@@ -822,11 +881,12 @@ def train_epoch(epoch: int) -> tuple[float, float]:
         history["batch"]["train_loss"].append(float(ce_loss.item()))
         history["batch"]["trunc_loss"].append(float(trunc_loss.item()))
         history["batch"]["cvqnn_trunc_loss"].append(float(cvqnn_trunc_loss.item()))
+        history["batch"]["query_trunc_loss"].append(float(query_trunc_loss.item()))
         history["batch"]["total_loss"].append(float(loss.item()))
         history["batch"]["batch_acc"].append(float(batch_acc))
         history["batch"]["grad_norm"].append(float(grad_norm))
 
-    return total_trunc / total, total_cvqnn_trunc / total
+    return total_trunc / total, total_cvqnn_trunc / total, total_query_trunc / total
 
 
 # Figure generation lives in `experiments/report_diagnostics.py` — run it
@@ -867,7 +927,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
     t0 = time.time()
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
-    trunc_loss, cvqnn_trunc_loss = train_epoch(epoch)
+    trunc_loss, cvqnn_trunc_loss, query_trunc_loss = train_epoch(epoch)
     train_eval = evaluate(model, train_eval_loader, device,
                           progress="train eval")
     test_eval = evaluate(model, test_loader, device,
@@ -893,6 +953,8 @@ for epoch in range(start_epoch, EPOCHS + 1):
     history["epoch"]["test_trunc_loss"].append(float(test_eval["trunc_loss"]))
     history["epoch"]["cvqnn_trunc_loss"].append(cvqnn_trunc_loss)
     history["epoch"]["test_cvqnn_trunc_loss"].append(float(test_eval["cvqnn_trunc_loss"]))
+    history["epoch"]["query_trunc_loss"].append(query_trunc_loss)
+    history["epoch"]["test_query_trunc_loss"].append(float(test_eval["query_trunc_loss"]))
 
     log_metrics(
         {
@@ -905,6 +967,8 @@ for epoch in range(start_epoch, EPOCHS + 1):
             "epoch/test_trunc_loss": float(test_eval["trunc_loss"]),
             "epoch/cvqnn_trunc_loss": cvqnn_trunc_loss,
             "epoch/test_cvqnn_trunc_loss": float(test_eval["cvqnn_trunc_loss"]),
+            "epoch/query_trunc_loss": query_trunc_loss,
+            "epoch/test_query_trunc_loss": float(test_eval["query_trunc_loss"]),
         },
         use_wandb=config.use_wandb,
     )
@@ -931,8 +995,16 @@ for epoch in range(start_epoch, EPOCHS + 1):
     np.savez_compressed(preds_dir / f"epoch_{epoch:04d}_train.npz",
                         **train_pred_kwargs)
 
-    lcu_snap, poly_snap = snapshot_coefficients(model)
-    cvqnn_snap = snapshot_cvqnn_params(model)   # None when cvqnn_num_layers == 0
+    # Coefficient snapshots: canonical models keep the historic flat keys;
+    # the stacked model writes block-prefixed keys (block{b}_*/agg_*, ADR-0003).
+    if args.model == "quantum_stacked":
+        coeff_snaps = snapshot_stacked_coefficients(model)
+    else:
+        lcu_snap, poly_snap = snapshot_coefficients(model)
+        cvqnn_snap = snapshot_cvqnn_params(model)   # None when cvqnn_num_layers == 0
+        coeff_snaps = {"lcu_coeffs": lcu_snap, "poly_coeffs": poly_snap}
+        if cvqnn_snap is not None:
+            coeff_snaps["cvqnn_params"] = cvqnn_snap
 
     t_diag = time.time()
     try:
@@ -940,10 +1012,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
             model, diag_loader, device,
             progress="diagnostics",
         )
-        diag_raw["lcu_coeffs"] = lcu_snap
-        diag_raw["poly_coeffs"] = poly_snap
-        if cvqnn_snap is not None:
-            diag_raw["cvqnn_params"] = cvqnn_snap
+        diag_raw.update(coeff_snaps)
         np.savez_compressed(diag_dir / f"epoch_{epoch:04d}.npz", **diag_raw)
         diag_status = f"  (diag {time.time() - t_diag:.1f}s)"
     except Exception as e:
@@ -957,10 +1026,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
             "Saving only lcu/poly snapshots for this epoch.",
             RuntimeWarning,
         )
-        _fallback_diag = {"lcu_coeffs": lcu_snap, "poly_coeffs": poly_snap}
-        if cvqnn_snap is not None:
-            _fallback_diag["cvqnn_params"] = cvqnn_snap
-        np.savez_compressed(diag_dir / f"epoch_{epoch:04d}.npz", **_fallback_diag)
+        np.savez_compressed(diag_dir / f"epoch_{epoch:04d}.npz", **coeff_snaps)
         diag_status = "  (diag skipped)"
 
     elapsed = time.time() - t0

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import warnings
 from pathlib import Path
@@ -194,6 +195,38 @@ def _warn_mismatch(name: str, derived: float, logged: float | None,
             "history.json and may be stale.",
             RuntimeWarning,
         )
+
+
+def _diag_stages(diag: dict) -> list[tuple[str, str, str]]:
+    """Enumerate the per-stage diagnostics namespaces in one npz dict.
+
+    Data-driven detection of the seq-to-seq stacked artefact schema
+    (ADR-0003): stacked runs write block-prefixed keys (``block{b}_…`` per
+    seq-to-seq block, ``agg_…`` for the aggregator), canonical runs write
+    flat keys. Figure functions iterate the returned stages and render one
+    file per stage; the canonical single stage keeps the historic unsuffixed
+    filenames, so existing runs are unaffected.
+
+    Returns:
+        list of ``(key_prefix, file_suffix, title_label)`` tuples — e.g.
+        ``[("", "", "")]`` for a canonical run, or
+        ``[("block0_", "_block0", " — block 0"), …, ("agg_", "_agg",
+        " — aggregator")]`` for a stacked run.
+    """
+    block_ids = sorted({
+        int(m.group(1))
+        for k in diag
+        for m in [re.match(r"block(\d+)_", k)]
+        if m is not None
+    })
+    if not block_ids:
+        return [("", "", "")]
+    stages = [
+        (f"block{b}_", f"_block{b}", f" — block {b}") for b in block_ids
+    ]
+    if any(k.startswith("agg_") for k in diag):
+        stages.append(("agg_", "_agg", " — aggregator"))
+    return stages
 
 
 def _accuracy_from(preds: dict) -> float:
@@ -613,6 +646,29 @@ def plot_training_curves(run: dict) -> None:
         plt.close(fig)
         print("  ✓ cvqnn_trunc_loss_curve.png")
 
+    # Per-epoch query-unitary truncation loss — the separate
+    # mean_i(1 − ‖U_{q,i}|0⟩‖²) stream (seq-to-seq stacked model only,
+    # ADR-0003). Canonical runs log a zero stand-in every epoch, so skip when
+    # the stream is absent OR identically zero — a flat zero line is noise.
+    query_trunc = eh.get("query_trunc_loss") or []
+    test_query_trunc = eh.get("test_query_trunc_loss") or []
+    if any(v != 0.0 for v in query_trunc + test_query_trunc):
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        if query_trunc:
+            ax.plot(epoch_x[:len(query_trunc)], query_trunc,
+                    label="train query trunc loss", color="tab:purple", marker="o")
+        if test_query_trunc:
+            ax.plot(epoch_x[:len(test_query_trunc)], test_query_trunc,
+                    label="test query trunc loss", color="tab:brown", marker="s")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Mean query-unitary truncation loss")
+        ax.set_title("Query-unitary truncation loss (per epoch) — from training log")
+        ax.legend(); ax.grid(alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(fig_dir / "query_trunc_loss_curve.png", dpi=150)
+        plt.close(fig)
+        print("  ✓ query_trunc_loss_curve.png")
+
     # Per-class accuracy curve (test) — derived per epoch from predictions.
     per_class = np.stack(
         [_per_class_acc_from(test_preds[e], num_classes) for e in epoch_x]
@@ -697,6 +753,18 @@ def plot_training_curves(run: dict) -> None:
     _per_batch_plot(bh.get("grad_norm") or [], "Gradient L2 norm (log scale)",
                     "Gradient norm (per batch)", "per_batch_grad_norm.png",
                     log_y=True)
+    # The W / query streams are zero stand-ins when the block is disabled /
+    # the model has no query unitaries — skip the all-zero noise figures.
+    cvqnn_batch = bh.get("cvqnn_trunc_loss") or []
+    if any(v != 0.0 for v in cvqnn_batch):
+        _per_batch_plot(cvqnn_batch, "CVQNN (W) truncation loss",
+                        "CVQNN block (W) truncation loss (per batch)",
+                        "per_batch_cvqnn_trunc_loss.png")
+    query_batch = bh.get("query_trunc_loss") or []
+    if any(v != 0.0 for v in query_batch):
+        _per_batch_plot(query_batch, "Query-unitary truncation loss",
+                        "Query-unitary truncation loss (per batch)",
+                        "per_batch_query_trunc_loss.png")
 
 
 def plot_confusion_matrix_evolution(run: dict) -> None:
@@ -910,48 +978,94 @@ def plot_embedding_tsne(run: dict, recomputed: dict | None) -> None:
     print("  ✓ embedding_tsne.png")
 
 
+def _collect_gate_param_grids(
+    diag: dict, prefix: str
+) -> tuple[dict[int, dict[str, np.ndarray]], dict[int, dict[str, np.ndarray]]]:
+    """Group one stage's gate-param arrays as ``{head: {gate_name: arr}}``.
+
+    Keys follow ``{prefix}head{h}_{gate_name}`` with the seq-to-seq query
+    slice marked by a ``q_`` gate-name prefix (``{prefix}head{h}_q_{name}``,
+    ADR-0003). Returns ``(key_grid, query_grid)``; the query grid is empty for
+    canonical runs and the aggregator stage.
+    """
+    key_grid: dict[int, dict[str, np.ndarray]] = {}
+    query_grid: dict[int, dict[str, np.ndarray]] = {}
+    for k, arr in diag.items():
+        if not k.startswith(prefix):
+            continue
+        rest = k[len(prefix):]
+        if not rest.startswith("head"):
+            continue
+        head_str, _, gname = rest.partition("_")
+        if not gname or gname == "state_norms":
+            continue
+        try:
+            h = int(head_str[4:])
+        except ValueError:
+            continue
+        if gname.startswith("q_"):
+            query_grid.setdefault(h, {})[gname[2:]] = arr
+        else:
+            key_grid.setdefault(h, {})[gname] = arr
+    return key_grid, query_grid
+
+
+def _render_gate_histogram_grid(
+    grid: dict[int, dict[str, np.ndarray]], title: str, out_path: Path
+) -> None:
+    """Render one heads × gate-types histogram grid (the historic layout)."""
+    heads = sorted(grid)
+    gate_names = sorted({g for per_head in grid.values() for g in per_head})
+    fig, axes = plt.subplots(len(heads), len(gate_names),
+                             figsize=(2.2 * len(gate_names), 2.0 * len(heads)),
+                             squeeze=False)
+    for row, h in enumerate(heads):
+        for col, gname in enumerate(gate_names):
+            ax = axes[row, col]
+            arr = grid[h].get(gname)
+            if arr is None or arr.size == 0:
+                ax.set_visible(False)
+                continue
+            ax.hist(arr.reshape(-1), bins=40, color="tab:blue", alpha=0.7)
+            if row == 0:
+                ax.set_title(gname, fontsize=8)
+            if col == 0:
+                ax.set_ylabel(f"head {h}", fontsize=8)
+            ax.tick_params(axis="both", labelsize=6)
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"  ✓ {out_path.name}")
+
+
 def plot_hypernet_gate_histograms(run: dict) -> None:
     diag = run["diagnostics"]
     if diag is None:
         print("  - diagnostics/ missing → skipping hypernet_gate_param_histograms")
         return
-    # Group keys: head{i}_{gate_name}
-    gate_names = sorted({
-        k.split("_", 1)[1] for k in diag.keys()
-        if k.startswith("head") and "_" in k and not k.endswith("state_norms")
-        and not k.startswith("mean_photon_number")
-    })
-    # Drop "state_norms" / "mean_photon_number" leftovers (safety)
-    gate_names = [g for g in gate_names if g not in ("state_norms",)]
-
-    num_heads = len({k[:5] for k in diag.keys() if k.startswith("head")})
-    if num_heads == 0 or not gate_names:
+    rendered = False
+    for prefix, suffix, label in _diag_stages(diag):
+        key_grid, query_grid = _collect_gate_param_grids(diag, prefix)
+        if key_grid:
+            _render_gate_histogram_grid(
+                key_grid,
+                f"Hypernetwork gate-parameter distributions{label} "
+                f"(epoch {run['epoch']})",
+                run["fig_dir"] / f"hypernet_gate_param_histograms{suffix}.png",
+            )
+            rendered = True
+        if query_grid:
+            _render_gate_histogram_grid(
+                query_grid,
+                f"Query-unitary gate-parameter distributions{label} "
+                f"(epoch {run['epoch']})",
+                run["fig_dir"]
+                / f"hypernet_gate_param_histograms{suffix}_query.png",
+            )
+            rendered = True
+    if not rendered:
         print("  - no gate-param arrays in diagnostics/ → skipping hypernet histograms")
-        return
-
-    n_gates = len(gate_names)
-    fig, axes = plt.subplots(num_heads, n_gates,
-                             figsize=(2.2 * n_gates, 2.0 * num_heads),
-                             squeeze=False)
-    for h in range(num_heads):
-        for g_idx, gname in enumerate(gate_names):
-            key = f"head{h}_{gname}"
-            ax = axes[h, g_idx]
-            if key not in diag or diag[key].size == 0:
-                ax.set_visible(False)
-                continue
-            vals = diag[key].reshape(-1)
-            ax.hist(vals, bins=40, color="tab:blue", alpha=0.7)
-            if h == 0:
-                ax.set_title(gname, fontsize=8)
-            if g_idx == 0:
-                ax.set_ylabel(f"head {h}", fontsize=8)
-            ax.tick_params(axis="both", labelsize=6)
-    fig.suptitle(f"Hypernetwork gate-parameter distributions (epoch {run['epoch']})")
-    fig.tight_layout()
-    fig.savefig(run["fig_dir"] / "hypernet_gate_param_histograms.png", dpi=150)
-    plt.close(fig)
-    print("  ✓ hypernet_gate_param_histograms.png")
 
 
 def plot_cvqnn_param_values(run: dict) -> None:
@@ -964,31 +1078,40 @@ def plot_cvqnn_param_values(run: dict) -> None:
     is skipped (not an error).
     """
     diag = run["diagnostics"]
-    if diag is None or "cvqnn_params" not in diag:
+    stages = _diag_stages(diag) if diag is not None else []
+    if diag is None or not any(f"{p}cvqnn_params" in diag for p, _, _ in stages):
         print("  - no `cvqnn_params` in diagnostics/ (cvqnn_num_layers == 0?) "
               "→ skipping cvqnn_param_values")
         return
-    arr = np.asarray(diag["cvqnn_params"])   # (num_heads, cvqnn_param_count)
-    if arr.ndim != 2 or arr.size == 0:
-        print("  - empty `cvqnn_params` → skipping cvqnn_param_values")
-        return
-    num_heads, n_param = arr.shape
-    x = np.arange(n_param)
-    fig, axes = plt.subplots(num_heads, 1,
-                             figsize=(max(6, 0.25 * n_param), 1.8 * num_heads),
-                             squeeze=False)
-    for h in range(num_heads):
-        ax = axes[h, 0]
-        ax.axhline(0.0, color="gray", lw=0.8, ls="--")  # identity reference
-        ax.bar(x, arr[h], color="tab:purple", alpha=0.8)
-        ax.set_ylabel(f"head {h}", fontsize=8)
-        ax.tick_params(axis="both", labelsize=6)
-    axes[-1, 0].set_xlabel("W gate-param index (plan order)", fontsize=8)
-    fig.suptitle(f"CVQNN block (W) gate-param values vs identity (epoch {run['epoch']})")
-    fig.tight_layout()
-    fig.savefig(run["fig_dir"] / "cvqnn_param_values.png", dpi=150)
-    plt.close(fig)
-    print("  ✓ cvqnn_param_values.png")
+    for prefix, suffix, label in stages:
+        key = f"{prefix}cvqnn_params"
+        if key not in diag:
+            continue
+        arr = np.asarray(diag[key])   # (num_heads, cvqnn_param_count)
+        if arr.ndim != 2 or arr.size == 0:
+            print(f"  - empty `{key}` → skipping cvqnn_param_values{suffix}")
+            continue
+        num_heads, n_param = arr.shape
+        x = np.arange(n_param)
+        fig, axes = plt.subplots(num_heads, 1,
+                                 figsize=(max(6, 0.25 * n_param), 1.8 * num_heads),
+                                 squeeze=False)
+        for h in range(num_heads):
+            ax = axes[h, 0]
+            ax.axhline(0.0, color="gray", lw=0.8, ls="--")  # identity reference
+            ax.bar(x, arr[h], color="tab:purple", alpha=0.8)
+            ax.set_ylabel(f"head {h}", fontsize=8)
+            ax.tick_params(axis="both", labelsize=6)
+        axes[-1, 0].set_xlabel("W gate-param index (plan order)", fontsize=8)
+        fig.suptitle(
+            f"CVQNN block (W) gate-param values vs identity{label} "
+            f"(epoch {run['epoch']})"
+        )
+        fig.tight_layout()
+        fname = f"cvqnn_param_values{suffix}.png"
+        fig.savefig(run["fig_dir"] / fname, dpi=150)
+        plt.close(fig)
+        print(f"  ✓ {fname}")
 
 
 def plot_photon_number_per_mode(run: dict) -> None:
@@ -1060,25 +1183,33 @@ def plot_state_norm_histogram(run: dict) -> None:
 
 def plot_lcu_coefficients_heatmap(run: dict) -> None:
     diag = run["diagnostics"]
-    if diag is None or "lcu_coeffs" not in diag:
+    stages = _diag_stages(diag) if diag is not None else []
+    if diag is None or not any(f"{p}lcu_coeffs" in diag for p, _, _ in stages):
         raise MissingArtefactError(
             f"diagnostics/epoch_{run['epoch']:04d}.npz missing or has no "
             f"`lcu_coeffs` key — run `uv run python "
             f"experiments/backfill_artefacts.py --run-dir {run['run_dir']}` "
             "to produce it."
         )
-    arr = np.asarray(diag["lcu_coeffs"])   # (num_heads, num_patches, 2)
-    magnitude = np.sqrt((arr ** 2).sum(axis=-1))  # (num_heads, num_patches)
-    fig, ax = plt.subplots(figsize=(10, 4))
-    im = ax.imshow(magnitude, aspect="auto", cmap="viridis")
-    ax.set_xlabel("Patch index")
-    ax.set_ylabel("Head")
-    ax.set_title(f"LCU coefficient magnitudes |b_i| (epoch {run['epoch']})")
-    fig.colorbar(im, ax=ax)
-    fig.tight_layout()
-    fig.savefig(run["fig_dir"] / "lcu_coefficients_heatmap.png", dpi=150)
-    plt.close(fig)
-    print("  ✓ lcu_coefficients_heatmap.png")
+    for prefix, suffix, label in stages:
+        key = f"{prefix}lcu_coeffs"
+        if key not in diag:
+            continue
+        arr = np.asarray(diag[key])   # (num_heads, num_patches, 2)
+        magnitude = np.sqrt((arr ** 2).sum(axis=-1))  # (num_heads, num_patches)
+        fig, ax = plt.subplots(figsize=(10, 4))
+        im = ax.imshow(magnitude, aspect="auto", cmap="viridis")
+        ax.set_xlabel("Patch index")
+        ax.set_ylabel("Head")
+        ax.set_title(
+            f"LCU coefficient magnitudes |b_i|{label} (epoch {run['epoch']})"
+        )
+        fig.colorbar(im, ax=ax)
+        fig.tight_layout()
+        fname = f"lcu_coefficients_heatmap{suffix}.png"
+        fig.savefig(run["fig_dir"] / fname, dpi=150)
+        plt.close(fig)
+        print(f"  ✓ {fname}")
 
 
 def plot_polynomial_coefficient_trajectory(run: dict) -> None:
@@ -1088,36 +1219,48 @@ def plot_polynomial_coefficient_trajectory(run: dict) -> None:
         print("  - history.json has no epoch entries → skipping polynomial_coefficients_trajectory")
         return
     diag_per_epoch = _load_all_diagnostics(run["run_dir"], n_epochs=n_epochs)
-    poly_chunks = []
-    for e in range(1, n_epochs + 1):
-        d = diag_per_epoch[e]
-        if "poly_coeffs" not in d:
-            raise MissingArtefactError(
-                f"diagnostics/epoch_{e:04d}.npz missing `poly_coeffs` — "
-                f"run `uv run python experiments/backfill_artefacts.py "
-                f"--run-dir {run['run_dir']}` to produce it."
-            )
-        poly_chunks.append(np.asarray(d["poly_coeffs"]))
-    arr = np.stack(poly_chunks)            # (n_epochs, num_heads, degree+1)
-    n_epochs, num_heads, degree_plus_1 = arr.shape
-    fig, axes = plt.subplots(1, num_heads, figsize=(3.5 * num_heads, 4),
-                             sharey=True, squeeze=False)
-    epoch_x = list(range(1, n_epochs + 1))
-    for h in range(num_heads):
-        ax = axes[0, h]
-        for j in range(degree_plus_1):
-            ax.plot(epoch_x, arr[:, h, j], marker="o", label=f"c_{j}")
-        ax.set_title(f"head {h}")
-        ax.set_xlabel("Epoch")
-        if h == 0:
-            ax.set_ylabel("Coefficient value")
-        ax.grid(alpha=0.3)
-        ax.legend(fontsize=8)
-    fig.suptitle("Polynomial coefficient trajectory")
-    fig.tight_layout()
-    fig.savefig(run["fig_dir"] / "polynomial_coefficients_trajectory.png", dpi=150)
-    plt.close(fig)
-    print("  ✓ polynomial_coefficients_trajectory.png")
+    stages = _diag_stages(diag_per_epoch[1])
+    if not any(f"{p}poly_coeffs" in diag_per_epoch[1] for p, _, _ in stages):
+        raise MissingArtefactError(
+            f"diagnostics/epoch_0001.npz missing `poly_coeffs` — "
+            f"run `uv run python experiments/backfill_artefacts.py "
+            f"--run-dir {run['run_dir']}` to produce it."
+        )
+    for prefix, suffix, label in stages:
+        key = f"{prefix}poly_coeffs"
+        if key not in diag_per_epoch[1]:
+            continue
+        poly_chunks = []
+        for e in range(1, n_epochs + 1):
+            d = diag_per_epoch[e]
+            if key not in d:
+                raise MissingArtefactError(
+                    f"diagnostics/epoch_{e:04d}.npz missing `{key}` — "
+                    f"run `uv run python experiments/backfill_artefacts.py "
+                    f"--run-dir {run['run_dir']}` to produce it."
+                )
+            poly_chunks.append(np.asarray(d[key]))
+        arr = np.stack(poly_chunks)        # (n_epochs, num_heads, degree+1)
+        _, num_heads, degree_plus_1 = arr.shape
+        fig, axes = plt.subplots(1, num_heads, figsize=(3.5 * num_heads, 4),
+                                 sharey=True, squeeze=False)
+        epoch_x = list(range(1, n_epochs + 1))
+        for h in range(num_heads):
+            ax = axes[0, h]
+            for j in range(degree_plus_1):
+                ax.plot(epoch_x, arr[:, h, j], marker="o", label=f"c_{j}")
+            ax.set_title(f"head {h}")
+            ax.set_xlabel("Epoch")
+            if h == 0:
+                ax.set_ylabel("Coefficient value")
+            ax.grid(alpha=0.3)
+            ax.legend(fontsize=8)
+        fig.suptitle(f"Polynomial coefficient trajectory{label}")
+        fig.tight_layout()
+        fname = f"polynomial_coefficients_trajectory{suffix}.png"
+        fig.savefig(run["fig_dir"] / fname, dpi=150)
+        plt.close(fig)
+        print(f"  ✓ {fname}")
 
 
 def plot_success_prob_histogram(run: dict) -> None:
@@ -1255,16 +1398,22 @@ def sanity_checks(run: dict) -> None:
 
     # LCU coeffs shape sanity — pulled from the chosen epoch's diagnostics
     # npz now that the per-epoch history.epoch.lcu_coeffs list is gone.
+    # Checks every stage namespace (canonical flat key, or the stacked run's
+    # block{b}_/agg_ prefixes, ADR-0003).
     diag = run["diagnostics"]
-    if diag is not None and "lcu_coeffs" in diag:
-        arr = np.asarray(diag["lcu_coeffs"])
+    if diag is not None:
         n_heads_expected = run["config"].quantum.num_heads
-        if arr.shape[0] != n_heads_expected:
-            warnings.warn(
-                f"LCU coeffs shape mismatch: got {arr.shape[0]} heads, "
-                f"config has {n_heads_expected}",
-                RuntimeWarning,
-            )
+        for prefix, _suffix, label in _diag_stages(diag):
+            key = f"{prefix}lcu_coeffs"
+            if key not in diag:
+                continue
+            arr = np.asarray(diag[key])
+            if arr.shape[0] != n_heads_expected:
+                warnings.warn(
+                    f"LCU coeffs shape mismatch{label}: got {arr.shape[0]} "
+                    f"heads, config has {n_heads_expected}",
+                    RuntimeWarning,
+                )
 
 
 # ---------------------------------------------------------------------------

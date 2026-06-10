@@ -127,17 +127,29 @@ failed figure warns but does not abort the rest; `sanity_checks` runs first):
 
 - *Fast* (history.json / npz only): training curves —
   `loss_curve`, `accuracy_curve`, `trunc_loss_curve`,
+  `cvqnn_trunc_loss_curve`, `query_trunc_loss_curve`,
   `per_class_accuracy_curve`, `confusion_matrix_test`,
   `per_batch_train_loss`, `per_batch_trunc_loss`,
-  `per_batch_train_accuracy`, `per_batch_grad_norm` — plus
+  `per_batch_train_accuracy`, `per_batch_grad_norm`,
+  `per_batch_cvqnn_trunc_loss`, `per_batch_query_trunc_loss` — plus
   `confusion_matrix_evolution`, `per_class_metrics_table`,
   `top_k_accuracy`, `calibration_reliability`,
-  `hypernet_gate_param_histograms`, `photon_number_per_mode`,
-  `state_norm_histogram`, `success_prob_histogram`,
-  `success_prob_trajectory`, `lcu_coefficients_heatmap`,
-  `polynomial_coefficients_trajectory`.
+  `hypernet_gate_param_histograms`, `cvqnn_param_values`,
+  `photon_number_per_mode`, `state_norm_histogram`,
+  `success_prob_histogram`, `success_prob_trajectory`,
+  `lcu_coefficients_heatmap`, `polynomial_coefficients_trajectory`.
+  The query / W trunc figures are skipped when the stream is absent or
+  identically zero (old runs, canonical runs without the stream, L_W=0).
 - *Slow* (need readouts/test images — from saved npz, or `--full-inference`):
   `misclassification_gallery`, `embedding_tsne`.
+- *Stacked runs* (`model="quantum_stacked"`, detected data-driven from the
+  block-prefixed diagnostics keys): the four per-stage figures —
+  `hypernet_gate_param_histograms`, `cvqnn_param_values`,
+  `lcu_coefficients_heatmap`, `polynomial_coefficients_trajectory` — render
+  one file per stage (`…_block{b}.png`, `…_agg.png`), with a separate
+  `…_block{b}_query.png` histogram for each block's query-unitary slice.
+  Canonical runs keep the historic unsuffixed filenames; state-norm / photon
+  figures keep canonical names (they describe the decoder-input stage).
 
 #### Hyperparameter sweeps
 
@@ -147,7 +159,11 @@ Sweep axes are exposed on `full_experiment.py` directly — the budget axes
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--model NAME` | `quantum` | `quantum` \| `quantum_shared` \| `classical`. `quantum_shared` defaults `--scaling-knob` to `num_heads`. |
+| `--model NAME` | `quantum` | `quantum` \| `quantum_shared` \| `quantum_stacked` \| `classical`. `quantum_shared` defaults `--scaling-knob` to `num_heads`; `quantum_stacked` is the seq-to-seq stacked model (ADR-0003). |
+| `--num-seq2seq-blocks N` | 1 | (`quantum_stacked`) seq-to-seq blocks; ≥ 1; excludes the optional aggregator block. A valid `--scaling-knob`, but coarse |
+| `--pooling MODE` | `mean` | (`quantum_stacked`) `mean` pools final tokens over positions; `quixer` appends a canonical seq-to-one aggregator block |
+| `--block-residual on\|off` | `on` | (`quantum_stacked`) identity residual `x + block(x)` from block 2 onward; `off` = pure-pipeline ablation |
+| `--query-trunc-lambda F` | 0.01 | (`quantum_stacked`) weight of the separate query-unitary truncation penalty |
 | `--target-params N` | -1 (off; frozen 13,530-param model) | parameter budget; when >0 auto-scales `--scaling-knob` (default `num_heads`) |
 | `--num-layers L` | 1 | per-patch circuit depth (L stacked gate sequences + L−1 `BS→Rot` interferometers); can also be a `--scaling-knob` |
 | `--observables NAME` | `xpxsps` | named observable preset (see below) |
@@ -181,11 +197,14 @@ runs, one process per grid point, in **two combinable modes**:
   auto-scaling): `--num-heads`, `--num-modes`, `--cutoff-dim`, `--poly-degree`,
   `--cnn-channels-1`, `--cnn-channels-2`, `--cnn-kernel-size`,
   `--decoder-hidden-dim`, `--cnn-num-conv-layers`, `--hypernet-num-linear-layers`,
-  `--decoder-num-layers`, `--decoder-hidden-mult` (each `nargs='+'`; the same flags
+  `--decoder-num-layers`, `--decoder-hidden-mult`, plus the stacked-model axes
+  `--num-seq2seq-blocks`, `--pooling`, `--block-residual`,
+  `--query-trunc-lambda` (each `nargs='+'`; the same flags
   exist on `full_experiment.py` for single runs; `--decoder-hidden-mult` is
   mutually exclusive with `--decoder-hidden-dim`). Run dirs are named
   `manual__obs-{preset}__seed{seed}` plus a short marker per active axis
-  (`__nh6`, `__nm3`, `__pd2`, `__ncl3`, `__hll2`, `__dnl3`, `__dhm1.0`, …).
+  (`__nh6`, `__nm3`, `__pd2`, `__ncl3`, `__hll2`, `__dnl3`, `__dhm1.0`, `__sb2`,
+  `__pool-quixer`, `__nores`, `__qtl0.02`, …).
 
 At least one of `--target-params` or a manual axis is required; they can coexist
 (fix some fields manually while auto-scaling one knob). It writes
@@ -376,8 +395,11 @@ cv_quixer/
 │       ├── cv_attention.py  CNNHypernetwork, LCUSumCoefficients,
 │       │                    PolynomialCoefficients, HyperCVAttentionHead,
 │       │                    HyperCVAttention + truncation loss helpers
-│       └── cv_quixer.py     CVDecoder, CVQuixer (main model),
-│                            param-count auto-scaling → utils.params.autoscale_to_target
+│       ├── cv_quixer.py     CVDecoder, CVQuixer (main model),
+│       │                    param-count auto-scaling → utils.params.autoscale_to_target
+│       └── cv_seq2seq.py    Seq-to-seq stacked model (model="quantum_stacked",
+│                            ADR-0003): Seq2SeqCNNHead/Seq2SeqLinearHead,
+│                            Seq2SeqCVAttention blocks, StackedCVQuixer
 ├── quantum/        Pure PyTorch CV simulation engine (no PennyLane)
 │   ├── state.py        FockState — N-mode Fock statevector container
 │   ├── circuit.py      CVCircuit — einsum-based gate application
@@ -474,7 +496,31 @@ hard-wired to `num_modes`. See `QuantumConfig.readout_observables` /
 - **Model factory**: `cv_quixer.models.build_model(config)` is the only place the model
   string is resolved to a class: `"quantum"` → `CVQuixer` (per-head CNN hypernetworks),
   `"quantum_shared"` → `SharedCVQuixer` (one shared patch CNN + per-head linears),
+  `"quantum_stacked"` → `StackedCVQuixer` (seq-to-seq blocks, ADR-0003),
   `"classical"` → `ClassicalViT`.
+- **Seq-to-seq stacked variant** (`model="quantum_stacked"`, `StackedCVQuixer`,
+  ADR-0003): `num_seq2seq_blocks` uniform **seq-to-seq blocks** — per head, all N
+  positions share one LCU `M`, polynomial `P`, and CVQNN block `W`; position i's
+  output token is the readout of `W·P(M)·U_{q,i}|0⟩`, where the **query unitary**
+  `U_{q,i}` is a second slice of the same hypernet output that emits `U_i`
+  (key/query projections of one shared patch embedding; the hypernet's final
+  linear emits `2×` the op-plan width). The query state is renormalised before
+  `P(M)`; its leakage is the separate `query_trunc_loss` stream (weighted by
+  `query_trunc_lambda`), and the per-patch trunc penalty measures LCU-term
+  leakage on the *actual input states* (degenerates to the vacuum form
+  elsewhere). Block 1 uses per-head CNN hypernets on raw patches; blocks ≥ 2 use
+  per-head `Linear(H×R → 2×gate_params)` over tokens, with identity residuals
+  from block 2 on (`block_residual`). The stack ends in mean-pooling
+  (`pooling="mean"`) or a canonical seq-to-one **aggregator block**
+  (`pooling="quixer"`, `LinearCVHead`s — not counted by `num_seq2seq_blocks`);
+  either way the decoder input is `H×R`, identical to the canonical models.
+  Engine stays iterative (no LCU matrix): the vmap nesting gains a query axis
+  (head → batch → query → patch) at ~`d·N²` gate-plan applications per head per
+  block (~N× the canonical model, × blocks). Diagnostics npz keys are
+  block-prefixed (`block{b}_head{h}_{gate}`, `…_q_{gate}` for the query slice,
+  `agg_…`, `block{b}_lcu_coeffs`, …); state norms / photon numbers keep the
+  canonical keys and describe the decoder-input stage. A new, never-trained
+  model — no checkpoint-compat constraints with `quantum`/`quantum_shared`.
 - **Shared-CNN variant** (`model="quantum_shared"`, `SharedCVQuixer`): a single
   `SharedPatchCNN` embeds each patch once (`Conv→Conv→flatten→+2D-PE`, shared across heads);
   it emits the flattened conv features directly (width `cnn_channels_2 × h_out²`, **no
@@ -558,6 +604,10 @@ hard-wired to `num_modes`. See `QuantumConfig.readout_observables` /
 | `scaling_knob` | `"num_heads"` | Integer QuantumConfig field auto-scaled toward `target_params` (e.g. `num_heads`, `cnn_channels_2`, `num_modes`, `num_layers`, the three depth fields above — all monotonic in param count). `num_heads` is the default (robust across budgets; `cnn_channels_2` accuracy degrades with scale). The build-and-count search in `utils/params.autoscale_to_target` tolerates knobs with a minimum > 1 (e.g. `decoder_num_layers ≥ 2`): out-of-range trials are skipped, never crash |
 | `trunc_penalty` | `"none"` | `"none"`, `"norm"`, or `"photon_number"` |
 | `trunc_lambda` | 0.01 | Truncation penalty loss weight |
+| `num_seq2seq_blocks` | 1 | (`quantum_stacked` only, ADR-0003) Number of uniform seq-to-seq blocks; ≥ 1 enforced (a 0-block model would duplicate the existing CVQuixer). Does **not** count the optional aggregator block. A valid (monotonic) `scaling_knob`, but coarse |
+| `pooling` | `"mean"` | (`quantum_stacked` only) `"mean"` pools the final tokens over positions; `"quixer"` appends a canonical seq-to-one aggregator block. Both end at the same `H×R` decoder width |
+| `block_residual` | `True` | (`quantum_stacked` only) Identity residual `x + block(x)` from block 2 onward (block 1's widths differ). `False` = pure-pipeline ablation |
+| `query_trunc_lambda` | 0.01 | (`quantum_stacked` only) Weight of the **separate** query-unitary truncation penalty `mean_i(1 − ‖U_{q,i}\|0⟩‖²)`. Single-application leakage like W's (fires once per position, before the polynomial), hence the lighter default vs the compounding per-patch `trunc_lambda`. `0` → tracked but not penalised |
 | `gate_param_bound` | `None` | Soft-clip magnitude gate params (squeeze r, displacement re/im) to `(-b, b)` via `b·tanh(x/b)` — stops gates driving the state far past the cutoff (the NaN-head cause at high `num_heads`). `None` = off (not checkpoint-compatible with a bounded model). `full_experiment.py --gate-param-bound auto` → `auto_gate_bound(cutoff)=asinh(√(cutoff-1))` (the representable photon budget; ≈1.54 at cutoff 6). Avoid large b (~4 → ⟨n⟩≈745, the degenerate regime). |
 | `readout_observable` | `None` | Legacy single-string selector: `"quadrature_x"`, `"photon_number"`, or `"pnr_distribution"`. Mutually exclusive with `readout_observables` |
 | `readout_observables` | `None` | Canonical `list[ObservableSpec]`. Mutually exclusive with `readout_observable`. Both `None` → default ⟨x̂⟩ per mode |
