@@ -284,18 +284,27 @@ def main() -> None:
         with np.load(p) as d:
             return "lcu_coeffs" in d.files and "poly_coeffs" in d.files
 
+    def _pred_is_complete(p: Path) -> bool:
+        """An existing predictions npz counts as complete only if it carries
+        the success_probs key — older backfills must be redone."""
+        if not p.is_file():
+            return False
+        with np.load(p) as d:
+            return "success_probs" in d.files
+
     for epoch, ckpt_path in tqdm(available, desc="epochs", unit="epoch"):
         pred_path = preds_dir / f"epoch_{epoch:04d}.npz"
         pred_train_path = preds_dir / f"epoch_{epoch:04d}_train.npz"
         diag_path = diag_dir / f"epoch_{epoch:04d}.npz"
         if (
-            pred_path.is_file()
-            and pred_train_path.is_file()
+            _pred_is_complete(pred_path)
+            and _pred_is_complete(pred_train_path)
             and _diag_has_coeffs(diag_path)
             and not args.overwrite
         ):
-            print(f"  epoch {epoch}: predictions (test+train) + diagnostics "
-                  f"(with lcu/poly) already exist → skipping (pass --overwrite to redo)")
+            print(f"  epoch {epoch}: predictions (test+train, with "
+                  f"success_probs) + diagnostics (with lcu/poly) already "
+                  f"exist → skipping (pass --overwrite to redo)")
             continue
 
         print(f"  epoch {epoch}: loading {ckpt_path.name}")
@@ -310,13 +319,15 @@ def main() -> None:
         train_eval = evaluate(model, train_eval_loader, device,
                               num_classes=config.data.num_classes,
                               progress=f"epoch {epoch} train eval")
-        np.savez_compressed(
-            pred_train_path,
+        train_pred_kwargs = dict(
             y_true=train_eval["y_true"],
             y_pred=train_eval["y_pred"],
             y_probs=train_eval["y_probs"],
             readouts=train_eval["readouts"],
         )
+        if train_eval.get("success_probs") is not None:
+            train_pred_kwargs["success_probs"] = train_eval["success_probs"]
+        np.savez_compressed(pred_train_path, **train_pred_kwargs)
         _set_epoch_entry(history, "train_loss", epoch, float(train_eval["loss"]))
         _set_epoch_entry(history, "train_acc",  epoch, float(train_eval["acc"]))
 
@@ -324,13 +335,15 @@ def main() -> None:
         test_eval = evaluate(model, test_loader, device,
                              num_classes=config.data.num_classes,
                              progress=f"epoch {epoch} test eval")
-        np.savez_compressed(
-            pred_path,
+        test_pred_kwargs = dict(
             y_true=test_eval["y_true"],
             y_pred=test_eval["y_pred"],
             y_probs=test_eval["y_probs"],
             readouts=test_eval["readouts"],
         )
+        if test_eval.get("success_probs") is not None:
+            test_pred_kwargs["success_probs"] = test_eval["success_probs"]
+        np.savez_compressed(pred_path, **test_pred_kwargs)
         _set_epoch_entry(history, "test_loss",       epoch, float(test_eval["loss"]))
         _set_epoch_entry(history, "test_acc",        epoch, float(test_eval["acc"]))
         _set_epoch_entry(history, "test_trunc_loss", epoch,

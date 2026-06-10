@@ -7,6 +7,7 @@ so large values make tests prohibitively slow.
 
 import math
 
+import numpy as np
 import torch
 import pytest
 from unittest.mock import MagicMock, patch
@@ -927,6 +928,57 @@ class TestM5ReturnContract:
         out = model(self._patches(tiny_data_config), return_trunc_loss=True)
         assert isinstance(out, CVQuixerOut)
         assert out.trunc_loss is None
+
+    def test_return_success_prob_populates_only_success_probs(
+        self, tiny_data_config,
+    ):
+        """return_success_prob=True alone → CVQuixerOut with success_probs
+        populated (list of (B,) per head, finite, positive), every other
+        optional field None, and logits identical to the flag-free call."""
+        model = CVQuixer(self._config(), tiny_data_config)
+        model.eval()
+        patches = self._patches(tiny_data_config)
+        with torch.no_grad():
+            plain = model(patches)
+            out = model(patches, return_success_prob=True)
+        assert isinstance(out, CVQuixerOut)
+        assert out.success_probs is not None and len(out.success_probs) == 2
+        for sp in out.success_probs:
+            assert sp.shape == (2,)
+            assert torch.isfinite(sp).all()
+            assert (sp > 0).all()
+        assert out.states is None and out.readouts is None
+        assert out.trunc_loss is None and out.cvqnn_trunc_loss is None
+        assert torch.allclose(plain, out.logits)
+
+
+class TestEvaluateSuccessProbs:
+    """evaluate() surfaces the per-sample raw post-selection norms."""
+
+    def test_evaluate_returns_NH_success_probs(self, tiny_data_config):
+        from torch.utils.data import DataLoader, TensorDataset
+
+        from cv_quixer.evaluation.diagnostics import evaluate
+
+        cfg = QuantumConfig(
+            num_modes=2, cutoff_dim=4, num_heads=2,
+            cnn_channels_1=4, cnn_channels_2=8, cnn_kernel_size=3,
+            decoder_hidden_dim=16, poly_degree=2, dtype="complex64",
+        )
+        model = CVQuixer(cfg, tiny_data_config)
+        num_patches = (
+            tiny_data_config.image_size // tiny_data_config.patch_size
+        ) ** 2
+        patches = torch.randn(6, num_patches, tiny_data_config.patch_size ** 2)
+        labels = torch.randint(0, tiny_data_config.num_classes, (6,))
+        loader = DataLoader(TensorDataset(patches, labels), batch_size=4)
+
+        result = evaluate(model, loader, torch.device("cpu"),
+                          num_classes=tiny_data_config.num_classes)
+        sp = result["success_probs"]
+        assert sp.shape == (6, 2)
+        assert sp.dtype == np.float32
+        assert np.isfinite(sp).all() and (sp > 0).all()
 
 
 class TestAutoScaling:

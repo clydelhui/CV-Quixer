@@ -129,7 +129,15 @@ class _CVQuixerBase(BaseVisionTransformer):
             return_trunc_loss:  If True and trunc_penalty != "none", also
                                 return the mean truncation penalty across all
                                 batch elements and heads.
-            return_success_prob: Not yet implemented. Raises NotImplementedError.
+            return_success_prob: If True, also return the per-head raw
+                                LCU/QSVT post-selection norms
+                                ``‖P(M)|ψ⟩‖²`` as ``success_probs`` —
+                                ``list[Tensor]``, one ``(B,)`` per head.
+                                Raw, i.e. NOT divided by the block-encoding
+                                subnormalisation λ² (derive λ from the LCU /
+                                polynomial coefficients; see ADR-0002).
+                                Essentially free — the values are already
+                                computed by the attention forward.
             return_states:      If True, also return ``(states, success_probs)``
                                 as appended trailing tuple entries —
                                 ``states`` is ``list[Tensor]`` (one per head,
@@ -157,22 +165,16 @@ class _CVQuixerBase(BaseVisionTransformer):
               readouts:      (B, num_heads * len(observable_plan)) — populated
                              when return_readouts=True.
               states:        list[Tensor] — populated when return_states=True.
-              success_probs: list[Tensor] — populated when return_states=True.
+              success_probs: list[(B,) Tensor] — populated when
+                             return_success_prob=True or return_states=True.
         """
-        if return_success_prob:
-            raise NotImplementedError(
-                "return_success_prob is not yet implemented. "
-                "Per-head success_prob tensors are computed inside "
-                "the attention heads but aggregation and exposure from "
-                "the model is pending."
-            )
-
         readouts, states, success_probs, trunc_loss, cvqnn_trunc_loss = (
             self.cv_attention(patches)
         )
         logits = self.decoder(readouts)                           # (B, num_classes)
 
-        if not (return_trunc_loss or return_readouts or return_states):
+        if not (return_trunc_loss or return_readouts or return_states
+                or return_success_prob):
             return logits
 
         return CVQuixerOut(
@@ -192,7 +194,10 @@ class _CVQuixerBase(BaseVisionTransformer):
             ),
             readouts=readouts if return_readouts else None,
             states=states if return_states else None,
-            success_probs=success_probs if return_states else None,
+            success_probs=(
+                success_probs if (return_success_prob or return_states)
+                else None
+            ),
         )
 
 

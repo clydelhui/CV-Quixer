@@ -909,20 +909,27 @@ for epoch in range(start_epoch, EPOCHS + 1):
         use_wandb=config.use_wandb,
     )
 
-    np.savez_compressed(
-        preds_dir / f"epoch_{epoch:04d}.npz",
+    # success_probs is absent for models without LCU post-selection.
+    test_pred_kwargs = dict(
         y_true=test_eval["y_true"],
         y_pred=test_eval["y_pred"],
         y_probs=test_eval["y_probs"],
         readouts=test_eval["readouts"],
     )
-    np.savez_compressed(
-        preds_dir / f"epoch_{epoch:04d}_train.npz",
+    if test_eval.get("success_probs") is not None:
+        test_pred_kwargs["success_probs"] = test_eval["success_probs"]
+    np.savez_compressed(preds_dir / f"epoch_{epoch:04d}.npz",
+                        **test_pred_kwargs)
+    train_pred_kwargs = dict(
         y_true=train_eval["y_true"],
         y_pred=train_eval["y_pred"],
         y_probs=train_eval["y_probs"],
         readouts=train_eval["readouts"],
     )
+    if train_eval.get("success_probs") is not None:
+        train_pred_kwargs["success_probs"] = train_eval["success_probs"]
+    np.savez_compressed(preds_dir / f"epoch_{epoch:04d}_train.npz",
+                        **train_pred_kwargs)
 
     lcu_snap, poly_snap = snapshot_coefficients(model)
     cvqnn_snap = snapshot_cvqnn_params(model)   # None when cvqnn_num_layers == 0

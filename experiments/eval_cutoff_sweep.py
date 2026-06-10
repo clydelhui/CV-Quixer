@@ -380,22 +380,29 @@ def _synthesize_cutoff_rundir(
     with open(sub / "history.json", "w") as f:
         json.dump(h, f, indent=2)
 
-    # predictions/epoch_0001.npz (test) + optionally _train counterpart
-    np.savez_compressed(
-        sub / "predictions" / "epoch_0001.npz",
+    # predictions/epoch_0001.npz (test) + optionally _train counterpart.
+    # success_probs is absent for models without LCU post-selection.
+    test_pred_kwargs = dict(
         y_true=test_eval["y_true"],
         y_pred=test_eval["y_pred"],
         y_probs=test_eval["y_probs"],
         readouts=test_eval["readouts"],
     )
+    if test_eval.get("success_probs") is not None:
+        test_pred_kwargs["success_probs"] = test_eval["success_probs"]
+    np.savez_compressed(sub / "predictions" / "epoch_0001.npz",
+                        **test_pred_kwargs)
     if train_eval is not None:
-        np.savez_compressed(
-            sub / "predictions" / "epoch_0001_train.npz",
+        train_pred_kwargs = dict(
             y_true=train_eval["y_true"],
             y_pred=train_eval["y_pred"],
             y_probs=train_eval["y_probs"],
             readouts=train_eval["readouts"],
         )
+        if train_eval.get("success_probs") is not None:
+            train_pred_kwargs["success_probs"] = train_eval["success_probs"]
+        np.savez_compressed(sub / "predictions" / "epoch_0001_train.npz",
+                            **train_pred_kwargs)
 
     # diagnostics/epoch_0001.npz — raw quantum-diagnostic arrays plus the
     # lcu/poly coefficient snapshots (so the post-hoc report_diagnostics

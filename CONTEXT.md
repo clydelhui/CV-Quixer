@@ -30,6 +30,20 @@ Killoran form `U₁ → S → U₂ → D → Φ`, unlike `U_i` which drops the l
 interferometer `U₁` (trivial on the vacuum that `U_i` first acts on).
 _Avoid_: variational layer, ansatz, output circuit.
 
+**Success probability**:
+The probability that the heralded LCU/QSVT implementation of `P(M)` post-selects
+successfully: `‖P(M)|ψ⟩‖² / λ²`, measured in the truncated simulation (so a small part
+of the norm deficit is Fock truncation, not heralding failure). Applies only to the
+Polynomial step — the CVQNN block `W` is unitary and has no success probability; its
+norm deficit is truncation leakage.
+_Avoid_: state norm (that is the unnormalised numerator), post-selection rate.
+
+**Subnormalisation** (`λ`):
+The block-encoding scale factor of the heralded polynomial,
+`λ = Σ_j |c_j| · (Σ_i |b_i|)ʲ` — the nested-LCU normalisation of `P(M)` built from the
+LCU of unitaries `M`. Derivable from the learned coefficients; one scalar per head.
+_Avoid_: normalisation constant (ambiguous with state renormalisation).
+
 **Head**:
 One `(LCU + Polynomial + CVQNN block + readout)` pipeline. The model runs `num_heads`
 independent heads in parallel and concatenates their readouts.

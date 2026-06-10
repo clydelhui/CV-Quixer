@@ -105,7 +105,8 @@ torch/model imports are deferred, so the default path is fast and runs
 without a configured PyTorch backend.
 
 If you have an older run that lacks the new artefacts (per-epoch
-`epoch_NNNN_train.npz`, or diagnostics npz without `lcu_coeffs` /
+`epoch_NNNN_train.npz`, predictions npz without a `success_probs` key, or
+diagnostics npz without `lcu_coeffs` /
 `poly_coeffs` keys), `report_diagnostics.py` fails loudly with a hint to
 run `experiments/backfill_artefacts.py --run-dir <run>` first. Backfill
 replays the post-epoch eval pass from each checkpoint and writes the
@@ -132,7 +133,8 @@ failed figure warns but does not abort the rest; `sanity_checks` runs first):
   `confusion_matrix_evolution`, `per_class_metrics_table`,
   `top_k_accuracy`, `calibration_reliability`,
   `hypernet_gate_param_histograms`, `photon_number_per_mode`,
-  `state_norm_histogram`, `lcu_coefficients_heatmap`,
+  `state_norm_histogram`, `success_prob_histogram`,
+  `success_prob_trajectory`, `lcu_coefficients_heatmap`,
   `polynomial_coefficients_trajectory`.
 - *Slow* (need readouts/test images — from saved npz, or `--full-inference`):
   `misclassification_gallery`, `embedding_tsne`.
@@ -671,8 +673,8 @@ Output layout differs per script (none of `results/` is git-tracked):
 | `parameter_table.txt` | Snapshot of `print_parameter_table()` |
 | `checkpoints/` | `latest.pt` (every epoch), `best.pt` (best test acc), `final_model.pt`, `epoch_NNNN.pt` |
 | `figures/` | Populated by `report_diagnostics.py` (run post-hoc or partway through). Not written by `full_experiment.py` itself. |
-| `predictions/epoch_NNNN.npz` | Test side per epoch: `y_true`, `y_pred`, `y_probs`, `readouts`. Canonical source for accuracy/loss/per-class/confusion/calibration figures. |
-| `predictions/epoch_NNNN_train.npz` | Train side per epoch: same four keys, from the clean post-epoch train eval. Enables train-side per-class/confusion/embedding figures. |
+| `predictions/epoch_NNNN.npz` | Test side per epoch: `y_true`, `y_pred`, `y_probs`, `readouts`, `success_probs` (float32 `(N, num_heads)` raw per-sample LCU/QSVT post-selection norms ‖P(M)\|ψ⟩‖²; figures derive the subnormalisation λ from `lcu_coeffs`/`poly_coeffs` at render time — see ADR-0002). Canonical source for accuracy/loss/per-class/confusion/calibration figures. |
+| `predictions/epoch_NNNN_train.npz` | Train side per epoch: same five keys, from the clean post-epoch train eval. Enables train-side per-class/confusion/embedding figures. |
 | `predictions/test_images.npz` | One-time, reassembled `(N, H, W)` test images for the misclassification gallery. |
 | `diagnostics/epoch_NNNN.npz` | Per-epoch raw quantum diagnostics: gate-param samples (`head{h}_{gate}`), state norms (`head{h}_state_norms`), `mean_photon_number`, `lcu_coeffs`, `poly_coeffs`. |
 | `subset_indices.npz` | Absolute train/test/diag indices into the full PatchedDataset, written once. |

@@ -359,6 +359,11 @@ def evaluate(model, loader, device, num_classes: int = 10,
         confusion      — int64 (num_classes, num_classes) — rows true, cols pred
         readouts       — float32 (N, num_heads * readout_per_head) pre-decoder
                          activations (used for the post-hoc t-SNE plot)
+        success_probs  — float32 (N, num_heads) raw per-sample LCU/QSVT
+                         post-selection norms ‖P(M)|ψ⟩‖² per head. Raw, i.e.
+                         not divided by the subnormalisation λ² (derive λ from
+                         lcu_coeffs/poly_coeffs; see ADR-0002). Key absent for
+                         models without LCU post-selection.
     """
     model.eval()
     total_loss, total_trunc, total_cvqnn_trunc, correct, total = 0.0, 0.0, 0.0, 0, 0
@@ -366,6 +371,7 @@ def evaluate(model, loader, device, num_classes: int = 10,
     y_pred_chunks: list[torch.Tensor] = []
     y_prob_chunks: list[torch.Tensor] = []
     readout_chunks: list[torch.Tensor] = []
+    sp_chunks: list[torch.Tensor] = []
     iterator = loader
     if progress:
         from tqdm import tqdm
@@ -374,7 +380,8 @@ def evaluate(model, loader, device, num_classes: int = 10,
                         mininterval=5.0)
     for patches, labels in iterator:
         patches, labels = patches.to(device), labels.to(device)
-        out = model(patches, return_trunc_loss=True, return_readouts=True)
+        out = model(patches, return_trunc_loss=True, return_readouts=True,
+                    return_success_prob=True)
         # out.trunc_loss is None when the model's trunc_penalty == "none".
         logits, readouts = out.logits, out.readouts
         if out.trunc_loss is not None:
@@ -391,11 +398,20 @@ def evaluate(model, loader, device, num_classes: int = 10,
         y_pred_chunks.append(preds.detach().cpu())
         y_prob_chunks.append(F.softmax(logits, dim=-1).detach().cpu().float())
         readout_chunks.append(readouts.detach().cpu().float())
+        # out.success_probs is None on models without LCU post-selection.
+        if out.success_probs is not None:
+            # list of H × (B,) → (B, H)
+            sp_chunks.append(
+                torch.stack(out.success_probs, dim=1).detach().cpu().float()
+            )
 
     y_true = torch.cat(y_true_chunks).numpy().astype(np.int64)
     y_pred = torch.cat(y_pred_chunks).numpy().astype(np.int64)
     y_probs = torch.cat(y_prob_chunks).numpy().astype(np.float32)
     readouts_np = torch.cat(readout_chunks).numpy().astype(np.float32)
+    success_probs_np = (
+        torch.cat(sp_chunks).numpy().astype(np.float32) if sp_chunks else None
+    )
 
     flat = y_true.astype(np.int64) * num_classes + y_pred.astype(np.int64)
     confusion = np.bincount(flat, minlength=num_classes * num_classes).reshape(
@@ -408,7 +424,7 @@ def evaluate(model, loader, device, num_classes: int = 10,
         0.0,
     ).astype(np.float32)
 
-    return {
+    result = {
         "loss":          total_loss / total,
         "acc":           correct / total,
         "trunc_loss":    total_trunc / total,
@@ -420,3 +436,6 @@ def evaluate(model, loader, device, num_classes: int = 10,
         "confusion":     confusion,
         "readouts":      readouts_np,
     }
+    if success_probs_np is not None:
+        result["success_probs"] = success_probs_np
+    return result
