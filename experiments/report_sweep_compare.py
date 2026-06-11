@@ -4,22 +4,25 @@ Where `report_sweep.py` aggregates a *single* sweep, this script overlays
 several — typically one sweep per model variant (e.g. an already-finished
 `quantum` sweep vs a new `quantum_shared` sweep) — into one combined table and a
 pair of cross-sweep comparison figures. It reads only JSON (no torch / model
-rebuild) and reuses `report_sweep`'s run loader and aggregation helpers, so it
-never reimplements run parsing and stays fast on partial/in-progress sweeps.
+rebuild) and reuses `report_sweep`'s run loader and configuration-identity
+grouping, so it never reimplements run parsing and stays fast on
+partial/in-progress sweeps.
 
-The series are keyed on (sweep_label, model, observables, scaling_knob): leading
-with the sweep label means two sweeps that share a model/observable/knob — e.g.
-two `quantum` sweeps, or a re-run vs the original — stay separate instead of being
-averaged into one point. Within a sweep, the same key also keeps distinct scaling
-knobs apart (e.g. the quantum knobsweep has both `cnn_channels_2` and `num_heads`
-runs at 12,800, genuinely different architectures). Colour encodes the sweep
-label (one per --label); marker/linestyle encode the knob.
+Points are seed-averaged per (sweep label, *configuration identity*) — every
+recorded sweep coordinate except the training seed — so manual-mode sweeps get
+one point per architecture instead of collapsing into a single average, and two
+sweeps that contain the same configuration (e.g. a re-run vs the original) stay
+separate. Series (one line each) are the sweep label plus the --series-by
+fields (default: model observables); colour encodes the sweep label, marker the
+series fields. As in `report_sweep.py`, a series' points are connected only
+when exactly one identity field varies across them.
 
 Outputs (under --out-dir, default results/sweeps/compare_<ts>/):
 
     comparison.csv / comparison.md      every run across all sweeps, one row each
     figures/acc_vs_params_compare.png   best test acc vs achieved param count
-    figures/acc_by_params_compare.png   grouped bars: model/knob at each budget
+    figures/acc_by_params_compare.png   grouped bars: series at each budget
+                                        (or per configuration for manual sweeps)
 
 Usage:
     uv run python experiments/report_sweep_compare.py \\
@@ -33,7 +36,10 @@ from __future__ import annotations
 import argparse
 import csv
 import warnings
+from collections import defaultdict
+from collections.abc import Sequence
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 
 import matplotlib
@@ -42,14 +48,16 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-# Reuse the single-sweep loader + aggregation helpers (JSON only, no torch).
-from report_sweep import _aggregate_by, _mean_value_by, load_sweep
-
-# Series identity: never collapse different sweeps, models, or scaling knobs into
-# one point. Including sweep_label keeps same-model runs from different sweeps
-# separate (one series per --label). (Seeds are still averaged within a key by
-# _aggregate_by.)
-SERIES_FIELDS = ("sweep_label", "model", "observables", "scaling_knob", "target_params")
+# Reuse the single-sweep loader + configuration-identity helpers (JSON only).
+from report_sweep import (
+    CONFIG_IDENTITY_FIELDS,
+    _FIELD_INDEX,
+    _check_identity_drift,
+    _config_groups,
+    _series_key,
+    _varying_fields,
+    load_sweep,
+)
 
 # Columns for the combined table, in display order.
 COMPARISON_COLUMNS = [
@@ -59,9 +67,8 @@ COMPARISON_COLUMNS = [
     "n_epochs", "total_runtime_sec", "device",
 ]
 
-# Plot markers cycled per scaling knob (linestyle paired so b/w prints differ).
+# Plot markers cycled per --series-by group (colour already encodes the sweep).
 _MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*"]
-_LINESTYLES = ["-", "--", "-.", ":"]
 
 
 def _fmt(v: object) -> str:
@@ -81,6 +88,9 @@ def load_sweeps(sweep_dirs: list[Path], labels: list[str]) -> list[dict]:
                 RuntimeWarning,
             )
             continue
+        # Per sweep, not across sweeps: two sweeps may legitimately contain the
+        # same configuration (that is the point of comparing them).
+        _check_identity_drift(sweep_rows)
         for r in sweep_rows:
             r["sweep_label"] = label
             rows.append(r)
@@ -105,52 +115,65 @@ def write_table(rows: list[dict], out_dir: Path) -> None:
     print(f"  ✓ {md_path}")
 
 
-def _series_style(rows: list[dict]) -> tuple[dict[str, object], dict[str, tuple]]:
-    """Stable colour-per-sweep-label and marker/linestyle-per-knob maps."""
-    labels = sorted({str(r.get("sweep_label")) for r in rows})
-    knobs = sorted({str(r.get("scaling_knob")) for r in rows})
+def _per_label_groups(rows: list[dict]) -> dict[tuple, dict]:
+    """{(sweep_label, config_key): seed-averaged group}, grouped per sweep."""
+    out: dict[tuple, dict] = {}
+    for label in sorted({r["sweep_label"] for r in rows}):
+        label_rows = [r for r in rows if r["sweep_label"] == label]
+        for key, g in _config_groups(label_rows).items():
+            out[(label, key)] = g
+    return out
+
+
+def _label_colors(labels: set) -> dict:
+    """Stable colour per sweep label."""
     cmap = plt.get_cmap("tab10")
-    color_by_label = {lbl: cmap(i % 10) for i, lbl in enumerate(labels)}
-    style_by_knob = {
-        k: (_MARKERS[i % len(_MARKERS)], _LINESTYLES[i % len(_LINESTYLES)])
-        for i, k in enumerate(knobs)
+    return {lbl: cmap(i % 10) for i, lbl in enumerate(sorted(labels))}
+
+
+def _suffix_markers(suffixes: set) -> dict:
+    """Stable marker per --series-by value tuple (shared across sweep labels)."""
+    return {
+        s: _MARKERS[i % len(_MARKERS)]
+        for i, s in enumerate(sorted(suffixes, key=str))
     }
-    return color_by_label, style_by_knob
 
 
-def plot_acc_vs_params(rows: list[dict], fig_dir: Path) -> None:
-    """Best test acc vs achieved param count, one line per (sweep, model, obs, knob)."""
-    agg = _aggregate_by(rows, SERIES_FIELDS)
-    if not agg:
-        print("  (no runs with best_test_acc — skipping acc_vs_params_compare)")
+def _series_name(label: str, suffix: tuple) -> str:
+    return "/".join([str(label), *(str(v) for v in suffix)])
+
+
+def plot_acc_vs_params(
+    rows: list[dict], fig_dir: Path, series_by: Sequence[str]
+) -> None:
+    """Best test acc vs achieved params, one point per (sweep, configuration)."""
+    groups = {
+        lk: g for lk, g in _per_label_groups(rows).items() if g["x"] is not None
+    }
+    if len(groups) < 2:
+        print("  (need ≥2 distinct configurations — skipping acc_vs_params_compare)")
         return
-    x_by_key = _mean_value_by(rows, SERIES_FIELDS, "achieved_params")
-    color_by_label, style_by_knob = _series_style(rows)
+    by_series: dict[tuple, dict[tuple, dict]] = defaultdict(dict)
+    for (label, key), g in groups.items():
+        by_series[(label, _series_key(key, series_by))][key] = g
+    colors = _label_colors({lbl for (lbl, _s) in by_series})
+    markers = _suffix_markers({s for (_lbl, s) in by_series})
 
-    series = sorted({(lbl, m, o, k) for (lbl, m, o, k, _tp) in agg})
     fig, ax = plt.subplots(figsize=(7.5, 5))
-    for label, model, obs, knob in series:
-        pts = sorted(
-            (x_by_key[(lbl, m, o, k, tp)], mean, std)
-            for (lbl, m, o, k, tp), (mean, std) in agg.items()
-            if (lbl, m, o, k) == (label, model, obs, knob)
-            and (lbl, m, o, k, tp) in x_by_key
-        )
-        if not pts:
-            continue
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
-        es = [p[2] for p in pts]
-        marker, linestyle = style_by_knob[str(knob)]
+    for label, suffix in sorted(by_series, key=str):
+        sgroups = by_series[(label, suffix)]
+        pts = sorted((g["x"], g["acc"][0], g["acc"][1]) for g in sgroups.values())
+        linestyle = "-" if len(_varying_fields(sgroups)) == 1 else "none"
         ax.errorbar(
-            xs, ys, yerr=es, marker=marker, linestyle=linestyle, capsize=3,
-            color=color_by_label[str(label)], label=f"{label}/{model}/{obs}/{knob}",
+            [p[0] for p in pts], [p[1] for p in pts], yerr=[p[2] for p in pts],
+            marker=markers[suffix], linestyle=linestyle, capsize=3,
+            color=colors[label], label=_series_name(label, suffix),
         )
     ax.set_xlabel("Achieved parameter count")
     ax.set_ylabel("Best test accuracy")
-    ax.set_title("Accuracy vs achieved params (colour = sweep label, marker = scaling knob)")
+    ax.set_title("Accuracy vs achieved params (colour = sweep label)")
     ax.grid(alpha=0.3)
-    ax.legend(title="sweep / model / observable / knob", fontsize=8)
+    ax.legend(title=" / ".join(["sweep", *series_by]), fontsize=8)
     fig.tight_layout()
     out = fig_dir / "acc_vs_params_compare.png"
     fig.savefig(out, dpi=150)
@@ -158,43 +181,121 @@ def plot_acc_vs_params(rows: list[dict], fig_dir: Path) -> None:
     print(f"  ✓ {out}")
 
 
-def plot_acc_by_params(rows: list[dict], fig_dir: Path) -> None:
-    """Grouped bars: best test acc by (sweep, model, obs, knob), grouped by budget."""
-    agg = _aggregate_by(rows, SERIES_FIELDS)
-    if not agg:
+def plot_acc_by_params(
+    rows: list[dict], fig_dir: Path, series_by: Sequence[str]
+) -> None:
+    """Grouped bars: one bar per (sweep, series) at each target budget.
+
+    Budget sweeps keep the historic budgets-on-x layout (skipped unless ≥2
+    budgets); when several configurations land in one bar cell — i.e. an
+    identity field outside --series-by varies — they are averaged with a
+    RuntimeWarning suggesting the fields to add. Manual sweeps (no positive
+    budgets anywhere) instead draw one bar per configuration under its
+    (sweep, series) category, annotated with achieved params.
+    """
+    per_cfg = _per_label_groups(rows)
+    if not per_cfg:
         print("  (no runs with best_test_acc — skipping acc_by_params_compare)")
         return
-    achieved = _mean_value_by(rows, SERIES_FIELDS, "achieved_params")
-    color_by_label, _ = _series_style(rows)
+    tpi = _FIELD_INDEX["target_params"]
 
-    cats = sorted({(lbl, m, o, k) for (lbl, m, o, k, _tp) in agg})
-    budgets = sorted({tp for (_lbl, _m, _o, _k, tp) in agg})
-    x = np.arange(len(budgets))
-    width = 0.8 / max(len(cats), 1)
+    if any((key[tpi] or 0) > 0 for (_lbl, key) in per_cfg):
+        # Budget mode: cells keyed (sweep, series, budget).
+        cells: dict[tuple, list[tuple]] = defaultdict(list)
+        for (label, key), g in per_cfg.items():
+            cells[(label, _series_key(key, series_by), key[tpi])].append((key, g))
+        budgets = sorted({tp for (_l, _s, tp) in cells})
+        if len(budgets) < 2:
+            print("  (need ≥2 target budgets — skipping acc_by_params_compare)")
+            return
+        merged = {c: v for c, v in cells.items() if len(v) > 1}
+        if merged:
+            fields = sorted({
+                f for v in merged.values()
+                for f in _varying_fields([k for k, _g in v])
+            })
+            warnings.warn(
+                f"{len(merged)} bar cell(s) average >1 configuration (varying "
+                f"fields: {fields}); add them to --series-by to split the bars.",
+                RuntimeWarning,
+            )
+        cats = sorted({(lbl, s) for (lbl, s, _tp) in cells}, key=str)
+        colors = _label_colors({lbl for (lbl, _s) in cats})
+        x = np.arange(len(budgets))
+        width = 0.8 / max(len(cats), 1)
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    for i, (label, model, obs, knob) in enumerate(cats):
-        means = [agg.get((label, model, obs, knob, tp), (np.nan, 0.0))[0] for tp in budgets]
-        errs = [agg.get((label, model, obs, knob, tp), (np.nan, 0.0))[1] for tp in budgets]
-        bars = ax.bar(
-            x + i * width, means, width, yerr=errs, capsize=3,
-            color=color_by_label[str(label)], label=f"{label}/{model}/{obs}/{knob}",
-        )
-        for tp, bar in zip(budgets, bars):
-            n = achieved.get((label, model, obs, knob, tp))
-            if n is not None and not np.isnan(bar.get_height()):
-                ax.annotate(
-                    f"{int(round(n)):,}",
-                    (bar.get_x() + bar.get_width() / 2, bar.get_height()),
-                    ha="center", va="bottom", fontsize=6, rotation=90,
+        fig, ax = plt.subplots(figsize=(8, 5))
+        for i, (label, suffix) in enumerate(cats):
+            means, errs, achs = [], [], []
+            for tp in budgets:
+                v = cells.get((label, suffix, tp))
+                if not v:
+                    means.append(np.nan)
+                    errs.append(0.0)
+                    achs.append(None)
+                    continue
+                ms = [g["acc"][0] for _k, g in v]
+                means.append(float(np.mean(ms)))
+                errs.append(
+                    v[0][1]["acc"][1] if len(v) == 1 else float(np.std(ms))
                 )
-    ax.set_xticks(x + width * (len(cats) - 1) / 2)
-    ax.set_xticklabels([f"{tp:,}" for tp in budgets])
-    ax.set_xlabel("Target parameter budget")
+                xs_ = [g["x"] for _k, g in v if g["x"] is not None]
+                achs.append(float(np.mean(xs_)) if xs_ else None)
+            bars = ax.bar(
+                x + i * width, means, width, yerr=errs, capsize=3,
+                color=colors[label], label=_series_name(label, suffix),
+            )
+            for n, bar in zip(achs, bars):
+                if n is not None and not np.isnan(bar.get_height()):
+                    ax.annotate(
+                        f"{int(round(n)):,}",
+                        (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                        ha="center", va="bottom", fontsize=6, rotation=90,
+                    )
+        ax.set_xticks(x + width * (len(cats) - 1) / 2)
+        ax.set_xticklabels([f"{tp:,}" for tp in budgets])
+        ax.set_xlabel("Target parameter budget")
+        ax.legend(title=" / ".join(["sweep", *series_by]), fontsize=8)
+    else:
+        # Manual mode: one bar per configuration under its (sweep, series).
+        by_cat: dict[tuple, list[dict]] = defaultdict(list)
+        for (label, key), g in per_cfg.items():
+            by_cat[(label, _series_key(key, series_by))].append(g)
+        if sum(len(v) for v in by_cat.values()) < 2:
+            print("  (need ≥2 configurations — skipping acc_by_params_compare)")
+            return
+        cats = sorted(by_cat, key=str)
+        colors = _label_colors({lbl for (lbl, _s) in cats})
+        n_bars = max(len(v) for v in by_cat.values())
+        width = 0.8 / n_bars
+        x = np.arange(len(cats))
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        seen_labels: set = set()
+        for ci, (label, suffix) in enumerate(cats):
+            cfgs = sorted(by_cat[(label, suffix)], key=lambda g: (g["x"] is None, g["x"]))
+            for bi, g in enumerate(cfgs):
+                bar = ax.bar(
+                    ci + bi * width, g["acc"][0], width, yerr=g["acc"][1],
+                    capsize=3, color=colors[label],
+                    label=str(label) if label not in seen_labels else None,
+                )[0]
+                seen_labels.add(label)
+                if g["x"] is not None:
+                    ax.annotate(
+                        f"{int(round(g['x'])):,}",
+                        (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                        ha="center", va="bottom", fontsize=6, rotation=90,
+                    )
+        ax.set_xticks(x + width * (n_bars - 1) / 2)
+        ax.set_xticklabels(
+            [_series_name(lbl, s) for (lbl, s) in cats], rotation=15, ha="right"
+        )
+        ax.set_xlabel("Sweep / series (one bar per configuration)")
+        ax.legend(title="sweep", fontsize=8)
     ax.set_ylabel("Best test accuracy")
-    ax.set_title("Accuracy by sweep / model / knob at each budget (bar labels = achieved params)")
+    ax.set_title("Accuracy by series at each budget (bar labels = achieved params)")
     ax.grid(alpha=0.3, axis="y")
-    ax.legend(title="sweep / model / observable / knob", fontsize=8)
     fig.tight_layout()
     out = fig_dir / "acc_by_params_compare.png"
     fig.savefig(out, dpi=150)
@@ -212,6 +313,14 @@ def main() -> None:
         "--label", type=str, action="append", dest="labels", default=None,
         help="display label for the matching --sweep-dir (repeat; defaults to "
         "each sweep dir's basename)",
+    )
+    parser.add_argument(
+        "--series-by", nargs="+", default=["model", "observables"],
+        choices=CONFIG_IDENTITY_FIELDS, metavar="FIELD",
+        help="meta fields defining the per-sweep legend/series "
+             "(default: model observables — e.g. add scaling_knob to recover "
+             "per-knob lines in a multi-knob budget sweep; choices: "
+             + ", ".join(CONFIG_IDENTITY_FIELDS) + ")",
     )
     parser.add_argument(
         "--out-dir", type=str, default=None,
@@ -250,11 +359,16 @@ def main() -> None:
 
     fig_dir = out_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
-    for fn in (plot_acc_vs_params, plot_acc_by_params):
+    plotters = (
+        partial(plot_acc_vs_params, series_by=args.series_by),
+        partial(plot_acc_by_params, series_by=args.series_by),
+    )
+    for fn in plotters:
         try:
             fn(rows, fig_dir)
         except Exception as e:  # one bad figure must not abort the rest
-            warnings.warn(f"{fn.__name__} failed: {type(e).__name__}: {e}", RuntimeWarning)
+            name = getattr(fn, "func", fn).__name__
+            warnings.warn(f"{name} failed: {type(e).__name__}: {e}", RuntimeWarning)
 
 
 if __name__ == "__main__":

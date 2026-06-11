@@ -6,14 +6,25 @@ the resolved architecture), and emits a comparison table + plots into the sweep
 directory:
 
     summary.csv / summary.md         one row per run (drop-in thesis table)
-    figures/acc_vs_params.png        best test acc vs parameter budget,
-                                     one line per observable/scaling-knob (± std)
-    figures/acc_by_observable.png    grouped bars: acc by observable/knob,
-                                     grouped by parameter budget
-    figures/acc_by_scaling_knob.png  grouped bars: acc by scaling knob, grouped by
-                                     budget (only when ≥2 knobs swept)
+    figures/acc_vs_params.png        best test acc vs achieved params, one
+                                     seed-averaged point per configuration
+                                     (series chosen via --series-by)
+    figures/acc_by_observable.png    grouped bars: acc by observable — by budget,
+                                     or by configuration for manual sweeps
+                                     (only when ≥2 observable presets)
+    figures/acc_by_scaling_knob.png  grouped bars: acc by model/scaling knob,
+                                     grouped by budget (only when ≥2 knobs swept)
     figures/acc_vs_trunc_lambda.png  acc vs truncation penalty weight λ
-                                     (only when trunc_lambda is swept)
+                                     (only when ≥2 λ values are swept)
+    figures/acc_vs_<field>.png       one per architecture field that varies
+
+Cross-run figures group runs by *configuration identity* — every recorded sweep
+coordinate except the training seed (``CONFIG_IDENTITY_FIELDS``) — so only seed
+repeats are ever averaged together. Manual-mode runs, which all share the
+``target_params=-1`` / default-knob placeholders, therefore get one point per
+architecture instead of collapsing into a single averaged point. Every figure
+renders only when its comparison axis takes ≥2 distinct values (a skip notice is
+printed otherwise).
 
 The cross-run aggregation reads only JSON (no torch / model rebuild), so it is
 fast and runs on a partial or in-progress sweep. By default it then also renders
@@ -31,10 +42,13 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import subprocess
 import sys
 import warnings
 from collections import defaultdict
+from collections.abc import Iterable, Sequence
+from functools import partial
 from pathlib import Path
 
 import matplotlib
@@ -49,7 +63,7 @@ REPORT_DIAGNOSTICS = "experiments/report_diagnostics.py"
 
 # Resolved architecture knobs recorded in history["meta"] by full_experiment.py.
 # Surfaced per-run in the table and used as the candidate axes for the
-# acc-vs-hyperparam figures (any that vary across runs). num_layers is loaded
+# acc-vs-hyperparam figures (any that vary across the runs). num_layers is loaded
 # separately (it predates this list) but is included here as a figure candidate.
 ARCH_META_FIELDS = [
     "num_modes", "num_heads", "cutoff_dim", "poly_degree",
@@ -58,7 +72,20 @@ ARCH_META_FIELDS = [
     "decoder_hidden_mult", "cvqnn_num_layers",
     # Stacked-model axes (ADR-0003); absent on older runs → skipped.
     "num_seq2seq_blocks", "pooling", "block_residual",
+    # Loss-weight knobs (query_trunc_lambda is a sweep axis, __qtl marker).
+    "query_trunc_lambda", "cvqnn_trunc_lambda",
 ]
+
+# A run's *configuration identity*: every sweep coordinate except the training
+# seed. Two runs are "the same experiment repeated" — and may be seed-averaged
+# in cross-run figures — iff they agree on all of these fields. Keep this in
+# sync with the axes sweep.py exposes; _check_identity_drift() warns when run
+# names reveal an axis missing from this list.
+CONFIG_IDENTITY_FIELDS = (
+    "model", "observables", "scaling_knob", "target_params",
+    "num_layers", "trunc_lambda", *ARCH_META_FIELDS,
+)
+_FIELD_INDEX = {f: i for i, f in enumerate(CONFIG_IDENTITY_FIELDS)}
 
 # Columns for the summary table, in display order.
 SUMMARY_COLUMNS = [
@@ -139,7 +166,7 @@ def _load_run(run_dir: Path) -> dict | None:
         "device": meta.get("device"),
     }
     # Resolved architecture knobs (present for runs from the manual-sweep-aware
-    # full_experiment.py; None for older runs — safely omitted from figures).
+    # full_experiment.py; None for older runs — kept as None in the identity key).
     for field in ARCH_META_FIELDS:
         row[field] = meta.get(field)
     return row
@@ -186,13 +213,15 @@ def write_table(rows: list[dict], sweep_dir: Path) -> None:
 
 
 def _aggregate_by(
-    rows: list[dict], fields: tuple[str, ...]
+    rows: list[dict], fields: tuple[str, ...], skip_none_keys: bool = True
 ) -> dict[tuple, tuple[float, float]]:
-    """Mean ± std of best_test_acc over seeds, keyed by the given meta fields.
+    """Mean ± std of best_test_acc over runs, keyed by the given meta fields.
 
-    Runs missing best_test_acc, or any of the requested key fields, are skipped.
-    (Skipping on a None key is what restricts the λ figure to λ-swept runs:
-    non-λ runs carry trunc_lambda=None and drop out automatically.)
+    Runs missing best_test_acc are always skipped. With ``skip_none_keys=True``
+    (default), a None in any key field also drops the run — that is what
+    restricts the λ figure to λ-swept runs. ``skip_none_keys=False`` keeps None
+    as an ordinary key value instead (configuration-identity grouping: older
+    runs simply miss some meta fields and must still group among themselves).
     """
     buckets: dict[tuple, list[float]] = defaultdict(list)
     for r in rows:
@@ -200,28 +229,30 @@ def _aggregate_by(
         if acc is None:
             continue
         key = tuple(r.get(f) for f in fields)
-        if any(k is None for k in key):
+        if skip_none_keys and any(k is None for k in key):
             continue
         buckets[key].append(float(acc))
     return {k: (float(np.mean(v)), float(np.std(v))) for k, v in buckets.items()}
 
 
 def _mean_value_by(
-    rows: list[dict], fields: tuple[str, ...], value_field: str
+    rows: list[dict], fields: tuple[str, ...], value_field: str,
+    skip_none_keys: bool = True,
 ) -> dict[tuple, float]:
     """Mean of ``value_field`` over rows, keyed by the given meta fields.
 
     Uses the same keying/skip rules as ``_aggregate_by`` (rows missing
-    best_test_acc or any key field drop out), so the returned map lines up
-    one-to-one with ``_aggregate_by``'s keys. Used to place points at the mean
-    *achieved* parameter count of each seed-group rather than the target budget.
+    best_test_acc or — with ``skip_none_keys`` — any key field drop out), so the
+    returned map lines up one-to-one with ``_aggregate_by``'s keys. Used to place
+    points at the mean *achieved* parameter count of each seed-group rather than
+    the target budget.
     """
     buckets: dict[tuple, list[float]] = defaultdict(list)
     for r in rows:
         if r.get("best_test_acc") is None:
             continue
         key = tuple(r.get(f) for f in fields)
-        if any(k is None for k in key):
+        if skip_none_keys and any(k is None for k in key):
             continue
         val = r.get(value_field)
         if val is None:
@@ -230,43 +261,109 @@ def _mean_value_by(
     return {k: float(np.mean(v)) for k, v in buckets.items()}
 
 
-def plot_acc_vs_params(rows: list[dict], fig_dir: Path) -> None:
-    """Best test acc vs *achieved* parameter count, one line per (observable, knob).
+def _config_key(row: dict) -> tuple:
+    """A run's configuration identity key (every sweep coordinate except seed)."""
+    return tuple(row.get(f) for f in CONFIG_IDENTITY_FIELDS)
 
-    Keying by scaling_knob (not just observable) keeps multi-knob sweeps from
-    collapsing two knobs into one averaged point per budget. Accuracy is still
-    seed-averaged within each (observable, knob, target budget) group, but each
-    point's x is the group's mean *achieved* parameter count — so two knobs that
-    overshoot the same budget differently (e.g. 13,530 vs 12,722 at a 12,800
-    target) are drawn at their true sizes rather than stacked at one x.
+
+def _strip_seed(run_name: str) -> str:
+    """Run name with the ``__seed{N}`` marker removed.
+
+    sweep.py encodes every active grid axis in the run-dir name (it must, or two
+    grid points would collide on disk), so the stripped name is unique per
+    configuration by construction.
     """
-    agg = _aggregate_by(rows, ("observables", "scaling_knob", "target_params"))
-    if not agg:
-        print("  (no completed runs with best_test_acc — skipping acc_vs_params)")
-        return
-    x_by_key = _mean_value_by(
-        rows, ("observables", "scaling_knob", "target_params"), "achieved_params"
+    return re.sub(r"__seed\d+", "", run_name)
+
+
+def _check_identity_drift(rows: list[dict]) -> None:
+    """Warn when one configuration identity spans >1 seed-stripped run name.
+
+    Two different stripped run names sharing one identity key means a sweep axis
+    exists that ``CONFIG_IDENTITY_FIELDS`` does not list — those genuinely
+    different configs would be silently seed-averaged together (the manual-sweep
+    collapse bug all over again), so make it loud.
+    """
+    names_by_key: dict[tuple, set[str]] = defaultdict(set)
+    for r in rows:
+        names_by_key[_config_key(r)].add(_strip_seed(str(r.get("run_name"))))
+    for names in names_by_key.values():
+        if len(names) > 1:
+            warnings.warn(
+                "runs with different sweep coordinates share one configuration "
+                f"identity and will be averaged together: {sorted(names)} — a "
+                "sweep axis is probably missing from CONFIG_IDENTITY_FIELDS in "
+                "report_sweep.py.",
+                RuntimeWarning, stacklevel=2,
+            )
+
+
+def _config_groups(rows: list[dict]) -> dict[tuple, dict]:
+    """Seed-average ``best_test_acc`` within each configuration identity.
+
+    Returns ``{config_key: {"acc": (mean, std), "x": mean achieved_params}}``
+    (``x`` is None when no run in the group recorded achieved_params). None
+    identity-field values are kept as ordinary key components.
+    """
+    acc = _aggregate_by(rows, CONFIG_IDENTITY_FIELDS, skip_none_keys=False)
+    xs = _mean_value_by(
+        rows, CONFIG_IDENTITY_FIELDS, "achieved_params", skip_none_keys=False
     )
-    series = sorted({(o, k) for (o, k, _tp) in agg})
+    return {key: {"acc": acc[key], "x": xs.get(key)} for key in acc}
+
+
+def _varying_fields(keys: Iterable[tuple]) -> list[str]:
+    """Identity fields taking ≥2 distinct values across the given config keys."""
+    keys = list(keys)
+    return [
+        f for i, f in enumerate(CONFIG_IDENTITY_FIELDS)
+        if len({k[i] for k in keys}) > 1
+    ]
+
+
+def _series_key(cfg_key: tuple, series_by: Sequence[str]) -> tuple:
+    """Project a config key onto the --series-by fields (legend grouping)."""
+    return tuple(cfg_key[_FIELD_INDEX[f]] for f in series_by)
+
+
+def _series_label(skey: tuple) -> str:
+    return "/".join(str(v) for v in skey) or "all"
+
+
+def plot_acc_vs_params(
+    rows: list[dict], fig_dir: Path, series_by: Sequence[str]
+) -> None:
+    """Best test acc vs *achieved* parameter count, one point per configuration.
+
+    Each point is one configuration identity, seed-averaged, at its mean
+    achieved parameter count — manual-mode configs (which all share the
+    ``target_params=-1`` placeholder) get one point each instead of collapsing
+    into a single average. Series (colour/legend) group by the --series-by
+    fields. A series' points are connected only when exactly one identity field
+    varies across them (a genuine 1-D trend, e.g. a budget sweep); otherwise
+    they are drawn as markers + error bars only.
+    """
+    groups = {k: g for k, g in _config_groups(rows).items() if g["x"] is not None}
+    if len(groups) < 2:
+        print("  (need ≥2 distinct configurations — skipping acc_vs_params)")
+        return
+    by_series: dict[tuple, dict[tuple, dict]] = defaultdict(dict)
+    for key, g in groups.items():
+        by_series[_series_key(key, series_by)][key] = g
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    for obs, knob in series:
-        # Sort points by achieved param count (x) for a sensible line order.
-        pts = sorted(
-            (x_by_key[(o, k, tp)], m, s)
-            for (o, k, tp), (m, s) in agg.items()
-            if o == obs and k == knob and (o, k, tp) in x_by_key
+    for skey in sorted(by_series, key=str):
+        sgroups = by_series[skey]
+        pts = sorted((g["x"], g["acc"][0], g["acc"][1]) for g in sgroups.values())
+        linestyle = "-" if len(_varying_fields(sgroups)) == 1 else "none"
+        ax.errorbar(
+            [p[0] for p in pts], [p[1] for p in pts], yerr=[p[2] for p in pts],
+            marker="o", linestyle=linestyle, capsize=3, label=_series_label(skey),
         )
-        if not pts:
-            continue
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
-        es = [p[2] for p in pts]
-        ax.errorbar(xs, ys, yerr=es, marker="o", capsize=3, label=f"{obs}/{knob}")
     ax.set_xlabel("Achieved parameter count")
     ax.set_ylabel("Best test accuracy")
-    ax.set_title("Accuracy vs achieved parameter count by observable / scaling knob")
+    ax.set_title("Accuracy vs achieved parameter count")
     ax.grid(alpha=0.3)
-    ax.legend(title="observable / knob")
+    ax.legend(title=" / ".join(series_by))
     fig.tight_layout()
     out = fig_dir / "acc_vs_params.png"
     fig.savefig(out, dpi=150)
@@ -275,41 +372,82 @@ def plot_acc_vs_params(rows: list[dict], fig_dir: Path) -> None:
 
 
 def plot_acc_by_observable(rows: list[dict], fig_dir: Path) -> None:
-    """Grouped bars: best test acc by (observable, scaling knob), grouped by budget."""
-    agg = _aggregate_by(rows, ("observables", "scaling_knob", "target_params"))
-    if not agg:
-        print("  (no completed runs with best_test_acc — skipping acc_by_observable)")
+    """Grouped bars: best test acc by observable preset.
+
+    Skipped unless ≥2 observable presets have completed runs. Budget sweeps keep
+    the historic layout — (model, observable, knob) categories with one bar
+    group per target budget. Manual sweeps (no positive budgets) group by
+    configuration instead: one bar per config under its (model, observable)
+    category, annotated with its achieved param count.
+    """
+    completed = [r for r in rows if r.get("best_test_acc") is not None]
+    n_obs = len({
+        r.get("observables") for r in completed if r.get("observables") is not None
+    })
+    if n_obs < 2:
+        print("  (need ≥2 observable presets — skipping acc_by_observable)")
         return
-    # Achieved param count per group, annotated on each bar (the budget grouping
-    # is categorical, but a group's two knobs can have different achieved sizes).
-    achieved = _mean_value_by(
-        rows, ("observables", "scaling_knob", "target_params"), "achieved_params"
-    )
-    cats = sorted({(o, k) for (o, k, _tp) in agg})
-    budgets = sorted({tp for (_o, _k, tp) in agg})
-    x = np.arange(len(cats))
-    width = 0.8 / max(len(budgets), 1)
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    for i, tp in enumerate(budgets):
-        means = [agg.get((o, k, tp), (np.nan, 0.0))[0] for (o, k) in cats]
-        errs = [agg.get((o, k, tp), (np.nan, 0.0))[1] for (o, k) in cats]
-        bars = ax.bar(x + i * width, means, width, yerr=errs, capsize=3, label=f"{tp:,}")
-        for (o, k), bar in zip(cats, bars):
-            n = achieved.get((o, k, tp))
-            if n is not None and not np.isnan(bar.get_height()):
-                ax.annotate(
-                    f"{int(round(n)):,}",
-                    (bar.get_x() + bar.get_width() / 2, bar.get_height()),
-                    ha="center", va="bottom", fontsize=6, rotation=90,
-                )
-    ax.set_xticks(x + width * (len(budgets) - 1) / 2)
-    ax.set_xticklabels([f"{o}/{k}" for (o, k) in cats], rotation=15, ha="right")
-    ax.set_xlabel("Observable preset / scaling knob")
+    if any((r.get("target_params") or 0) > 0 for r in completed):
+        # Budget mode: historic layout, with `model` added to the category key.
+        key_fields = ("model", "observables", "scaling_knob", "target_params")
+        agg = _aggregate_by(rows, key_fields)
+        achieved = _mean_value_by(rows, key_fields, "achieved_params")
+        cats = sorted({(m, o, k) for (m, o, k, _tp) in agg})
+        budgets = sorted({tp for (_m, _o, _k, tp) in agg})
+        x = np.arange(len(cats))
+        width = 0.8 / max(len(budgets), 1)
+        for i, tp in enumerate(budgets):
+            means = [agg.get((m, o, k, tp), (np.nan, 0.0))[0] for (m, o, k) in cats]
+            errs = [agg.get((m, o, k, tp), (np.nan, 0.0))[1] for (m, o, k) in cats]
+            bars = ax.bar(
+                x + i * width, means, width, yerr=errs, capsize=3, label=f"{tp:,}"
+            )
+            for (m, o, k), bar in zip(cats, bars):
+                n = achieved.get((m, o, k, tp))
+                if n is not None and not np.isnan(bar.get_height()):
+                    ax.annotate(
+                        f"{int(round(n)):,}",
+                        (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                        ha="center", va="bottom", fontsize=6, rotation=90,
+                    )
+        ax.set_xticks(x + width * (len(budgets) - 1) / 2)
+        ax.set_xticklabels(
+            [f"{m}/{o}/{k}" for (m, o, k) in cats], rotation=15, ha="right"
+        )
+        ax.set_xlabel("Model / observable preset / scaling knob")
+        ax.legend(title="target param budget")
+    else:
+        # Manual mode: one bar per configuration under its (model, observable).
+        groups = _config_groups(rows)
+        mi, oi = _FIELD_INDEX["model"], _FIELD_INDEX["observables"]
+        by_cat: dict[tuple, list[dict]] = defaultdict(list)
+        for key, g in groups.items():
+            by_cat[(key[mi], key[oi])].append(g)
+        cats = sorted(by_cat, key=str)
+        n_bars = max(len(v) for v in by_cat.values())
+        width = 0.8 / n_bars
+        x = np.arange(len(cats))
+        for ci, cat in enumerate(cats):
+            cfgs = sorted(by_cat[cat], key=lambda g: (g["x"] is None, g["x"]))
+            for bi, g in enumerate(cfgs):
+                bar = ax.bar(
+                    ci + bi * width, g["acc"][0], width,
+                    yerr=g["acc"][1], capsize=3, color="tab:blue",
+                )[0]
+                if g["x"] is not None:
+                    ax.annotate(
+                        f"{int(round(g['x'])):,}",
+                        (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                        ha="center", va="bottom", fontsize=6, rotation=90,
+                    )
+        ax.set_xticks(x + width * (n_bars - 1) / 2)
+        ax.set_xticklabels([f"{m}/{o}" for (m, o) in cats], rotation=15, ha="right")
+        ax.set_xlabel("Model / observable preset (one bar per configuration)")
     ax.set_ylabel("Best test accuracy")
-    ax.set_title("Accuracy by observable / scaling knob (bar labels = achieved params)")
+    ax.set_title("Accuracy by observable (bar labels = achieved params)")
     ax.grid(alpha=0.3, axis="y")
-    ax.legend(title="target param budget")
     fig.tight_layout()
     out = fig_dir / "acc_by_observable.png"
     fig.savefig(out, dpi=150)
@@ -318,30 +456,32 @@ def plot_acc_by_observable(rows: list[dict], fig_dir: Path) -> None:
 
 
 def plot_acc_by_scaling_knob(rows: list[dict], fig_dir: Path) -> None:
-    """Grouped bars: best test acc by scaling knob, grouped by parameter budget.
+    """Grouped bars: best test acc by model/scaling knob, grouped by budget.
 
     The headline figure for a scaling-knob sweep — quantum-width (num_heads) vs
     classical (cnn_channels_2) at each budget. Skipped unless ≥2 knobs are
     present. Intended for single-observable sweeps; observables are averaged over.
     """
-    agg = _aggregate_by(rows, ("scaling_knob", "target_params"))
-    knobs = sorted({k for (k, _tp) in agg})
+    key_fields = ("model", "scaling_knob", "target_params")
+    agg = _aggregate_by(rows, key_fields)
+    knobs = sorted({k for (_m, k, _tp) in agg})
     if len(knobs) < 2:
         print("  (need ≥2 scaling_knob values — skipping acc_by_scaling_knob)")
         return
-    # Achieved param count per (knob, budget), averaged over observables, for bar labels.
-    achieved = _mean_value_by(rows, ("scaling_knob", "target_params"), "achieved_params")
-    budgets = sorted({tp for (_k, tp) in agg})
-    x = np.arange(len(knobs))
+    # Achieved param count per (model, knob, budget), averaged over observables.
+    achieved = _mean_value_by(rows, key_fields, "achieved_params")
+    cats = sorted({(m, k) for (m, k, _tp) in agg})
+    budgets = sorted({tp for (_m, _k, tp) in agg})
+    x = np.arange(len(cats))
     width = 0.8 / max(len(budgets), 1)
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
     for i, tp in enumerate(budgets):
-        means = [agg.get((k, tp), (np.nan, 0.0))[0] for k in knobs]
-        errs = [agg.get((k, tp), (np.nan, 0.0))[1] for k in knobs]
+        means = [agg.get((m, k, tp), (np.nan, 0.0))[0] for (m, k) in cats]
+        errs = [agg.get((m, k, tp), (np.nan, 0.0))[1] for (m, k) in cats]
         bars = ax.bar(x + i * width, means, width, yerr=errs, capsize=3, label=f"{tp:,}")
-        for k, bar in zip(knobs, bars):
-            n = achieved.get((k, tp))
+        for (m, k), bar in zip(cats, bars):
+            n = achieved.get((m, k, tp))
             if n is not None and not np.isnan(bar.get_height()):
                 ax.annotate(
                     f"{int(round(n)):,}",
@@ -349,8 +489,8 @@ def plot_acc_by_scaling_knob(rows: list[dict], fig_dir: Path) -> None:
                     ha="center", va="bottom", fontsize=6, rotation=90,
                 )
     ax.set_xticks(x + width * (len(budgets) - 1) / 2)
-    ax.set_xticklabels(knobs)
-    ax.set_xlabel("Scaling knob")
+    ax.set_xticklabels([f"{m}/{k}" for (m, k) in cats])
+    ax.set_xlabel("Model / scaling knob")
     ax.set_ylabel("Best test accuracy")
     ax.set_title("Accuracy by scaling knob (bar labels = achieved params)")
     ax.grid(alpha=0.3, axis="y")
@@ -362,34 +502,39 @@ def plot_acc_by_scaling_knob(rows: list[dict], fig_dir: Path) -> None:
     print(f"  ✓ {out}")
 
 
-def plot_acc_vs_trunc_lambda(rows: list[dict], fig_dir: Path) -> None:
-    """Best test acc vs truncation penalty weight λ, one line per (obs, knob, budget).
+def plot_acc_vs_trunc_lambda(
+    rows: list[dict], fig_dir: Path, series_by: Sequence[str]
+) -> None:
+    """Best test acc vs truncation penalty weight λ, one point per configuration.
 
-    Only λ-swept runs (trunc_lambda not None) contribute; skipped when none do.
+    Skipped unless ≥2 distinct λ values are present. Series group by the
+    --series-by fields (λ itself excluded — it is the x-axis); a series' points
+    are connected only when λ is the *only* identity field varying across them.
     """
-    agg = _aggregate_by(
-        rows, ("observables", "scaling_knob", "target_params", "trunc_lambda")
-    )
-    if not agg:
-        print("  (no runs with a trunc_lambda axis — skipping acc_vs_trunc_lambda)")
+    li = _FIELD_INDEX["trunc_lambda"]
+    groups = {k: g for k, g in _config_groups(rows).items() if k[li] is not None}
+    if len({k[li] for k in groups}) < 2:
+        print("  (need ≥2 distinct trunc_lambda values — skipping acc_vs_trunc_lambda)")
         return
-    series = sorted({(o, k, tp) for (o, k, tp, _l) in agg})
+    series_fields = [f for f in series_by if f != "trunc_lambda"]
+    by_series: dict[tuple, dict[tuple, dict]] = defaultdict(dict)
+    for key, g in groups.items():
+        by_series[_series_key(key, series_fields)][key] = g
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    for obs, knob, tp in series:
-        pts = sorted(
-            (lam, m, s)
-            for (o, k, t, lam), (m, s) in agg.items()
-            if (o, k, t) == (obs, knob, tp)
+    for skey in sorted(by_series, key=str):
+        sgroups = by_series[skey]
+        pts = sorted((k[li], g["acc"][0], g["acc"][1]) for k, g in sgroups.items())
+        varying = [f for f in _varying_fields(sgroups) if f != "trunc_lambda"]
+        linestyle = "-" if not varying else "none"
+        ax.errorbar(
+            [p[0] for p in pts], [p[1] for p in pts], yerr=[p[2] for p in pts],
+            marker="o", linestyle=linestyle, capsize=3, label=_series_label(skey),
         )
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
-        es = [p[2] for p in pts]
-        ax.errorbar(xs, ys, yerr=es, marker="o", capsize=3, label=f"{obs}/{knob}/{tp:,}")
     ax.set_xlabel("Truncation penalty weight λ (trunc_lambda)")
     ax.set_ylabel("Best test accuracy")
     ax.set_title("Accuracy vs truncation penalty weight")
     ax.grid(alpha=0.3)
-    ax.legend(title="observable / knob / params")
+    ax.legend(title=" / ".join(series_fields) or None)
     fig.tight_layout()
     out = fig_dir / "acc_vs_trunc_lambda.png"
     fig.savefig(out, dpi=150)
@@ -397,43 +542,47 @@ def plot_acc_vs_trunc_lambda(rows: list[dict], fig_dir: Path) -> None:
     print(f"  ✓ {out}")
 
 
-def plot_acc_vs_hyperparam(rows: list[dict], fig_dir: Path) -> None:
+def plot_acc_vs_hyperparam(
+    rows: list[dict], fig_dir: Path, series_by: Sequence[str]
+) -> None:
     """One ``acc_vs_<field>.png`` per architecture field that varies across runs.
 
     The figure for manual-hyperparameter sweeps: for every candidate field
-    (``ARCH_META_FIELDS`` + ``num_layers``) that takes ≥2 distinct non-None values,
-    plot seed-averaged best test accuracy (± std) against that field's value, one
-    line per (observable, scaling_knob). Fields constant across the sweep, or
-    absent (older runs), are skipped. When several arch axes vary at once, the
-    others are averaged into each point (widening the ± band) — read alongside the
-    per-run ``summary.csv`` for the exact grid.
+    (``ARCH_META_FIELDS`` + ``num_layers``) that takes ≥2 distinct non-None
+    values, plot one seed-averaged point per configuration against that field's
+    value, one series per --series-by group (the x-axis field excluded). Fields
+    constant across the sweep, or absent (older runs), are skipped. Configs that
+    differ along *other* axes stay separate points at the same x (no silent
+    averaging); a series is line-connected only when the x field is its sole
+    varying axis.
     """
     candidates = ARCH_META_FIELDS + ["num_layers"]
+    all_groups = _config_groups(rows)
     for field in candidates:
-        distinct = {
-            r.get(field) for r in rows
-            if r.get(field) is not None and r.get("best_test_acc") is not None
-        }
-        if len(distinct) < 2:
+        fi = _FIELD_INDEX[field]
+        groups = {k: g for k, g in all_groups.items() if k[fi] is not None}
+        if len({k[fi] for k in groups}) < 2:
             continue
-        agg = _aggregate_by(rows, ("observables", "scaling_knob", field))
-        if not agg:
-            continue
-        series = sorted({(o, k) for (o, k, _v) in agg})
+        series_fields = [f for f in series_by if f != field]
+        by_series: dict[tuple, dict[tuple, dict]] = defaultdict(dict)
+        for key, g in groups.items():
+            by_series[_series_key(key, series_fields)][key] = g
         fig, ax = plt.subplots(figsize=(7, 4.5))
-        for obs, knob in series:
-            pts = sorted(
-                (v, m, s) for (o, k, v), (m, s) in agg.items() if (o, k) == (obs, knob)
+        for skey in sorted(by_series, key=str):
+            sgroups = by_series[skey]
+            pts = sorted((k[fi], g["acc"][0], g["acc"][1]) for k, g in sgroups.items())
+            varying = [f for f in _varying_fields(sgroups) if f != field]
+            linestyle = "-" if not varying else "none"
+            ax.errorbar(
+                [p[0] for p in pts], [p[1] for p in pts], yerr=[p[2] for p in pts],
+                marker="o", linestyle=linestyle, capsize=3,
+                label=_series_label(skey),
             )
-            xs = [p[0] for p in pts]
-            ys = [p[1] for p in pts]
-            es = [p[2] for p in pts]
-            ax.errorbar(xs, ys, yerr=es, marker="o", capsize=3, label=f"{obs}/{knob}")
         ax.set_xlabel(field)
         ax.set_ylabel("Best test accuracy")
         ax.set_title(f"Accuracy vs {field}")
         ax.grid(alpha=0.3)
-        ax.legend(title="observable / knob")
+        ax.legend(title=" / ".join(series_fields) or None)
         fig.tight_layout()
         out = fig_dir / f"acc_vs_{field}.png"
         fig.savefig(out, dpi=150)
@@ -471,6 +620,14 @@ def main() -> None:
         help="sweep directory written by experiments/sweep.py",
     )
     parser.add_argument(
+        "--series-by", nargs="+", default=["model", "observables"],
+        choices=CONFIG_IDENTITY_FIELDS, metavar="FIELD",
+        help="meta fields defining the legend/series of the line figures "
+             "(default: model observables — e.g. add scaling_knob to recover "
+             "per-knob lines in a multi-knob budget sweep; choices: "
+             + ", ".join(CONFIG_IDENTITY_FIELDS) + ")",
+    )
+    parser.add_argument(
         "--skip-per-run-figures", action="store_true",
         help="skip rendering report_diagnostics for each run "
              "(cross-run figures + tables only — the fast JSON-only pass)",
@@ -492,21 +649,24 @@ def main() -> None:
         return
 
     print(f"Aggregating {len(rows)} run(s) under {sweep_dir}")
+    _check_identity_drift(rows)
     write_table(rows, sweep_dir)
 
     fig_dir = sweep_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
-    for fn in (
-        plot_acc_vs_params,
+    plotters = (
+        partial(plot_acc_vs_params, series_by=args.series_by),
         plot_acc_by_observable,
         plot_acc_by_scaling_knob,
-        plot_acc_vs_trunc_lambda,
-        plot_acc_vs_hyperparam,
-    ):
+        partial(plot_acc_vs_trunc_lambda, series_by=args.series_by),
+        partial(plot_acc_vs_hyperparam, series_by=args.series_by),
+    )
+    for fn in plotters:
         try:
             fn(rows, fig_dir)
         except Exception as e:  # one bad figure must not abort the rest
-            warnings.warn(f"{fn.__name__} failed: {type(e).__name__}: {e}", RuntimeWarning)
+            name = getattr(fn, "func", fn).__name__
+            warnings.warn(f"{name} failed: {type(e).__name__}: {e}", RuntimeWarning)
 
     if not args.skip_per_run_figures:
         render_per_run_figures(sweep_dir, rows)

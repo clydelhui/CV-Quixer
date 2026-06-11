@@ -219,11 +219,23 @@ flock — no manual pre-build); `--dry-run` writes the manifest only.
 `experiments/report_sweep.py --sweep-dir <dir>` scans the sweep (JSON only — no
 torch), emitting `summary.csv` + `summary.md` (one row/run: target/achieved
 params, observable preset, the resolved architecture knobs, best/final acc,
-runtime) and `figures/acc_vs_params.png` + `figures/acc_by_observable.png`
-(cross-run figures plot the *achieved* param count), plus one
-`figures/acc_vs_<field>.png` per architecture field that *varies* across the runs
-(the manual-sweep figure — e.g. `acc_vs_num_heads.png`; absent fields / constant
-fields are skipped). It then **also renders the full `report_diagnostics.py` figure suite for
+runtime) and the cross-run figures. Figures group runs by **configuration
+identity** (`CONFIG_IDENTITY_FIELDS` — every recorded sweep coordinate except
+the seed), so only seed repeats are averaged together: manual-mode runs (all
+sharing the `target_params=-1` placeholder) get one point per architecture
+instead of collapsing into one average, and a `RuntimeWarning` fires if run
+names reveal a sweep axis missing from the identity list (the drift guard).
+Every figure renders only when its comparison axis takes ≥2 distinct values:
+`figures/acc_vs_params.png` (one seed-averaged point per configuration at its
+*achieved* param count; needs ≥2 configs; a series' points are line-connected
+only when exactly one identity field varies), `figures/acc_by_observable.png`
+(needs ≥2 presets; bars grouped by budget, or by configuration for manual-only
+sweeps), `figures/acc_vs_trunc_lambda.png` (needs ≥2 λ values), plus one
+`figures/acc_vs_<field>.png` per architecture field that *varies* across the
+runs (e.g. `acc_vs_num_heads.png`). `--series-by FIELD…` (default
+`model observables`) picks the legend/series fields of the line figures — e.g.
+add `scaling_knob` to recover per-knob lines in a multi-knob budget sweep. It
+then **also renders the full `report_diagnostics.py` figure suite for
 every run by default** (one subprocess per run; `report_diagnostics`'s default
 path is npz/JSON-based, so heavy torch imports stay deferred); pass
 `--skip-per-run-figures` for the fast cross-run-only pass.
@@ -752,20 +764,22 @@ eval, written into the sweep dir):
 | `sweep_manifest.json` | Grid axes, per-run `run_name`, and the exact `full_experiment.py` argv for each grid point (consumed by `run_sweep.sh`). |
 | `p{params}__obs-{preset}__seed{seed}/` | One full `full_experiment.py` run dir per grid point (same layout as above). |
 | `summary.csv` / `summary.md` | Written by `report_sweep.py` — one row per run (model, target/achieved params, observable preset, scaling knob, best/final acc, runtime). |
-| `figures/acc_vs_params.png`, `figures/acc_by_observable.png` | Written by `report_sweep.py` — cross-run comparison plots. |
+| `figures/acc_vs_params.png`, `figures/acc_by_observable.png`, … | Written by `report_sweep.py` — cross-run comparison plots (configuration-identity grouped; each skipped unless its axis takes ≥2 values). |
 
 **`report_sweep_compare.py`** (cross-sweep overlay; default out-dir
 `results/sweeps/compare_<YYYY-MM-DD_HH-MM-SS>/`, override with `--out-dir`).
-Reuses `report_sweep`'s loaders; reads each run's `model` from `history["meta"]`
-or, for older runs, `config.json` (default `"quantum"`). Series key on
-`(model, observables, scaling_knob)` so different knobs/models are never averaged
-together:
+Reuses `report_sweep`'s loaders and configuration-identity grouping; reads each
+run's `model` from `history["meta"]` or, for older runs, `config.json` (default
+`"quantum"`). Points are seed-averaged per (sweep label, configuration
+identity); series = sweep label + the same `--series-by` fields (default
+`model observables`), so different models/configs are never averaged together
+and manual sweeps keep one point per architecture:
 
 | Entry | Contents |
 |---|---|
 | `comparison.csv` / `comparison.md` | One row per run across all `--sweep-dir`s, tagged with `sweep_label` + `model`. |
-| `figures/acc_vs_params_compare.png` | Best test acc vs achieved params (colour = model, marker = scaling knob). |
-| `figures/acc_by_params_compare.png` | Grouped bars: model/knob at each target budget (bar labels = achieved params). |
+| `figures/acc_vs_params_compare.png` | Best test acc vs achieved params (colour = sweep label, marker = `--series-by` group). |
+| `figures/acc_by_params_compare.png` | Grouped bars: one bar per (sweep, series) at each budget, or per configuration for manual-only sweeps (bar labels = achieved params). |
 
 ## Agent skills
 
