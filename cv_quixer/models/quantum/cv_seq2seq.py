@@ -467,9 +467,14 @@ class StackedCVQuixer(BaseVisionTransformer):
             # Aggregator: canonical seq-to-one heads on the final tokens. Its
             # patch-trunc and W-trunc streams join the block means; it has no
             # query stream (vacuum input, ADR-0003).
-            pooled, agg_states, agg_sps, agg_pt, agg_wt = _run_heads_vmap(
-                self.aggregator_heads, self.config.num_heads,
-                len(self.config._observable_plan), tokens,
+            # The aggregator's per-head debug stats are dropped: the stacked
+            # model's NaN-forensics stream is out of scope (canonical models
+            # only) and CVQuixerOut's debug fields default to None.
+            pooled, agg_states, agg_sps, agg_pt, agg_wt, _agg_debug = (
+                _run_heads_vmap(
+                    self.aggregator_heads, self.config.num_heads,
+                    len(self.config._observable_plan), tokens,
+                )
             )
             patch_truncs.append(agg_pt)
             w_truncs.append(agg_wt)

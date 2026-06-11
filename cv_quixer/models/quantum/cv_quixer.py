@@ -56,6 +56,15 @@ class CVQuixerOut(NamedTuple):
     # seq-to-seq stacked model has query unitaries, so the canonical models
     # leave this None (the stream does not exist for them, ADR-0003).
     query_trunc_loss: Optional[torch.Tensor] = None
+    # NaN-forensics debug reductions (all detached; populated alongside
+    # trunc_loss for the canonical models, None for the stacked model). Per-head
+    # versions of the scalar streams plus per-param-type gate stats — see
+    # cv_attention.HeadDebugStats. ``gate_param_*`` columns are ordered by the
+    # model's ``gate_stat_labels`` property.
+    trunc_loss_per_head: Optional[torch.Tensor] = None        # (H,)
+    cvqnn_trunc_loss_per_head: Optional[torch.Tensor] = None  # (H,)
+    gate_param_min_abs: Optional[torch.Tensor] = None         # (H, T)
+    gate_param_zero_count: Optional[torch.Tensor] = None      # (H, T)
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +181,7 @@ class _CVQuixerBase(BaseVisionTransformer):
               success_probs: list[(B,) Tensor] — populated when
                              return_success_prob=True or return_states=True.
         """
-        readouts, states, success_probs, trunc_loss, cvqnn_trunc_loss = (
+        readouts, states, success_probs, trunc_loss, cvqnn_trunc_loss, debug = (
             self.cv_attention(patches)
         )
         logits = self.decoder(readouts)                           # (B, num_classes)
@@ -202,7 +211,31 @@ class _CVQuixerBase(BaseVisionTransformer):
                 success_probs if (return_success_prob or return_states)
                 else None
             ),
+            # NaN-forensics reductions: detached at source (HeadDebugStats), so
+            # surfacing them alongside trunc_loss costs nothing and never holds
+            # the autograd graph alive.
+            trunc_loss_per_head=(
+                debug.trunc_per_head.to(logits.device)
+                if return_trunc_loss else None
+            ),
+            cvqnn_trunc_loss_per_head=(
+                debug.cvqnn_trunc_per_head.to(logits.device)
+                if return_trunc_loss else None
+            ),
+            gate_param_min_abs=(
+                debug.gate_min_abs.to(logits.device)
+                if return_trunc_loss else None
+            ),
+            gate_param_zero_count=(
+                debug.gate_zero_count.to(logits.device)
+                if return_trunc_loss else None
+            ),
         )
+
+    @property
+    def gate_stat_labels(self) -> list[str]:
+        """Column labels for the ``gate_param_*`` debug outputs, in order."""
+        return list(self.cv_attention.heads[0]._gate_stat_labels)
 
 
 # ---------------------------------------------------------------------------

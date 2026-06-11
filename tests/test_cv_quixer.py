@@ -135,28 +135,28 @@ class TestHyperCVAttentionHead:
             patch_size=7, num_patches=16, config=small_quantum_config,
         )
         patches = torch.randn(16, 49)   # 16 patches of 7×7 pixels
-        readout, _, _, _, _ = head(patches)
+        readout, _, _, _, _, _ = head(patches)
         assert readout.shape == (small_quantum_config.num_modes,)
 
     def test_readout_is_real(self, small_quantum_config):
         head = HyperCVAttentionHead(
             patch_size=7, num_patches=16, config=small_quantum_config,
         )
-        readout, _, _, _, _ = head(torch.randn(16, 49))
+        readout, _, _, _, _, _ = head(torch.randn(16, 49))
         assert not readout.is_complex()
 
     def test_state_data_is_tensor(self, small_quantum_config):
         head = HyperCVAttentionHead(
             patch_size=7, num_patches=16, config=small_quantum_config,
         )
-        _, state_data, _, _, _ = head(torch.randn(16, 49))
+        _, state_data, _, _, _, _ = head(torch.randn(16, 49))
         assert isinstance(state_data, torch.Tensor)
 
     def test_success_prob_positive(self, small_quantum_config):
         head = HyperCVAttentionHead(
             patch_size=7, num_patches=16, config=small_quantum_config,
         )
-        _, _, success_prob, _, _ = head(torch.randn(16, 49))
+        _, _, success_prob, _, _, _ = head(torch.randn(16, 49))
         assert success_prob.item() > 0
 
 
@@ -592,7 +592,7 @@ class TestM1M2TruncFusion:
             head.poly_coeffs.c.data[1] = 0.5   # make `result` depend on the LCU pass
         patches = torch.randn(16, 49)
 
-        _, _, _, fused, _ = head(patches)
+        _, _, _, fused, _, _ = head(patches)
         helper = head._compute_patch_trunc_loss(
             patches, self._vacuum_flat(2, 4, head.torch_dtype),
             torch.device("cpu"), head.torch_dtype,
@@ -610,7 +610,7 @@ class TestM1M2TruncFusion:
             head, "_compute_patch_trunc_loss",
             wraps=head._compute_patch_trunc_loss,
         ) as spy:
-            _, _, _, tl, _ = head(patches)
+            _, _, _, tl, _, _ = head(patches)
         assert spy.call_count == 0
         assert tl.dim() == 0 and not tl.is_complex()
         assert tl.item() == 0.0
@@ -618,7 +618,7 @@ class TestM1M2TruncFusion:
         head_n = HyperCVAttentionHead(
             patch_size=7, num_patches=16, config=self._config("norm"),
         )
-        _, _, _, tl_n, _ = head_n(patches)
+        _, _, _, tl_n, _, _ = head_n(patches)
         assert tl.dtype == tl_n.dtype
         assert tl.device == tl_n.device
 
@@ -637,8 +637,8 @@ class TestM1M2TruncFusion:
             head_norm.poly_coeffs.c.data[1] = 0.5
         patches = torch.randn(16, 49)
 
-        r0, s0, sp0, _, _ = head_none(patches)
-        r1, s1, sp1, _, _ = head_norm(patches)
+        r0, s0, sp0, _, _, _ = head_none(patches)
+        r1, s1, sp1, _, _, _ = head_norm(patches)
         assert torch.allclose(r0, r1, atol=1e-10)
         assert torch.allclose(s0, s1, atol=1e-10)
         assert torch.allclose(sp0, sp1, atol=1e-10)
@@ -661,14 +661,14 @@ class TestM1M2TruncFusion:
                     h.poly_coeffs.c.data[1] = 0.5
             patches = torch.randn(3, 16, 49)
 
-            readouts, states, sps, tl, _ = attn(patches)
+            readouts, states, sps, tl, _, _ = attn(patches)
 
             B = patches.shape[0]
             man_r, man_s, man_sp, man_tl = [], [], [], []
             for head in attn.heads:
                 rb, sb, spb, tlb = [], [], [], []
                 for b in range(B):
-                    r, s, sp, t, _ = head(patches[b])
+                    r, s, sp, t, _, _ = head(patches[b])
                     rb.append(r)
                     sb.append(s)
                     spb.append(sp)
@@ -705,7 +705,7 @@ class TestM1M2TruncFusion:
         attn = HyperCVAttention(patch_size=7, num_patches=16, config=cfg)
         patches = torch.randn(2, 16, 49)
 
-        readouts, _, _, trunc_loss, _ = attn(patches)
+        readouts, _, _, trunc_loss, _, _ = attn(patches)
         # Depend on both the readout path and the trunc path so the gradient
         # exercises every head's hypernetwork + coefficient parameters.
         (readouts.sum() + trunc_loss).backward()
@@ -729,7 +729,7 @@ class TestM1M2TruncFusion:
             head, "_compute_patch_trunc_loss",
             wraps=head._compute_patch_trunc_loss,
         ) as spy:
-            _, _, _, tl, _ = head(patches)
+            _, _, _, tl, _, _ = head(patches)
         assert spy.call_count == 1
 
         helper = head._compute_patch_trunc_loss(
@@ -807,7 +807,7 @@ class TestM3PostSelection:
             head.poly_coeffs.c.data.copy_(torch.tensor(coeffs))
         patches = torch.randn(16, 49)
 
-        readout, _, success_prob, _, _ = head(patches)
+        readout, _, success_prob, _, _, _ = head(patches)
         assert torch.isfinite(readout).all(), name
         assert torch.isfinite(success_prob).all(), name
 
@@ -856,7 +856,7 @@ class TestM3PostSelection:
             head.poly_coeffs.c.data.zero_()
         patches = torch.randn(16, 49)
 
-        readout, state_data, success_prob, _, _ = head(patches)
+        readout, state_data, success_prob, _, _, _ = head(patches)
         assert success_prob.item() == 0.0
         assert torch.all(state_data == 0)
         assert torch.all(readout == 0)
@@ -1311,7 +1311,7 @@ class TestGateParamBound:
         with torch.no_grad():
             head.hypernetwork.linear.bias.fill_(200.0)
         patches = torch.randn(16, 49)
-        readout, _, success_prob, trunc, _ = head(patches)
+        readout, _, success_prob, trunc, _, _ = head(patches)
         assert torch.isfinite(readout).all()
         assert torch.isfinite(trunc)
         assert torch.isfinite(success_prob)

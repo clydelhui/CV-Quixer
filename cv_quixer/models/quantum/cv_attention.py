@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, NamedTuple
 
 import torch
 import torch.nn as nn
@@ -619,7 +619,7 @@ class _CVHeadBase(nn.Module):
         # Trace-time constants for the truncation-loss path. Branching on these
         # under torch.func.vmap is safe (resolved once at trace time). The real
         # dtype is the avg_trunc_loss slot dtype in *every* forward branch so
-        # the vmapped 4-tuple return signature stays invariant.
+        # the vmapped tuple return signature stays invariant.
         self._trunc_enabled: bool = config.trunc_penalty != "none"
         self._real_dtype = (
             torch.float64 if config.dtype == "complex128" else torch.float32
@@ -643,6 +643,36 @@ class _CVHeadBase(nn.Module):
         self._gate_param_width = _op_plan_param_count(
             self._op_plan, config.num_modes, config.bs_topology
         )
+
+        # Gate-param debug-stat layout (NaN forensics): one entry per distinct
+        # ``{op}_{param}`` name, columns aggregated over layers/occurrences in
+        # the same parameter-name-major order _apply_gate_plan consumes. The
+        # index tensors select columns of the (N, _gate_param_width) hypernet
+        # output, so _gate_param_stats reads the exact tensor the gate builders
+        # see (bit-faithful exactly-zero detection).
+        _stat_labels: list[str] = []
+        _stat_cols: dict[str, list[int]] = {}
+        _off = 0
+        for _op in self._op_plan:
+            _n_sites = m if _op.site_kind == "mode" else len(self._bs_pairs)
+            for _p in _op.param_names:
+                _lbl = f"{_op.name}_{_p}"
+                if _lbl not in _stat_cols:
+                    _stat_labels.append(_lbl)
+                    _stat_cols[_lbl] = []
+                _stat_cols[_lbl].extend(range(_off, _off + _n_sites))
+                _off += _n_sites
+        # Drop param types with no columns (e.g. bs_* at num_modes == 1, where
+        # there are no beamsplitter pairs) — reductions over them are empty.
+        _stat_labels = [lbl for lbl in _stat_labels if _stat_cols[lbl]]
+        self._gate_stat_labels: list[str] = _stat_labels
+        # Plain attributes (not buffers): identical across heads, so stacking
+        # them per head for the vmap driver would be pure waste; unbatched
+        # constants are fine inside vmap.
+        self._gate_stat_idx: dict[str, torch.Tensor] = {
+            lbl: torch.tensor(cols, dtype=torch.long)
+            for lbl, cols in _stat_cols.items()
+        }
 
         # Optional soft-clip on magnitude gate params (overflow guard). Trace-time
         # constant (plain float / None), so the branch in _apply_patch_gates_to_state
@@ -1009,6 +1039,28 @@ class _CVHeadBase(nn.Module):
             return result, success_prob, avg_trunc_loss
         return result, success_prob
 
+    def _gate_param_stats(self, all_params: torch.Tensor) -> torch.Tensor:
+        """Detached per-param-type debug reductions over one element's gate params.
+
+        Row 0: min |value| per param type; row 1: count of exactly-0.0 values.
+        Shape (2, len(self._gate_stat_labels)), real dtype, detached — the
+        always-on NaN-forensics stream (full_experiment.py debug/). Computed on
+        the raw hypernet output, *before* the gate_param_bound soft-clip:
+        b·tanh(x/b) maps 0 to 0 exactly, so the exactly-zero set is identical
+        to what the gate builders consume. The exactly-zero count is the direct
+        trigger signal for the beamsplitter/displacement NaN-gradient
+        singularity at exactly zero (see the cvqnn_params init comment).
+        """
+        ap = all_params.detach()
+        mins: list[torch.Tensor] = []
+        zeros: list[torch.Tensor] = []
+        for lbl in self._gate_stat_labels:
+            idx = self._gate_stat_idx[lbl].to(ap.device)
+            vals = ap.index_select(-1, idx)
+            mins.append(vals.abs().amin())
+            zeros.append((vals == 0.0).sum().to(ap.dtype))
+        return torch.stack([torch.stack(mins), torch.stack(zeros)])
+
     def _postselect_renorm(
         self, out_unnorm: torch.Tensor, norm_sq: torch.Tensor
     ) -> torch.Tensor:
@@ -1116,6 +1168,8 @@ class _CVHeadBase(nn.Module):
                             loss (1 − ‖U_i|ψ⟩‖²) across all patches.
             w_trunc_loss:   Scalar tensor in [0, 1] — the CVQNN block's own
                             truncation leakage 1 − ‖W|ψ⟩‖² (0 when L_W == 0).
+            gate_stats:     Detached real (2, T) tensor of per-param-type debug
+                            reductions (see ``_gate_param_stats``).
         """
         classical_device = patches.device
         # CUDA supports float64/complex128 natively; MPS does not.
@@ -1134,7 +1188,13 @@ class _CVHeadBase(nn.Module):
             state = input_state
         state_flat = state.data.reshape(-1)   # (D^n,)
 
-        # 2-3. LCU + polynomial (iterative — no matrix materialised), plus the
+        # 2. Per-patch gate parameters — the hypernet runs once per element —
+        # plus the detached per-param-type debug stats computed on the exact
+        # tensor the gate builders consume (NaN forensics).
+        all_params = self._features_to_params(patches).to(quantum_device)
+        gate_stats = self._gate_param_stats(all_params)
+
+        # 3. LCU + polynomial (iterative — no matrix materialised), plus the
         # norm-based truncation loss. Both branch variables are trace-time
         # constants so exactly one branch is traced under vmap; avg_trunc_loss
         # is always a real 0-dim tensor (self._real_dtype, quantum_device).
@@ -1142,24 +1202,28 @@ class _CVHeadBase(nn.Module):
         #   - poly_degree ≥ 1: fuse the trunc summary into the first (vacuum)
         #     LCU pass so U_i|0⟩ is computed once, not twice (M2).
         #   - poly_degree == 0: no LCU pass exists, so fall back to the
-        #     standalone per-patch vacuum pass (preserves prior behaviour).
+        #     standalone per-patch vacuum pass (preserves prior behaviour; it
+        #     re-derives the gate params itself — a rare path, kept verbatim as
+        #     the unit-test oracle).
         if not self._trunc_enabled:
-            out_unnorm, success_prob = self._apply_polynomial_iterative(
-                patches, state_flat, quantum_device, dtype
+            out_unnorm, success_prob = self._apply_polynomial_iterative_params(
+                all_params, state_flat, quantum_device, dtype
             )
             avg_trunc_loss = torch.zeros(
                 (), device=quantum_device, dtype=self._real_dtype
             )
         elif len(self.poly_coeffs()) >= 2:
-            out_unnorm, success_prob, avg_trunc_loss = self._apply_polynomial_iterative(
-                patches, state_flat, quantum_device, dtype, want_trunc=True
+            out_unnorm, success_prob, avg_trunc_loss = (
+                self._apply_polynomial_iterative_params(
+                    all_params, state_flat, quantum_device, dtype, want_trunc=True
+                )
             )
         else:
             avg_trunc_loss = self._compute_patch_trunc_loss(
                 patches, state_flat, quantum_device, dtype
             )
-            out_unnorm, success_prob = self._apply_polynomial_iterative(
-                patches, state_flat, quantum_device, dtype
+            out_unnorm, success_prob = self._apply_polynomial_iterative_params(
+                all_params, state_flat, quantum_device, dtype
             )
 
         # 4. Post-selection renormalisation: divide by ‖P(M)|ψ⟩‖ to give a
@@ -1180,7 +1244,10 @@ class _CVHeadBase(nn.Module):
         # 7. Measure observable plan in order; move result back to classical
         # device for the decoder.
         readout = self._measure_plan(output_state).to(classical_device)
-        return readout, output_state.data, success_prob, avg_trunc_loss, w_trunc_loss
+        return (
+            readout, output_state.data, success_prob,
+            avg_trunc_loss, w_trunc_loss, gate_stats,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1380,12 +1447,38 @@ def _warn_failed_postselection(sp: torch.Tensor, element_label: str) -> None:
         )
 
 
+class HeadDebugStats(NamedTuple):
+    """Per-head debug reductions for NaN forensics (all detached, tiny).
+
+    The always-on instrumentation stream consumed by full_experiment.py's
+    debug logger. Every field is detached at source, so holding these past the
+    backward pass never keeps the autograd graph alive.
+
+    Fields (H = num_heads, T = len(head._gate_stat_labels)):
+        trunc_per_head:       (H,) batch-mean per-patch truncation loss.
+        cvqnn_trunc_per_head: (H,) batch-mean CVQNN-block (W) leakage.
+        gate_min_abs:         (H, T) min |gate param| over batch × patches × sites.
+        gate_zero_count:      (H, T) count of exactly-0.0 gate params — the
+                              direct trigger signal for the beamsplitter /
+                              displacement NaN-gradient singularity at exactly
+                              zero (see the cvqnn_params init comment).
+    """
+
+    trunc_per_head: torch.Tensor
+    cvqnn_trunc_per_head: torch.Tensor
+    gate_min_abs: torch.Tensor
+    gate_zero_count: torch.Tensor
+
+
 def _run_heads_vmap(
     heads: nn.ModuleList,
     num_heads: int,
     readout_total_dim: int,
     features: torch.Tensor,
-) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor, list[torch.Tensor], list[torch.Tensor],
+    torch.Tensor, torch.Tensor, HeadDebugStats,
+]:
     """Run all heads over a batch of per-patch feature sequences via nested vmap.
 
     The heads are independent, so their params/buffers are stacked along a new
@@ -1409,6 +1502,8 @@ def _run_heads_vmap(
         trunc_loss:       scalar — mean per-patch truncation loss over heads × batch.
         cvqnn_trunc_loss: scalar — mean CVQNN-block (W) truncation leakage over
                           heads × batch (0 when cvqnn_num_layers == 0).
+        debug:            HeadDebugStats — detached per-head reductions for the
+                          NaN-forensics stream.
     """
     base = heads[0]
     stacked_p, stacked_b = _stack_head_state(heads)
@@ -1423,12 +1518,13 @@ def _run_heads_vmap(
         # head → batch → patch.
         return vmap(_one_element, in_dims=(None, None, 0))(p, b, features)
 
-    readout_hb, state_hb, sp_hb, tl_hb, wtl_hb = vmap(_one_head, in_dims=(0, 0))(
-        stacked_p, stacked_b
-    )
+    readout_hb, state_hb, sp_hb, tl_hb, wtl_hb, gs_hb = vmap(
+        _one_head, in_dims=(0, 0)
+    )(stacked_p, stacked_b)
     # readout_hb          : (num_heads, B, R)
     # state_hb            : (num_heads, B, cutoff_dim, ..., cutoff_dim)
     # sp_hb, tl_hb, wtl_hb: (num_heads, B)
+    # gs_hb               : (num_heads, B, 2, T) — detached gate-param stats
 
     _warn_failed_postselection(sp_hb, "head×batch")
 
@@ -1441,7 +1537,16 @@ def _run_heads_vmap(
     all_success_probs = list(sp_hb.unbind(0))      # list[(B,)] per head
     trunc_loss = tl_hb.mean()                       # scalar over heads × batch
     cvqnn_trunc_loss = wtl_hb.mean()                # scalar over heads × batch
-    return readouts, all_states, all_success_probs, trunc_loss, cvqnn_trunc_loss
+    debug = HeadDebugStats(
+        trunc_per_head=tl_hb.detach().mean(dim=1),        # (H,)
+        cvqnn_trunc_per_head=wtl_hb.detach().mean(dim=1),  # (H,)
+        gate_min_abs=gs_hb[:, :, 0, :].amin(dim=1),        # (H, T)
+        gate_zero_count=gs_hb[:, :, 1, :].sum(dim=1),      # (H, T)
+    )
+    return (
+        readouts, all_states, all_success_probs,
+        trunc_loss, cvqnn_trunc_loss, debug,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1484,7 +1589,10 @@ class HyperCVAttention(nn.Module):
         self,
         patches: torch.Tensor,
         input_state: FockState | None = None,
-    ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor, list[torch.Tensor], list[torch.Tensor],
+        torch.Tensor, torch.Tensor, HeadDebugStats,
+    ]:
         """Apply all heads to a batch of patch sequences.
 
         Args:
@@ -1500,6 +1608,8 @@ class HyperCVAttention(nn.Module):
                               and batch elements.
             cvqnn_trunc_loss: Scalar — mean CVQNN-block (W) truncation leakage across
                               heads × batch (0 when cvqnn_num_layers == 0).
+            debug:            HeadDebugStats — detached per-head NaN-forensics
+                              reductions.
         """
         if input_state is not None:
             raise NotImplementedError("input_state is not supported under vmap")
@@ -1569,7 +1679,10 @@ class SharedCVAttention(nn.Module):
         self,
         patches: torch.Tensor,
         input_state: FockState | None = None,
-    ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor, list[torch.Tensor], list[torch.Tensor],
+        torch.Tensor, torch.Tensor, HeadDebugStats,
+    ]:
         """Apply the shared CNN then all heads to a batch of patch sequences.
 
         Args:
@@ -1577,8 +1690,8 @@ class SharedCVAttention(nn.Module):
             input_state: Not supported under vmap; must be None.
 
         Returns:
-            Same 5-tuple as ``HyperCVAttention.forward`` (readouts, states,
-            success_probs, trunc_loss, cvqnn_trunc_loss).
+            Same 6-tuple as ``HyperCVAttention.forward`` (readouts, states,
+            success_probs, trunc_loss, cvqnn_trunc_loss, debug).
         """
         if input_state is not None:
             raise NotImplementedError("input_state is not supported under vmap")

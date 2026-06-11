@@ -46,6 +46,7 @@ import argparse
 import contextlib
 import io
 import json
+import math
 import sys
 import time
 from dataclasses import asdict
@@ -79,7 +80,18 @@ from cv_quixer.evaluation.diagnostics import (
     snapshot_stacked_coefficients,
 )
 from cv_quixer.models import build_model
+from cv_quixer.provenance import invocation_record
 from cv_quixer.utils import print_parameter_table
+from cv_quixer.utils.debug_nan import (
+    MAX_EVENT_DUMPS,
+    DebugStreamWriter,
+    anomaly_replay,
+    build_grad_groups,
+    dump_nan_event,
+    grad_group_norms,
+    init_fingerprint,
+    nonfinite_heads,
+)
 from cv_quixer.utils.logging import finish_logging, init_logging, log_metrics
 
 # ---------------------------------------------------------------------------
@@ -528,7 +540,8 @@ ckpt_dir = run_dir / "checkpoints"
 log_dir = run_dir / "logs"
 preds_dir = run_dir / "predictions"
 diag_dir = run_dir / "diagnostics"
-for d in (run_dir, ckpt_dir, log_dir, preds_dir, diag_dir):
+debug_dir = run_dir / "debug"
+for d in (run_dir, ckpt_dir, log_dir, preds_dir, diag_dir, debug_dir):
     d.mkdir(parents=True, exist_ok=True)
 
 
@@ -727,6 +740,45 @@ if args.resume:
 
 
 # ---------------------------------------------------------------------------
+# NaN forensics (always-on; see cv_quixer/utils/debug_nan.py)
+# ---------------------------------------------------------------------------
+
+# Init fingerprint: written once at the launch that created the run (params
+# are still the init draws there); on resume the original file is kept.
+_fingerprint_path = debug_dir / "init_fingerprint.json"
+if not _fingerprint_path.exists():
+    with open(_fingerprint_path, "w") as f:
+        json.dump(
+            {"epoch_written": start_epoch, "params": init_fingerprint(model)},
+            f, indent=2,
+        )
+
+grad_groups = build_grad_groups(model)
+grad_group_names = sorted(grad_groups)
+_gate_stat_labels = getattr(model, "gate_stat_labels", None)
+debug_stream = DebugStreamWriter(
+    debug_dir,
+    meta={
+        "grad_group_names": grad_group_names,
+        "gate_stat_labels": _gate_stat_labels,
+        "num_heads": int(getattr(model.config, "num_heads", 0))
+        if hasattr(model, "config") else 0,
+    },
+)
+debug_stream.load()   # extend the existing stream on resume
+
+# Event state for the on-event policy (agreed 2026-06-11): dump + anomaly
+# replay per NEW dead head, keep training, abort at the end of the first
+# epoch that completes without a new event.
+nan_watch = {
+    "dead_heads": set(),       # heads with any non-finite stream so far
+    "global_event": False,     # non-finite seen without head attribution
+    "n_dumps": 0,
+    "last_event_epoch": None,
+}
+
+
+# ---------------------------------------------------------------------------
 # Save resolved config (after auto-scaling has chosen cnn_channels_2)
 # ---------------------------------------------------------------------------
 
@@ -777,6 +829,11 @@ history["meta"]["query_trunc_lambda"] = float(QUERY_TRUNC_LAMBDA)
 # decoder_hidden_dim above), kept separately from the int-cast loop.
 _dhm = getattr(_resolved_q, "decoder_hidden_mult", None)
 history["meta"]["decoder_hidden_mult"] = None if _dhm is None else float(_dhm)
+# Launch provenance (CONTEXT.md: Invocation). Append-only: entry 0 is the
+# launch that created the run; each --resume appends. Lives in history (not
+# config.json, which is rewritten verbatim on every launch) because history
+# is restored from the checkpoint on resume, so earlier entries survive.
+history["meta"].setdefault("invocations", []).append(invocation_record())
 
 
 # ---------------------------------------------------------------------------
@@ -811,6 +868,96 @@ def _grad_l2_norm(parameters) -> float:
     return float(torch.norm(torch.stack(norms), 2).item())
 
 
+def _batch_loss(patches: torch.Tensor, labels: torch.Tensor):
+    """Forward + full training loss for one batch.
+
+    Shared by the normal training path and the NaN-event anomaly replay so
+    the replayed computation is identical to the one that produced the
+    non-finite gradients.
+
+    Returns ``(loss, ce_loss, query_trunc_loss, out)``.
+    """
+    out = model(patches, return_trunc_loss=True, return_success_prob=True)
+    # None for models without query unitaries (only the stacked model has
+    # the stream); a zero stand-in keeps the logging path uniform.
+    query_trunc_loss = (
+        out.query_trunc_loss
+        if out.query_trunc_loss is not None
+        else torch.zeros((), device=out.logits.device)
+    )
+    ce_loss = F.cross_entropy(out.logits, labels)
+    loss = (
+        ce_loss
+        + quantum_cfg.trunc_lambda * out.trunc_loss
+        + quantum_cfg.cvqnn_trunc_lambda * out.cvqnn_trunc_loss
+        + quantum_cfg.query_trunc_lambda * query_trunc_loss
+    )
+    return loss, ce_loss, query_trunc_loss, out
+
+
+def _collect_debug_record(out, group_norms: dict, scalars: dict) -> dict:
+    """Assemble the per-batch NaN-forensics record (numpy, all tiny).
+
+    Per-head fields are present only when the model surfaces them (canonical
+    quantum models; the stacked model leaves them None).
+    """
+    record: dict = dict(scalars)
+    record["grad_groups"] = group_norms
+    if out.trunc_loss_per_head is not None:
+        record["trunc_per_head"] = (
+            out.trunc_loss_per_head.detach().cpu().numpy()
+        )
+        record["cvqnn_trunc_per_head"] = (
+            out.cvqnn_trunc_loss_per_head.detach().cpu().numpy()
+        )
+        record["gate_min_abs"] = out.gate_param_min_abs.detach().cpu().numpy()
+        record["gate_zero_count"] = (
+            out.gate_param_zero_count.detach().cpu().numpy()
+        )
+    if out.success_probs is not None:
+        sp = torch.stack([s.detach() for s in out.success_probs])  # (H, B)
+        record["sp_min"] = sp.amin(dim=1).cpu().numpy()
+        record["sp_max"] = sp.amax(dim=1).cpu().numpy()
+    record["logits_finite"] = float(
+        torch.isfinite(out.logits.detach()).all().item()
+    )
+    return record
+
+
+def _handle_nan_event(
+    new_dead: set, patches: torch.Tensor, labels: torch.Tensor,
+    record: dict, *, step: int, epoch: int,
+) -> None:
+    """Forensic dump + anomaly replay for a newly detected non-finite event.
+
+    Runs after ``loss.backward()`` and before ``optimizer.step()`` — the
+    dumped params are the last finite ones, the dumped grads the first
+    non-finite ones. The anomaly replay perturbs the grads, so the caller
+    must recompute them before stepping (the agreed policy is to step anyway
+    and keep training; the run aborts at the end of the first epoch with no
+    new event — see the main loop).
+    """
+    nan_watch["n_dumps"] += 1
+    event_dir = debug_dir / f"nan_event_step{step:06d}"
+    print(
+        f"\n  [NaN event] step {step} (epoch {epoch}): "
+        f"new non-finite heads {sorted(new_dead) or '(none — global)'}; "
+        f"dumping forensics to {event_dir}/"
+    )
+    dump_nan_event(
+        event_dir, model, optimizer, patches, labels, record,
+        step=step, epoch=epoch,
+    )
+    report = anomaly_replay(
+        lambda: _batch_loss(patches, labels)[0],
+        model,
+        event_dir / "anomaly_report.txt",
+    )
+    # First line of the report into the tee'd train.log for visibility.
+    head_line = report.strip().splitlines()[-1] if report.strip() else ""
+    print(f"  [NaN event] anomaly replay: {head_line[:300]}")
+
+
 def train_epoch(epoch: int) -> tuple[float, float, float]:
     """One epoch of training. Returns the mean per-sample truncation losses
     (per-patch, CVQNN-block W, query-unitary — the last is 0 for models
@@ -824,7 +971,8 @@ def train_epoch(epoch: int) -> tuple[float, float, float]:
 
     Per-batch CE / trunc / cvqnn-trunc / total loss / batch acc / grad norm are
     still appended to history["batch"] so the per-batch diagnostic plots are
-    unchanged.
+    unchanged. The NaN-forensics stream (per-head trunc, per-group grad norms,
+    gate-param stats, per-head success-prob range) goes to debug/stream.npz.
     """
     global global_step
     model.train()
@@ -835,26 +983,56 @@ def train_epoch(epoch: int) -> tuple[float, float, float]:
     ):
         patches, labels = patches.to(device), labels.to(device)
         optimizer.zero_grad()
-        out = model(patches, return_trunc_loss=True)
+        loss, ce_loss, query_trunc_loss, out = _batch_loss(patches, labels)
         logits, trunc_loss = out.logits, out.trunc_loss
         cvqnn_trunc_loss = out.cvqnn_trunc_loss
-        # None for models without query unitaries (only the stacked model has
-        # the stream); a zero stand-in keeps the logging path uniform.
-        query_trunc_loss = (
-            out.query_trunc_loss
-            if out.query_trunc_loss is not None
-            else torch.zeros((), device=logits.device)
-        )
-        ce_loss = F.cross_entropy(logits, labels)
-        loss = (
-            ce_loss
-            + quantum_cfg.trunc_lambda * trunc_loss
-            + quantum_cfg.cvqnn_trunc_lambda * cvqnn_trunc_loss
-            + quantum_cfg.query_trunc_lambda * query_trunc_loss
-        )
         loss.backward()
 
         grad_norm = _grad_l2_norm(model.parameters())
+
+        # --- NaN forensics: detect BEFORE optimizer.step() so an event dump
+        # captures the last finite params + the first non-finite grads. ---
+        group_norms = grad_group_norms(grad_groups)
+        record = _collect_debug_record(
+            out, group_norms,
+            {
+                "step": global_step + 1,
+                "epoch": epoch,
+                "total_loss": float(loss.item()),
+                "grad_norm": float(grad_norm),
+            },
+        )
+        num_heads = int(getattr(quantum_cfg, "num_heads", 0))
+        bad_heads = nonfinite_heads(record, num_heads)
+        all_finite = math.isfinite(record["total_loss"]) and math.isfinite(
+            record["grad_norm"]
+        )
+        new_dead = bad_heads - nan_watch["dead_heads"]
+        new_global = (not all_finite) and not bad_heads \
+            and not nan_watch["global_event"]
+        if new_dead or new_global:
+            nan_watch["last_event_epoch"] = epoch
+            nan_watch["dead_heads"] |= new_dead
+            nan_watch["global_event"] = nan_watch["global_event"] or new_global
+            if nan_watch["n_dumps"] < MAX_EVENT_DUMPS:
+                _handle_nan_event(
+                    new_dead, patches, labels, record,
+                    step=global_step + 1, epoch=epoch,
+                )
+                # The anomaly replay left the grads in an undefined state;
+                # recompute them so the step matches the natural trajectory.
+                optimizer.zero_grad()
+                replay_loss, _, _, _ = _batch_loss(patches, labels)
+                replay_loss.backward()
+                debug_stream.save()   # persist the stream up to the event
+        # npz stream wants homogeneous arrays: vectorise the grad-group dict
+        # in the writer's canonical group order.
+        stream_record = {k: v for k, v in record.items() if k != "grad_groups"}
+        stream_record["grad_group_norms"] = np.array(
+            [group_norms[n] for n in grad_group_names], dtype=np.float64
+        )
+        debug_stream.append(stream_record)
+
         optimizer.step()
 
         # Early OOM-headroom signal: the steady-state footprint (fwd+bwd+step)
@@ -886,6 +1064,7 @@ def train_epoch(epoch: int) -> tuple[float, float, float]:
         history["batch"]["batch_acc"].append(float(batch_acc))
         history["batch"]["grad_norm"].append(float(grad_norm))
 
+    debug_stream.save()
     return total_trunc / total, total_cvqnn_trunc / total, total_query_trunc / total
 
 
@@ -1059,6 +1238,32 @@ for epoch in range(start_epoch, EPOCHS + 1):
     history["meta"]["total_runtime_sec"] = float(time.time() - run_start)
     save_history()
 
+    # NaN-event abort policy (agreed 2026-06-11): after any non-finite event,
+    # keep training through the end of the epoch so the post-event spread is
+    # captured (per-group grad norms, second head deaths, …), then abort at
+    # the end of the first epoch that completes WITHOUT a new event — the
+    # remaining epochs would only train a corrupted model.
+    _had_event = nan_watch["last_event_epoch"] is not None
+    if _had_event and nan_watch["last_event_epoch"] < epoch:
+        abort_info = {
+            "aborted_after_epoch": epoch,
+            "last_event_epoch": nan_watch["last_event_epoch"],
+            "dead_heads": sorted(nan_watch["dead_heads"]),
+            "global_event": nan_watch["global_event"],
+            "n_event_dumps": nan_watch["n_dumps"],
+        }
+        with open(debug_dir / "aborted_nan.json", "w") as f:
+            json.dump(abort_info, f, indent=2)
+        history["meta"]["nan_aborted"] = abort_info
+        save_history()
+        print(
+            f"\n[NaN abort] non-finite event(s) in epoch "
+            f"{nan_watch['last_event_epoch']} "
+            f"(dead heads: {abort_info['dead_heads']}), no new event in epoch "
+            f"{epoch} — stopping after this epoch. Forensics: {debug_dir}/"
+        )
+        break
+
 total_runtime = time.time() - run_start
 
 # ---------------------------------------------------------------------------
@@ -1091,6 +1296,7 @@ print(f"  config         → config.json")
 print(f"  history        → history.json")
 print(f"  predictions    → predictions/  (per-epoch npz + test_images.npz)")
 print(f"  diagnostics    → diagnostics/  (per-epoch npz)")
+print(f"  debug          → debug/  (NaN-forensics stream + event dumps)")
 print(
     f"  checkpoints    → checkpoints/  (latest.pt, best.pt, final_model.pt, epoch_NNNN.pt)"
 )
