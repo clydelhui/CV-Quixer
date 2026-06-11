@@ -26,6 +26,16 @@ architecture instead of collapsing into a single averaged point. Every figure
 renders only when its comparison axis takes ≥2 distinct values (a skip notice is
 printed otherwise).
 
+Epoch fairness: best/final accuracies span each run's whole training history,
+so comparing runs trained to different lengths (a mid-top-up sweep, a
+``--runs``-filtered top-up — see experiments/resume_sweep.py) is unfair; a
+``RuntimeWarning`` fires whenever the compared runs' epoch counts differ. Pass
+``--max-epoch N`` to derive best/best-epoch/final/n_epochs from each run's
+first N epochs only (ignoring meta's all-epochs values) and compare at a common
+horizon; runs with fewer than N epochs are kept, with a warning. The cap
+applies to the table and cross-run figures only — the per-run
+report_diagnostics suite always renders full history.
+
 The cross-run aggregation reads only JSON (no torch / model rebuild), so it is
 fast and runs on a partial or in-progress sweep. By default it then also renders
 the full `report_diagnostics.py` figure suite into each run's own `figures/` dir
@@ -119,8 +129,14 @@ def _resolve_model(run_dir: Path, meta: dict) -> str:
     return "quantum"
 
 
-def _load_run(run_dir: Path) -> dict | None:
-    """Read one run's history/config into a flat summary row, or None to skip."""
+def _load_run(run_dir: Path, max_epoch: int | None = None) -> dict | None:
+    """Read one run's history/config into a flat summary row, or None to skip.
+
+    With ``max_epoch=N`` the per-epoch series are truncated to the first N
+    epochs and best/best-epoch/final/n_epochs are derived from the slice —
+    ignoring meta's all-epochs values — so runs topped up to different lengths
+    can be compared fairly at a common epoch count.
+    """
     history_path = run_dir / "history.json"
     if not history_path.is_file():
         # A dir with config.json but no history.json is a run that started but
@@ -141,9 +157,24 @@ def _load_run(run_dir: Path) -> dict | None:
     test_acc = epoch.get("test_acc") or []
     train_acc = epoch.get("train_acc") or []
 
-    best = meta.get("best_test_acc")
-    if best is None and test_acc:
-        best = max(test_acc)
+    if max_epoch is not None:
+        if len(test_acc) < max_epoch:
+            warnings.warn(
+                f"{run_dir.name} has only {len(test_acc)} epoch(s), below the "
+                f"--max-epoch {max_epoch} cap — it is kept, but compares a "
+                "shorter training horizon (top it up with "
+                "experiments/resume_sweep.py for a fair comparison).",
+                RuntimeWarning, stacklevel=2,
+            )
+        test_acc = test_acc[:max_epoch]
+        train_acc = train_acc[:max_epoch]
+        best = max(test_acc) if test_acc else None
+        best_epoch = test_acc.index(best) + 1 if test_acc else None
+    else:
+        best = meta.get("best_test_acc")
+        if best is None and test_acc:
+            best = max(test_acc)
+        best_epoch = meta.get("best_epoch")
 
     row = {
         "run_name": run_dir.name,
@@ -158,7 +189,7 @@ def _load_run(run_dir: Path) -> dict | None:
         "trunc_lambda": meta.get("trunc_lambda"),
         "seed": meta.get("seed"),
         "best_test_acc": best,
-        "best_epoch": meta.get("best_epoch"),
+        "best_epoch": best_epoch,
         "final_test_acc": test_acc[-1] if test_acc else None,
         "final_train_acc": train_acc[-1] if train_acc else None,
         "n_epochs": len(test_acc),
@@ -172,11 +203,11 @@ def _load_run(run_dir: Path) -> dict | None:
     return row
 
 
-def load_sweep(sweep_dir: Path) -> list[dict]:
+def load_sweep(sweep_dir: Path, max_epoch: int | None = None) -> list[dict]:
     """Load every run row under `sweep_dir`, sorted for stable output."""
     rows: list[dict] = []
     for run_dir in sorted(p for p in sweep_dir.iterdir() if p.is_dir()):
-        row = _load_run(run_dir)
+        row = _load_run(run_dir, max_epoch=max_epoch)
         if row is not None:
             rows.append(row)
     rows.sort(
@@ -296,6 +327,32 @@ def _check_identity_drift(rows: list[dict]) -> None:
                 "report_sweep.py.",
                 RuntimeWarning, stacklevel=2,
             )
+
+
+def _check_epoch_heterogeneity(rows: list[dict]) -> None:
+    """Warn when the compared runs' effective epoch counts differ.
+
+    best/final acc over more epochs is advantaged, so cross-run comparisons of
+    unequal-length runs are unfair — top the short runs up
+    (experiments/resume_sweep.py) or cap the long ones (--max-epoch).
+    """
+    # Keyed per row, not per run_name: two compared sweeps may legitimately
+    # contain the same run name (e.g. a re-run vs the original).
+    counts = [(str(r["run_name"]), r["n_epochs"]) for r in rows]
+    if len({n for _name, n in counts}) > 1:
+        by_count: dict[int, list[str]] = defaultdict(list)
+        for name, n in counts:
+            by_count[n].append(name)
+        detail = "; ".join(
+            f"{n} epoch(s): {sorted(names)}" for n, names in sorted(by_count.items())
+        )
+        warnings.warn(
+            "runs being compared have differing epoch count(s) — best/final "
+            "accuracies span unequal training horizons. Top up the short runs "
+            "(experiments/resume_sweep.py) or pass --max-epoch to compare at a "
+            f"common epoch. {detail}",
+            RuntimeWarning, stacklevel=2,
+        )
 
 
 def _config_groups(rows: list[dict]) -> dict[tuple, dict]:
@@ -628,6 +685,12 @@ def main() -> None:
              + ", ".join(CONFIG_IDENTITY_FIELDS) + ")",
     )
     parser.add_argument(
+        "--max-epoch", type=int, default=None, metavar="N",
+        help="derive best/final accuracy from each run's first N epochs only "
+             "(fair comparison across runs topped up to different lengths); "
+             "per-run report_diagnostics figures are unaffected",
+    )
+    parser.add_argument(
         "--skip-per-run-figures", action="store_true",
         help="skip rendering report_diagnostics for each run "
              "(cross-run figures + tables only — the fast JSON-only pass)",
@@ -643,13 +706,14 @@ def main() -> None:
     if not sweep_dir.is_dir():
         parser.error(f"--sweep-dir does not exist: {sweep_dir}")
 
-    rows = load_sweep(sweep_dir)
+    rows = load_sweep(sweep_dir, max_epoch=args.max_epoch)
     if not rows:
         print(f"No runs found under {sweep_dir} (need per-run history.json).")
         return
 
     print(f"Aggregating {len(rows)} run(s) under {sweep_dir}")
     _check_identity_drift(rows)
+    _check_epoch_heterogeneity(rows)
     write_table(rows, sweep_dir)
 
     fig_dir = sweep_dir / "figures"
