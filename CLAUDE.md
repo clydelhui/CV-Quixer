@@ -64,6 +64,12 @@ uv run python experiments/sweep.py \
     --num-heads 4 6 --num-modes 2 3 --decoder-num-layers 2 3 --observables xpxsps \
     --epochs 3 --train-fraction 0.1 --test-fraction 0.1 --dry-run
 
+# Top up a sweep — raise all (or --runs-matched) runs to a target TOTAL epoch
+# count: resume from latest.pt, restart checkpoint-less runs, skip runs already
+# at the target. --dry-run / --launch local|slurm as with sweep.py.
+uv run python experiments/resume_sweep.py \
+    --sweep-dir results/sweeps/<sweep>_<ts>/ --epochs 6 --dry-run
+
 # Aggregate a finished/partial sweep into a thesis table + comparison plots
 # (also renders the full report_diagnostics suite per run; --skip-per-run-figures to skip)
 uv run python experiments/report_sweep.py \
@@ -239,6 +245,21 @@ then **also renders the full `report_diagnostics.py` figure suite for
 every run by default** (one subprocess per run; `report_diagnostics`'s default
 path is npz/JSON-based, so heavy torch imports stay deferred); pass
 `--skip-per-run-figures` for the fast cross-run-only pass.
+
+**Sweep top-up.** `experiments/resume_sweep.py --sweep-dir <dir> --epochs N`
+raises selected runs to N *total* epochs (see CONTEXT.md "Top-up"; not
+additive — all runs converge to the same count). It replays each run's original
+argv from `sweep_manifest.json` verbatim (full_experiment rebuilds config from
+CLI flags even on resume) with `--epochs` rewritten and `--resume
+<run>/checkpoints/latest.pt` appended; checkpoint-less runs (died before
+epoch 1) relaunch fresh into the same run dir (the retry-failed-runs path);
+runs already at ≥ N are skipped. Writes `resume_manifest_<ts>.json` (same
+`runs[]` schema, re-indexed 0..K−1) so `scripts/run_sweep.sh` consumes it
+unchanged; the original manifest is never modified. `--runs PATTERN…` (fnmatch
+on run_name) selects a subset; `--dry-run` / `--launch local|slurm` as with
+`sweep.py`. Caveat: resume restores model+optimizer but not RNG state, so a
+topped-up run is statistically equivalent — not bit-identical — to an
+uninterrupted run of the same length.
 
 **Whole-sweep cutoff sweep.** `experiments/eval_cutoff_sweep_all.py --sweep-dir
 <dir>` fans `eval_cutoff_sweep.py` over **every** run in a sweep (discovers runs
@@ -433,6 +454,7 @@ experiments/
 ├── eval_cutoff_sweep.py   Re-evaluate a trained checkpoint at larger Fock cutoffs
 ├── eval_cutoff_sweep_all.py  Fan eval_cutoff_sweep over EVERY run in a sweep (manifest + local/slurm)
 ├── sweep.py               Fan a (param × observable × seed) grid into full_experiment runs
+├── resume_sweep.py        Top up a sweep: raise selected runs to a target total epoch count (manifest + local/slurm)
 ├── report_sweep.py        Cross-run sweep table (summary.csv/md) + plots + per-run diagnostics
 ├── report_sweep_compare.py  Overlay ≥2 sweeps (e.g. quantum vs quantum_shared) → combined table + cross-sweep figures
 ├── report_cutoff_sweep.py Cross-run cutoff table + figures/cutoff/ + per-cutoff diagnostics
