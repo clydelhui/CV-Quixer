@@ -240,7 +240,14 @@ sweeps), `figures/acc_vs_trunc_lambda.png` (needs ≥2 λ values), plus one
 `figures/acc_vs_<field>.png` per architecture field that *varies* across the
 runs (e.g. `acc_vs_num_heads.png`). `--series-by FIELD…` (default
 `model observables`) picks the legend/series fields of the line figures — e.g.
-add `scaling_knob` to recover per-knob lines in a multi-knob budget sweep. It
+add `scaling_knob` to recover per-knob lines in a multi-knob budget sweep.
+Epoch fairness: a `RuntimeWarning` fires whenever the compared runs' epoch
+counts differ (e.g. a mid-top-up sweep); `--max-epoch N` derives
+best/best-epoch/final/n_epochs from each run's first N epochs only (ignoring
+`meta`'s all-epochs values) for a fair comparison at a common horizon — runs
+below the cap are kept, with a warning. Both the flag and the guard are
+inherited by `report_sweep_compare.py`; the per-run `report_diagnostics.py`
+suite is unaffected (single-run figures always render full history). It
 then **also renders the full `report_diagnostics.py` figure suite for
 every run by default** (one subprocess per run; `report_diagnostics`'s default
 path is npz/JSON-based, so heavy torch imports stay deferred); pass

@@ -8,6 +8,7 @@ distinct architectures that share the manual-mode placeholder coordinates
 
 from __future__ import annotations
 
+import csv
 import json
 import sys
 import warnings
@@ -303,3 +304,115 @@ def test_compare_two_sweeps(tmp_path, monkeypatch):
     per = report_sweep_compare._per_label_groups(rows)
     assert len([1 for (lbl, _k) in per if lbl == "manual"]) == 2
     assert len([1 for (lbl, _k) in per if lbl == "budget"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# Epoch-fair reporting: --max-epoch cap + heterogeneous-epoch warning
+# ---------------------------------------------------------------------------
+
+
+def test_max_epoch_caps_derived_metrics(tmp_path):
+    """With max_epoch=N, best/best-epoch/final/n_epochs come from the first N
+    epochs of the history series — not meta's all-epochs values — so a run
+    topped up beyond its neighbours can be compared fairly at epoch N."""
+    sweep = tmp_path / "sweep"
+    make_run(sweep, "p8000__obs-xpxsps__seed42",
+             test_acc=(0.5, 0.6, 0.8, 0.9))  # peaks late; meta best = 0.9
+
+    (row,) = report_sweep.load_sweep(sweep, max_epoch=2)
+
+    assert row["best_test_acc"] == pytest.approx(0.6)
+    assert row["best_epoch"] == 2
+    assert row["final_test_acc"] == pytest.approx(0.6)
+    assert row["final_train_acc"] == pytest.approx(0.6)
+    assert row["n_epochs"] == 2
+
+
+def test_run_below_cap_is_kept_with_warning(tmp_path):
+    """A run with fewer epochs than the cap still appears in the rows (a
+    mid-top-up report must not silently lose runs), with a RuntimeWarning
+    naming the run and its actual epoch count."""
+    sweep = tmp_path / "sweep"
+    make_run(sweep, "p8000__obs-xpxsps__seed42", test_acc=(0.5,))
+
+    with pytest.warns(RuntimeWarning, match=r"p8000__obs-xpxsps__seed42.*1"):
+        (row,) = report_sweep.load_sweep(sweep, max_epoch=2)
+
+    assert row["n_epochs"] == 1
+    assert row["best_test_acc"] == pytest.approx(0.5)
+
+
+def test_heterogeneous_epoch_counts_warn(tmp_path):
+    """Comparing runs trained for different numbers of epochs is unfair (best
+    acc over more epochs is advantaged) — the report must say so loudly."""
+    sweep = tmp_path / "sweep"
+    make_run(sweep, "p8000__obs-xpxsps__seed42", test_acc=(0.5, 0.6))
+    make_run(sweep, "p8000__obs-xpxsps__seed43",
+             test_acc=(0.5, 0.6, 0.7, 0.8), seed=43)
+    rows = report_sweep.load_sweep(sweep)
+
+    with pytest.warns(RuntimeWarning, match="epoch count"):
+        report_sweep._check_epoch_heterogeneity(rows)
+
+
+def test_homogeneous_epoch_counts_do_not_warn(tmp_path):
+    """No crying wolf: equal epoch counts (the normal, fair case) are silent."""
+    sweep = tmp_path / "sweep"
+    make_run(sweep, "p8000__obs-xpxsps__seed42", test_acc=(0.5, 0.6))
+    make_run(sweep, "p8000__obs-xpxsps__seed43", test_acc=(0.5, 0.7), seed=43)
+    rows = report_sweep.load_sweep(sweep)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        report_sweep._check_epoch_heterogeneity(rows)
+
+
+def test_main_max_epoch_caps_summary_and_warns_on_heterogeneity(
+    tmp_path, monkeypatch
+):
+    """End-to-end: a lopsided sweep warns through main(); with --max-epoch the
+    summary table carries the capped metrics."""
+    sweep = tmp_path / "sweep"
+    make_run(sweep, "p8000__obs-xpxsps__seed42", test_acc=(0.5, 0.6))
+    make_run(sweep, "p8000__obs-xpxsps__seed43",
+             test_acc=(0.5, 0.6, 0.8, 0.9), seed=43)
+
+    with pytest.warns(RuntimeWarning, match="epoch count"):
+        run_report_sweep(sweep, monkeypatch)
+
+    run_report_sweep(sweep, monkeypatch, "--max-epoch", "2")
+    rows = list(csv.DictReader(open(sweep / "summary.csv")))
+    by_seed = {r["seed"]: r for r in rows}
+    assert float(by_seed["43"]["best_test_acc"]) == pytest.approx(0.6)
+    assert by_seed["43"]["n_epochs"] == "2"
+    assert by_seed["42"]["n_epochs"] == "2"
+
+
+def test_compare_inherits_max_epoch_and_heterogeneity_guard(
+    tmp_path, monkeypatch
+):
+    """report_sweep_compare honours --max-epoch through the shared loaders and
+    warns when epoch counts differ across the combined sweeps."""
+    sweep_a, sweep_b = tmp_path / "a", tmp_path / "b"
+    make_run(sweep_a, "p8000__obs-xpxsps__seed42", test_acc=(0.5, 0.6))
+    make_run(sweep_b, "p8000__obs-xpxsps__seed42",
+             test_acc=(0.5, 0.6, 0.8, 0.9), model="quantum_shared")
+    out = tmp_path / "out"
+
+    def run_compare(*extra):
+        monkeypatch.setattr(
+            sys, "argv",
+            ["report_sweep_compare.py",
+             "--sweep-dir", str(sweep_a), "--sweep-dir", str(sweep_b),
+             "--label", "a", "--label", "b", "--out-dir", str(out), *extra],
+        )
+        report_sweep_compare.main()
+
+    with pytest.warns(RuntimeWarning, match="epoch count"):
+        run_compare()
+
+    run_compare("--max-epoch", "2")
+    rows = list(csv.DictReader(open(out / "comparison.csv")))
+    by_label = {r["sweep_label"]: r for r in rows}
+    assert float(by_label["b"]["best_test_acc"]) == pytest.approx(0.6)
+    assert by_label["b"]["n_epochs"] == "2"

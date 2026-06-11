@@ -52,6 +52,7 @@ import numpy as np
 from report_sweep import (
     CONFIG_IDENTITY_FIELDS,
     _FIELD_INDEX,
+    _check_epoch_heterogeneity,
     _check_identity_drift,
     _config_groups,
     _series_key,
@@ -77,11 +78,13 @@ def _fmt(v: object) -> str:
     return "" if v is None else str(v)
 
 
-def load_sweeps(sweep_dirs: list[Path], labels: list[str]) -> list[dict]:
+def load_sweeps(
+    sweep_dirs: list[Path], labels: list[str], max_epoch: int | None = None
+) -> list[dict]:
     """Load every run across all sweeps, each row tagged with its sweep label."""
     rows: list[dict] = []
     for sweep_dir, label in zip(sweep_dirs, labels):
-        sweep_rows = load_sweep(sweep_dir)
+        sweep_rows = load_sweep(sweep_dir, max_epoch=max_epoch)
         if not sweep_rows:
             warnings.warn(
                 f"no runs with history.json under {sweep_dir} — skipping",
@@ -94,6 +97,9 @@ def load_sweeps(sweep_dirs: list[Path], labels: list[str]) -> list[dict]:
         for r in sweep_rows:
             r["sweep_label"] = label
             rows.append(r)
+    # Across sweeps: the whole point is comparing them, so unequal training
+    # horizons anywhere in the combined set make the comparison unfair.
+    _check_epoch_heterogeneity(rows)
     return rows
 
 
@@ -323,6 +329,11 @@ def main() -> None:
              + ", ".join(CONFIG_IDENTITY_FIELDS) + ")",
     )
     parser.add_argument(
+        "--max-epoch", type=int, default=None, metavar="N",
+        help="derive best/final accuracy from each run's first N epochs only "
+             "(fair comparison across sweeps trained to different lengths)",
+    )
+    parser.add_argument(
         "--out-dir", type=str, default=None,
         help="output directory (default: results/sweeps/compare_<ts>/)",
     )
@@ -349,7 +360,7 @@ def main() -> None:
     )
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    rows = load_sweeps(sweep_dirs, labels)
+    rows = load_sweeps(sweep_dirs, labels, max_epoch=args.max_epoch)
     if not rows:
         print("No runs found across the given sweeps (need per-run history.json).")
         return
