@@ -1,0 +1,305 @@
+"""Tests for experiments/report_sweep.py + report_sweep_compare.py (JSON only).
+
+These pin the configuration-identity grouping that fixes the manual-sweep
+collapse: cross-run figures must seed-average only true seed repeats, never
+distinct architectures that share the manual-mode placeholder coordinates
+(target_params=-1 / default scaling_knob).
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import warnings
+from pathlib import Path
+
+import pytest
+
+# The report scripts live in experiments/ (not a package); import them the same
+# way report_sweep_compare.py imports report_sweep — via sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "experiments"))
+
+import report_sweep  # noqa: E402
+import report_sweep_compare  # noqa: E402
+
+# One complete history["meta"] as full_experiment.py writes it (every
+# CONFIG_IDENTITY_FIELDS member populated), overridden per test.
+BASE_META = {
+    "model": "quantum",
+    "observables_name": "xpxsps",
+    "target_params": -1,
+    "scaling_knob": "num_heads",
+    "achieved_params": 10_000,
+    "num_layers": 2,
+    "trunc_lambda": 0.1,
+    "seed": 42,
+    "total_runtime_sec": 100.0,
+    "device": "cpu",
+    "num_modes": 2,
+    "num_heads": 4,
+    "cutoff_dim": 6,
+    "poly_degree": 3,
+    "cnn_channels_1": 8,
+    "cnn_channels_2": 8,
+    "cnn_kernel_size": 3,
+    "decoder_hidden_dim": 64,
+    "cnn_num_conv_layers": 2,
+    "hypernet_num_linear_layers": 1,
+    "decoder_num_layers": 2,
+    "decoder_hidden_mult": None,
+    "cvqnn_num_layers": 1,
+    "num_seq2seq_blocks": 1,
+    "pooling": "mean",
+    "block_residual": True,
+    "query_trunc_lambda": 0.01,
+    "cvqnn_trunc_lambda": 0.01,
+}
+
+
+def make_run(sweep_dir, run_name, *, test_acc=(0.5, 0.6), **meta_overrides):
+    """Write a minimal history.json for one synthetic run."""
+    meta = {**BASE_META, **meta_overrides}
+    meta.setdefault("best_test_acc", max(test_acc))
+    meta.setdefault("best_epoch", test_acc.index(max(test_acc)) + 1)
+    run_dir = sweep_dir / run_name
+    run_dir.mkdir(parents=True)
+    history = {
+        "meta": meta,
+        "epoch": {
+            "test_acc": list(test_acc),
+            "train_acc": list(test_acc),
+            "train_loss": [1.0] * len(test_acc),
+            "test_loss": [1.0] * len(test_acc),
+        },
+    }
+    (run_dir / "history.json").write_text(json.dumps(history))
+    return run_dir
+
+
+def run_report_sweep(sweep_dir, monkeypatch, *extra):
+    monkeypatch.setattr(
+        sys, "argv",
+        ["report_sweep.py", "--sweep-dir", str(sweep_dir),
+         "--skip-per-run-figures", *extra],
+    )
+    report_sweep.main()
+
+
+# ---------------------------------------------------------------------------
+# Configuration-identity grouping
+# ---------------------------------------------------------------------------
+
+
+def test_budget_mode_seed_groups(tmp_path):
+    """Budget sweeps keep one seed-averaged group per (budget, observable)."""
+    sweep = tmp_path / "sweep"
+    for tp, nh in [(8000, 3), (20000, 7)]:
+        for obs in ("x", "xpxsps"):
+            for seed, acc, ach in [(42, 0.60, tp + 10), (43, 0.70, tp - 10)]:
+                make_run(
+                    sweep, f"p{tp}__obs-{obs}__seed{seed}",
+                    test_acc=(acc - 0.1, acc),
+                    target_params=tp, num_heads=nh, observables_name=obs,
+                    seed=seed, achieved_params=ach,
+                )
+    rows = report_sweep.load_sweep(sweep)
+    groups = report_sweep._config_groups(rows)
+    assert len(groups) == 4
+    for g in groups.values():
+        assert g["acc"][0] == pytest.approx(0.65)
+        assert g["acc"][1] == pytest.approx(0.05)
+    assert sorted(g["x"] for g in groups.values()) == [8000, 8000, 20000, 20000]
+
+
+def test_manual_mode_configs_not_collapsed(tmp_path):
+    """The bug: manual configs all share (obs, knob, -1) and averaged into one."""
+    sweep = tmp_path / "sweep"
+    acc = 0.5
+    for nh in (4, 6):
+        for nm in (2, 3):
+            for seed in (42, 43):
+                acc += 0.02
+                make_run(
+                    sweep, f"manual__obs-xpxsps__seed{seed}__nh{nh}__nm{nm}",
+                    test_acc=(0.4, acc),
+                    num_heads=nh, num_modes=nm, seed=seed,
+                    achieved_params=1000 * nh + 10 * nm,
+                )
+    rows = report_sweep.load_sweep(sweep)
+    assert all(r["target_params"] == -1 for r in rows)
+    groups = report_sweep._config_groups(rows)
+    assert len(groups) == 4  # one per architecture, not one blended point
+
+
+def test_mixed_models_grouped_separately(tmp_path):
+    sweep = tmp_path / "sweep"
+    make_run(sweep, "manual__obs-xpxsps__seed42", test_acc=(0.5, 0.6))
+    make_run(
+        sweep, "manual__obs-xpxsps__seed42__stacked",
+        test_acc=(0.5, 0.7), model="quantum_stacked",
+    )
+    rows = report_sweep.load_sweep(sweep)
+    groups = report_sweep._config_groups(rows)
+    assert len(groups) == 2
+    series = {
+        report_sweep._series_key(k, ["model", "observables"]) for k in groups
+    }
+    assert series == {("quantum", "xpxsps"), ("quantum_stacked", "xpxsps")}
+
+
+def test_varying_fields():
+    base = {f: BASE_META.get(f) for f in report_sweep.CONFIG_IDENTITY_FIELDS}
+    base["observables"] = "xpxsps"
+    k1 = report_sweep._config_key(base)
+    k2 = report_sweep._config_key({**base, "num_heads": 6})
+    k3 = report_sweep._config_key({**base, "num_heads": 6, "num_modes": 3})
+    assert report_sweep._varying_fields([k1, k2]) == ["num_heads"]
+    assert set(report_sweep._varying_fields([k1, k2, k3])) == {
+        "num_heads", "num_modes",
+    }
+    assert report_sweep._varying_fields([k1]) == []
+
+
+# ---------------------------------------------------------------------------
+# Identity drift guard
+# ---------------------------------------------------------------------------
+
+
+def test_identity_drift_guard_warns(tmp_path):
+    sweep = tmp_path / "sweep"
+    # Same identity fields, but the run names carry an axis marker (a fake
+    # __gb knob) that CONFIG_IDENTITY_FIELDS does not track.
+    make_run(sweep, "manual__obs-xpxsps__seed42__gb1.5", seed=42)
+    make_run(sweep, "manual__obs-xpxsps__seed43", seed=43)
+    rows = report_sweep.load_sweep(sweep)
+    with pytest.warns(RuntimeWarning, match="configuration identity"):
+        report_sweep._check_identity_drift(rows)
+
+
+def test_no_drift_warning_for_seed_repeats(tmp_path):
+    sweep = tmp_path / "sweep"
+    make_run(sweep, "manual__obs-xpxsps__seed42", seed=42)
+    make_run(sweep, "manual__obs-xpxsps__seed43", seed=43)
+    rows = report_sweep.load_sweep(sweep)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        report_sweep._check_identity_drift(rows)
+
+
+# ---------------------------------------------------------------------------
+# Vary rule (figures render only when their axis takes ≥2 values)
+# ---------------------------------------------------------------------------
+
+
+def test_single_config_skips_cross_run_figures(tmp_path, monkeypatch):
+    sweep = tmp_path / "sweep"
+    make_run(sweep, "manual__obs-xpxsps__seed42", seed=42)
+    make_run(sweep, "manual__obs-xpxsps__seed43", seed=43)
+    run_report_sweep(sweep, monkeypatch)
+    figs = sweep / "figures"
+    assert (sweep / "summary.csv").is_file()
+    assert not (figs / "acc_vs_params.png").exists()
+    assert not (figs / "acc_by_observable.png").exists()
+    assert not (figs / "acc_vs_trunc_lambda.png").exists()
+
+
+def test_varying_axis_renders_its_figure(tmp_path, monkeypatch):
+    sweep = tmp_path / "sweep"
+    for layers, ach in [(2, 9000), (3, 11000)]:
+        make_run(
+            sweep, f"manual__obs-xpxsps__seed42__L{layers}",
+            num_layers=layers, achieved_params=ach,
+        )
+    run_report_sweep(sweep, monkeypatch)
+    figs = sweep / "figures"
+    assert (figs / "acc_vs_params.png").is_file()
+    assert (figs / "acc_vs_num_layers.png").is_file()
+    assert not (figs / "acc_by_observable.png").exists()  # single preset
+    assert not (figs / "acc_vs_trunc_lambda.png").exists()  # single λ
+    assert not (figs / "acc_vs_num_heads.png").exists()  # constant field
+
+
+def test_two_observables_render_bar_figure(tmp_path, monkeypatch):
+    sweep = tmp_path / "sweep"
+    for obs, ach in [("x", 9000), ("xpxsps", 11000)]:
+        make_run(
+            sweep, f"manual__obs-{obs}__seed42",
+            observables_name=obs, achieved_params=ach,
+        )
+    run_report_sweep(sweep, monkeypatch)
+    assert (sweep / "figures" / "acc_by_observable.png").is_file()
+
+
+def test_lambda_axis_renders_lambda_figure(tmp_path, monkeypatch):
+    sweep = tmp_path / "sweep"
+    for lam in (0.01, 0.1):
+        make_run(sweep, f"manual__obs-xpxsps__seed42__tl{lam}", trunc_lambda=lam)
+    run_report_sweep(sweep, monkeypatch)
+    assert (sweep / "figures" / "acc_vs_trunc_lambda.png").is_file()
+
+
+# ---------------------------------------------------------------------------
+# --series-by flag
+# ---------------------------------------------------------------------------
+
+
+def test_series_by_rejects_unknown_field(tmp_path, monkeypatch):
+    sweep = tmp_path / "sweep"
+    make_run(sweep, "manual__obs-xpxsps__seed42")
+    monkeypatch.setattr(
+        sys, "argv",
+        ["report_sweep.py", "--sweep-dir", str(sweep), "--series-by", "bogus"],
+    )
+    with pytest.raises(SystemExit):
+        report_sweep.main()
+
+
+def test_series_by_custom_field(tmp_path, monkeypatch):
+    sweep = tmp_path / "sweep"
+    for hll, ach in [(1, 9000), (2, 11000)]:
+        make_run(
+            sweep, f"manual__obs-xpxsps__seed42__hll{hll}",
+            hypernet_num_linear_layers=hll, achieved_params=ach,
+        )
+    run_report_sweep(sweep, monkeypatch, "--series-by", "hypernet_num_linear_layers")
+    assert (sweep / "figures" / "acc_vs_params.png").is_file()
+
+
+# ---------------------------------------------------------------------------
+# report_sweep_compare.py
+# ---------------------------------------------------------------------------
+
+
+def test_compare_two_sweeps(tmp_path, monkeypatch):
+    manual = tmp_path / "sweep_manual"
+    budget = tmp_path / "sweep_budget"
+    for nh, ach in [(4, 9000), (6, 11000)]:
+        for seed in (42, 43):
+            make_run(
+                manual, f"manual__obs-xpxsps__seed{seed}__nh{nh}",
+                num_heads=nh, seed=seed, achieved_params=ach,
+            )
+    for tp in (8000, 20000):
+        make_run(
+            budget, f"p{tp}__obs-xpxsps__seed42",
+            target_params=tp, achieved_params=tp, model="quantum_shared",
+        )
+    out = tmp_path / "out"
+    monkeypatch.setattr(
+        sys, "argv",
+        ["report_sweep_compare.py",
+         "--sweep-dir", str(manual), "--sweep-dir", str(budget),
+         "--label", "manual", "--label", "budget",
+         "--out-dir", str(out)],
+    )
+    report_sweep_compare.main()
+    csv_lines = (out / "comparison.csv").read_text().strip().splitlines()
+    assert len(csv_lines) == 1 + 6  # header + 6 runs
+    assert (out / "figures" / "acc_vs_params_compare.png").is_file()
+    # The manual sweep's two architectures stay distinct points (no collapse).
+    rows = report_sweep_compare.load_sweeps(
+        [manual, budget], ["manual", "budget"]
+    )
+    per = report_sweep_compare._per_label_groups(rows)
+    assert len([1 for (lbl, _k) in per if lbl == "manual"]) == 2
+    assert len([1 for (lbl, _k) in per if lbl == "budget"]) == 2

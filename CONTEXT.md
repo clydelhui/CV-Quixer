@@ -77,3 +77,11 @@ _Avoid_: pooling block, readout block.
 The vector of observable expectation values (`⟨x̂⟩`, `⟨p̂⟩`, `⟨n̂⟩`, …) measured on the
 final per-head state and fed to the classical decoder.
 _Avoid_: measurement, output (too generic).
+
+**Configuration identity**:
+The full set of sweep coordinates that makes two runs "the same experiment
+repeated" — model variant, observable preset, budget fields, and every
+architecture knob — everything except the training seed. Cross-run reports
+seed-average only within one configuration identity; runs differing in it are
+never averaged together.
+_Avoid_: grid point (the manifest's view of it), run group.
