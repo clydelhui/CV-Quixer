@@ -56,9 +56,11 @@ _SUCCESS_PROB_FLOOR = 1e-6
 
 
 # Std of the small-Gaussian init for the CVQNN block W's gate params. Small
-# enough that W ≈ I at start, but non-zero so the displacement/beamsplitter gate
-# gradients stay finite (their analytic Fock formulas are NaN-singular at exactly
-# zero) and W-symmetry across heads is broken.
+# enough that W ≈ I at start; non-zero to break W-symmetry across heads.
+# (Historically this also dodged a displacement/beamsplitter NaN-gradient
+# singularity at exactly-zero params; that is now fixed at the source in the
+# gate builders — pinned by tests/test_gate_gradients.py — so symmetry
+# breaking is the only remaining reason.)
 _CVQNN_INIT_STD = 1e-2
 
 
@@ -686,11 +688,11 @@ class _CVHeadBase(nn.Module):
         # CVQNN block W: a fixed, per-image, trainable Killoran circuit applied to
         # the post-polynomial (post-selected) state before readout. Owned params
         # (input-independent). Initialised with small Gaussian noise (W ≈ I, near
-        # the identity) — NOT exact zero: the displacement (α=0) and beamsplitter
-        # (θ=0) analytic Fock formulas have a NaN-gradient singularity at exactly
-        # zero (the off-diagonal complex power exp(s·log α) / sin(θ)**0). Small
-        # noise sits off that singularity (like the always-nonzero hypernet params)
-        # and breaks W-symmetry across heads. At L_W == 0 the block is absent —
+        # the identity) — non-zero to break W-symmetry across heads. (Exact zero
+        # would also be numerically safe: the historic displacement/beamsplitter
+        # NaN-gradient singularity at exactly-zero params is fixed at the source
+        # in the gate builders, pinned by tests/test_gate_gradients.py.)
+        # At L_W == 0 the block is absent —
         # `cvqnn_params` stays a plain None attribute (NOT a registered
         # nn.Parameter), so it never appears in named_parameters()/state_dict() and
         # the head is byte-identical to a pre-W model (checkpoint compat).
@@ -1073,6 +1075,12 @@ class _CVHeadBase(nn.Module):
         gradient is 0·grad = 0 (not 0·NaN), so a near-zero-norm element
         contributes a zero gradient instead of a ~1/√ε explosion. Shared by the
         post-selection, CVQNN, and query-state renorms.
+
+        Deliberate: a NaN ``norm_sq`` propagates (``clamp(NaN) = NaN``), so an
+        upstream non-finite state corrupts gradients *visibly* and the NaN
+        forensics (debug streams, event dumps, epoch abort) fire. Do NOT
+        nan_to_num/sanitise here — that converts loud failures into silently
+        wrong results. See ADR-0004.
         """
         safe = norm_sq.clamp(min=_SUCCESS_PROB_FLOOR)
         scaled = out_unnorm / safe.sqrt()

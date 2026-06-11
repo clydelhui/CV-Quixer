@@ -234,16 +234,23 @@ class TestDebugStreamWriter:
 
 class TestAnomalyReplay:
     def test_names_the_nan_backward_node(self, tmp_path):
-        # pow(0, 0) has a NaN backward despite a finite forward — the same
-        # singularity class as the beamsplitter at theta == 0.
-        x = torch.tensor(0.0, requires_grad=True)
+        # Complex z**1 at z == 0 has a NaN backward despite a finite forward —
+        # the singularity class of the (pre-fix) displacement gate at α == 0.
+        # (Real 0**0 is guarded by torch and would make this test vacuous.)
+        re = torch.tensor(0.0, requires_grad=True)
+        im = torch.tensor(0.0, requires_grad=True)
 
         def loss_fn():
-            return x ** torch.tensor(0.0)
+            z = torch.complex(re, im) ** torch.tensor(1.0 + 0.0j)
+            return z.real ** 2 + z.imag ** 2
 
         report = anomaly_replay(loss_fn, nn.Linear(1, 1), tmp_path / "r.txt")
         assert (tmp_path / "r.txt").exists()
-        assert "PowBackward" in report or "nan" in report.lower()
+        # The exception names the failing backward node ...
+        assert "returned nan" in report
+        # ... and the forward-call traceback warning is preserved on the
+        # exception path (the payload that names the offending source line).
+        assert "Traceback of forward call" in report
 
     def test_never_raises_on_broken_loss_fn(self, tmp_path):
         def loss_fn():

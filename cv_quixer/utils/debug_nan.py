@@ -259,6 +259,7 @@ def anomaly_replay(loss_fn, model: torch.nn.Module, out_path: Path) -> str:
     failure of the replay itself is reported rather than propagated.
     """
     lines: list[str] = []
+    wlist: list = []
     try:
         model.zero_grad(set_to_none=True)
         with warnings.catch_warnings(record=True) as wlist:
@@ -271,10 +272,14 @@ def anomaly_replay(loss_fn, model: torch.nn.Module, out_path: Path) -> str:
             "may originate outside this batch's backward (e.g. already-NaN "
             "params), or anomaly mode could not see inside vmap."
         )
-        for w in wlist:
-            lines.append(f"warning: {w.category.__name__}: {w.message}")
     except Exception:
         lines.append(traceback.format_exc())
+    # Anomaly mode emits the *forward-call* traceback of the failing op as a
+    # warning just before raising — that warning is the payload that names the
+    # offending source line, so it must be kept on the exception path too
+    # (the 2026-06 post-mortem had to recover it via offline replay).
+    for w in wlist:
+        lines.append(f"warning: {w.category.__name__}: {w.message}")
     text = "\n".join(lines) + "\n"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(text)

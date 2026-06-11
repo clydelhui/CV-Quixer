@@ -121,11 +121,26 @@ def displacement_matrix(alpha: torch.Tensor, cutoff_dim: int) -> torch.Tensor:
     L = _laguerre_all(k_grid, s_grid, abs2)                         # (D, D)
 
     # Phase factor (Cahill-Glauber convention): (-α*)^(n-m) for n>m (upper), α^(m-n) for n<m (lower).
-    # Clamp exponent to ≥1 to avoid complex 0^0 → NaN, then override s=0 entries with 1.
+    #
+    # Complex pow z**s routes through exp(s·log z), whose *backward* is NaN at
+    # z == 0 exactly when s == 1 (it evaluates exp(0·log 0)); s == 0 is NaN
+    # already in the forward. α == 0 is a legitimate gate value (the identity,
+    # "no push"), so feed the pow only exponents ≥ 2 — its backward is then
+    # s·z^(s−1) with exponent ≥ 1, finite by construction — and supply the
+    # s ∈ {0, 1} entries by their closed forms (1 and ±α). Values are
+    # bit-identical to the pow route for s ≥ 2; the s == 1 entries become
+    # literal ±α (more accurate than exp(log α)). The broken set {s=0 fwd,
+    # s=1 grad} is pinned exhaustively by tests/test_gate_gradients.py
+    # (ADR-0004).
     upper = (n_grid >= m_grid)
-    s_clamp = s_grid.clamp(min=1)                 # (D, D) integer, values ≥ 1
-    shift_safe = s_clamp.to(torch.complex128)
-    alpha_pow = torch.where(upper, (-alpha_c.conj()) ** shift_safe, alpha_c ** shift_safe)
+    s_pow = s_grid.clamp(min=2).to(torch.complex128)        # pow never sees s < 2
+    alpha_pow = torch.where(upper, (-alpha_c.conj()) ** s_pow, alpha_c ** s_pow)
+    # s == 1: the value IS the base — ±α directly, no pow involved.
+    alpha_pow = torch.where(
+        s_grid == 1,
+        torch.where(upper, -alpha_c.conj(), alpha_c),
+        alpha_pow,
+    )
     # For diagonal (s=0): α^0 = 1 by definition; complex 0^0 would give NaN.
     alpha_pow = torch.where(s_grid > 0, alpha_pow,
                             torch.ones(D, D, dtype=torch.complex128, device=alpha.device))
@@ -312,8 +327,19 @@ def beamsplitter_matrix(
                          + log_fact[l_g] - log_fact[t_safe]
                          - log_fact[(l_g - t_safe).clamp(0)])
 
-            p_cos = (N - j - t_g).to(torch.float64)
-            p_sin = (j + t_g).to(torch.float64)
+            # The exponents are photon counts — non-negative for every *valid*
+            # entry; only the padding entries masked out below can come out
+            # negative. Clamp them to ≥ 0 BEFORE the pow: at sin θ == 0
+            # exactly, an unclamped negative exponent materialises
+            # 0^negative = Inf, which the mask discards in the forward but the
+            # product rule multiplies against the masked-zero gradient in
+            # backward — 0·Inf = NaN, the dead-head trigger of the 2026-06
+            # sweep post-mortem (ADR-0004). With the clamp the padding
+            # computes 0^0, whose forward (1) and gradient (0) torch guards —
+            # the same pattern the squeeze gate already uses for exp_t.
+            # Pinned by tests/test_gate_gradients.py.
+            p_cos = (N - j - t_g).clamp(min=0).to(torch.float64)
+            p_sin = (j + t_g).clamp(min=0).to(torch.float64)
 
             # Real powers: avoids complex 0^0 → NaN when cos or sin is zero
             cos_pow = cos_r ** p_cos   # real
