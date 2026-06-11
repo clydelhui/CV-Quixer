@@ -87,6 +87,15 @@ same length (data-order RNG is not checkpointed).
 _Avoid_: re-run (suggests from scratch), extend / additional epochs (suggests an
 additive count — the target is a total).
 
+**Invocation**:
+One launch of an experiment entry-point script (sweep, run, eval, or whole-sweep
+eval): the exact command together with its launch context — when it ran, on which
+host, at which code revision, and (for SLURM launches) what it submitted to the
+queue. An artefact can accumulate several invocations — the launch that created it
+plus each resume or top-up — and records all of them in order.
+_Avoid_: command (only the argv string — an invocation includes its context),
+launch (ambiguous with the SLURM submission it may contain).
+
 **Configuration identity**:
 The full set of sweep coordinates that makes two runs "the same experiment
 repeated" — model variant, observable preset, budget fields, and every

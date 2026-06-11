@@ -746,6 +746,19 @@ Use `model.forward(patches, return_trunc_loss=True)` to get `(logits, trunc_loss
 
 Output layout differs per script (none of `results/` is git-tracked):
 
+**Launch provenance** (`cv_quixer/provenance.py`, CONTEXT.md "Invocation"):
+every entry point records the exact command that launched it as an append-only
+`invocations` list — `[{launched_at, argv, command, hostname, git_sha,
+git_dirty}]`, where `command` is the pasteable `uv run python …` re-run line —
+inside the artefact it already owns: `sweep_manifest.json` /
+`cutoff_sweep_manifest.json` / `resume_manifest_<ts>.json` for the
+orchestrators, `history["meta"]` for `full_experiment.py` (entry 0 created the
+run; each `--resume` appends — it survives because history is restored from
+the checkpoint), and `eval/<name>/meta.json` for `eval_cutoff_sweep.py`. When
+an orchestrator submits with `--launch slurm`, the entry also gains
+`slurm: {sbatch_command, job_id}`. Purely additive — readers tolerate
+artefacts that pre-date the key (no migration).
+
 **`mini_experiment.py`** (split across fixed roots):
 
 | Path | Contents |

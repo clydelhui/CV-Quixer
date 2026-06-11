@@ -44,12 +44,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import shutil
 import subprocess
 import sys
 import warnings
 from datetime import datetime
 from pathlib import Path
+
+from cv_quixer.provenance import invocation_record
 
 # Repo root = this file's grandparent (experiments/ -> repo root).
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -123,6 +126,9 @@ def build_manifest(args: argparse.Namespace, runs: list[dict]) -> dict:
 
     return {
         "created_at": datetime.now().isoformat(timespec="seconds"),
+        # Launch provenance (CONTEXT.md: Invocation) — the exact
+        # eval_cutoff_sweep_all.py command that defined this eval grid.
+        "invocations": [invocation_record()],
         "sweep_dir": str(args.sweep_dir),
         "eval_name": eval_name,
         "checkpoint_name": args.checkpoint_name,
@@ -146,8 +152,12 @@ def launch_local(manifest: dict) -> int:
     return failures
 
 
-def launch_slurm(manifest: dict, manifest_path: Path) -> None:
-    """Submit the per-run evals as a SLURM array (or print the command)."""
+def launch_slurm(manifest: dict, manifest_path: Path) -> dict | None:
+    """Submit the per-run evals as a SLURM array (or print the command).
+
+    Returns ``{"sbatch_command", "job_id"}`` for the manifest's invocation
+    record, or None when sbatch is unavailable and the command was only printed.
+    """
     n = manifest["n_runs"]
     cmd = ["sbatch", f"--array=0-{n - 1}", RUN_ARRAY_SH, str(manifest_path)]
     print("\nSLURM array submission:")
@@ -157,8 +167,18 @@ def launch_slurm(manifest: dict, manifest_path: Path) -> None:
             "\nsbatch not found on PATH — run the command above on the cluster "
             "login node (from the repo root)."
         )
-        return
-    subprocess.run(cmd, cwd=REPO_ROOT, check=True)
+        return None
+    result = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
+    out = result.stdout.strip()
+    if out:
+        print("  " + out)
+    if result.returncode != 0:
+        if result.stderr.strip():
+            print("  " + result.stderr.strip())
+        raise subprocess.CalledProcessError(result.returncode, cmd)
+    # sbatch prints "Submitted batch job <id>"; tolerate other formats.
+    job_id = out.split()[-1] if out.startswith("Submitted batch job") else None
+    return {"sbatch_command": shlex.join(cmd), "job_id": job_id}
 
 
 def main() -> None:
@@ -238,7 +258,16 @@ def main() -> None:
         if failures:
             sys.exit(1)
     elif launch == "slurm":
-        launch_slurm(manifest, manifest_path)
+        submission = launch_slurm(manifest, manifest_path)
+        if submission is not None:
+            # Close the loop in the invocation record: how the eval grid
+            # entered the queue. Atomic replace — the just-submitted array
+            # tasks read this file.
+            tmp_path = manifest_path.with_suffix(".json.tmp")
+            manifest["invocations"][-1]["slurm"] = submission
+            with open(tmp_path, "w") as f:
+                json.dump(manifest, f, indent=2)
+            tmp_path.replace(manifest_path)
         print(f"\nAfter the array finishes, aggregate with:")
         print(f"  uv run python experiments/report_cutoff_sweep.py "
               f"--sweep-dir {args.sweep_dir}")

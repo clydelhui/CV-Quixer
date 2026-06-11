@@ -76,6 +76,7 @@ from cv_quixer.evaluation.diagnostics import (
     snapshot_coefficients,
 )
 from cv_quixer.models import build_model
+from cv_quixer.provenance import invocation_record
 from cv_quixer.utils import print_parameter_table
 
 
@@ -591,6 +592,9 @@ with open(eval_dir / "results.csv", "w", newline="") as f:
     writer.writerows(per_cutoff)
 
 meta = {
+    # Launch provenance (CONTEXT.md: Invocation) — single-entry list, uniform
+    # with the manifests' / history["meta"]'s schema.
+    "invocations": [invocation_record()],
     "checkpoint": str(ckpt_path),
     "run_dir": str(run_dir),
     "training_cutoff": training_cutoff,
