@@ -15,14 +15,16 @@
 #     sbatch --array=0-5 scripts/run_sweep.sh \
 #         results/sweeps/<sweep>_<ts>/sweep_manifest.json
 #
-# Per-task resources (A100, 6 h) — sized for full 60k/10k FashionMNIST at
-# num_layers=2 (the 2-layer circuit roughly doubles per-patch cost vs L=1).
-# Bump --time or change --gres if your epochs/depth/fractions need more.
+# Per-task resources (A100, 8 h) — sized from the measured full-data
+# sweep_2026-06-11 runtimes: worst run (nm4, nh10, poly3) was ~53 min/epoch,
+# so 4 epochs at nm4 with nh15 lands around 4-4.5 h; 8 h gives ~2x headroom.
+# num_heads barely moves runtime (vmap absorbs it); num_modes dominates
+# (~x1.9 per extra mode). Bump --time if your epochs/modes/depth need more.
 # -----------------------------------------------------------------------
 #SBATCH --job-name=cv_quixer_sweep
 #SBATCH --output=slurm_logs/slurm-%x-%A_%a.out
 #SBATCH --error=slurm_logs/slurm-%x-%A_%a.err
-#SBATCH --time=06:00:00
+#SBATCH --time=08:00:00
 #SBATCH --gres=gpu:a100-40:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
