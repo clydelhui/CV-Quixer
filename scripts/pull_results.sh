@@ -101,7 +101,18 @@ fi
 # shellcheck disable=SC1090
 source "$CONFIG"
 : "${REMOTE:?set REMOTE=user@host in scripts/.pull_config}"
-REMOTE_ROOT="${REMOTE_ROOT:-~/CV-Quixer}"
+REMOTE_ROOT="${REMOTE_ROOT:-CV-Quixer}"   # relative to the REMOTE home by default
+# A `~` (or $HOME) in .pull_config expands on the LOCAL machine when sourced
+# (-> /Users/you/...), which the cluster has no such path for. Normalise a
+# local-home or literal-~ prefix back to a remote-home-relative path so the
+# remote shell resolves it. An explicit absolute remote path (/home/...) is
+# left untouched.
+case "$REMOTE_ROOT" in
+    "$HOME"/*) REMOTE_ROOT="${REMOTE_ROOT#"$HOME"/}" ;;   # /Users/you/CV-Quixer -> CV-Quixer
+    "$HOME")   REMOTE_ROOT="." ;;
+    "~/"*)     REMOTE_ROOT="${REMOTE_ROOT#"~/"}" ;;        # literal ~/CV-Quixer -> CV-Quixer
+    "~")       REMOTE_ROOT="." ;;
+esac
 
 # --- tier -> rsync filter rules ----------------------------------------
 # Inclusion tiers (figures, light) whitelist files: descend into every dir

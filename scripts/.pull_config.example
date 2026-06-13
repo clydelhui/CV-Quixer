@@ -4,10 +4,14 @@
 #   cp scripts/.pull_config.example scripts/.pull_config
 #
 # REMOTE       user@host of the cluster login node (required).
-# REMOTE_ROOT  path to the CV-Quixer checkout on the cluster
-#              (optional; default ~/CV-Quixer). The local repo layout is
-#              mirrored under it, so the same results/... path names a dir
-#              on both machines.
+# REMOTE_ROOT  path to the CV-Quixer checkout on the cluster, RELATIVE to your
+#              remote home (optional; default CV-Quixer). The local repo layout
+#              is mirrored under it, so the same results/... path names a dir on
+#              both machines.
+#              Do NOT write ~ or $HOME here — they expand on your LOCAL machine
+#              when this file is sourced, not on the cluster. Use a bare
+#              relative path (CV-Quixer) or an absolute remote path
+#              (/home/you/CV-Quixer). (The script normalises a stray ~ anyway.)
 
 REMOTE=user@login-node.example.edu
-REMOTE_ROOT=~/CV-Quixer
+REMOTE_ROOT=CV-Quixer
