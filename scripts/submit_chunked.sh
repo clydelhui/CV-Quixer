@@ -35,6 +35,14 @@
 #         sbatch scripts/submit_chunked.sh "$M" $((i*6)) 6 <n_runs> 4
 #     done
 #
+# Optional 6th arg = a --gres OVERRIDE forwarded to every chunk's
+# run_sweep.sh array (empty/omitted = run_sweep.sh's a100-40 default). Use it to
+# retarget bigger GPUs without editing run_sweep.sh — e.g. OOM-recovery reruns on
+# H200, chunk-sized to coexist with other already-queued jobs under MaxSubmitJobs:
+#     # 12 other tasks already queued -> keep this chain's peak (chunk+2) <= 20:
+#     sbatch scripts/submit_chunked.sh \
+#         results/sweeps/<sweep>_<ts>/resume_manifest_<ts>.json 0 16 28 1 gpu:h200-141:1
+#
 # afterany (not afterok) means the chain advances even when chunk tasks
 # fail or hit the wall — retry/top-up the casualties afterwards with
 # experiments/resume_sweep.py.
@@ -50,26 +58,33 @@
 
 set -euo pipefail
 
-MANIFEST="${1:?usage: sbatch scripts/submit_chunked.sh <sweep_manifest.json> <start> <chunk> <total> [window]}"
+MANIFEST="${1:?usage: sbatch scripts/submit_chunked.sh <sweep_manifest.json> <start> <chunk> <total> [window] [gres]}"
 START="${2:?missing <start> (first array index of this chunk, e.g. 0)}"
 CHUNK="${3:?missing <chunk> (chunk size; keep window*(chunk+1)+1 <= MaxSubmitJobs)}"
 TOTAL="${4:?missing <total> (n_runs from the manifest)}"
 WINDOW="${5:-1}"
+GRES="${6:-}"   # optional --gres override (e.g. gpu:h200-141:1); empty = run_sweep.sh default
 
 cd "$HOME/CV-Quixer"
 
 END=$(( START + CHUNK - 1 ))
 [ "$END" -ge "$TOTAL" ] && END=$(( TOTAL - 1 ))
 
-JOB_ID=$(sbatch --parsable --array="${START}-${END}" scripts/run_sweep.sh "$MANIFEST")
-echo "submitted chunk ${START}-${END} of 0-$(( TOTAL - 1 )) as job ${JOB_ID}  (window=${WINDOW}, $(date))"
+# ${GRES:+--gres=$GRES} expands to nothing when GRES is empty (preserving the
+# historic behaviour: run_sweep.sh's own #SBATCH --gres default applies) and to
+# a single --gres=... word otherwise (gres strings have no spaces). A CLI --gres
+# overrides the script directive, so this retargets every chunk's array.
+JOB_ID=$(sbatch --parsable ${GRES:+--gres="$GRES"} \
+    --array="${START}-${END}" scripts/run_sweep.sh "$MANIFEST")
+echo "submitted chunk ${START}-${END} of 0-$(( TOTAL - 1 )) as job ${JOB_ID}  (window=${WINDOW}, gres=${GRES:-<default>}, $(date))"
 
 # This chain's next chunk sits WINDOW chunk-widths ahead; the WINDOW-1
-# chunks in between belong to the other bootstrapped chains.
+# chunks in between belong to the other bootstrapped chains. GRES is forwarded
+# so every chunk in the chain inherits the same override.
 NEXT=$(( START + CHUNK * WINDOW ))
 if [ "$NEXT" -lt "$TOTAL" ]; then
     CHAIN_ID=$(sbatch --parsable --dependency="afterany:${JOB_ID}" \
-        scripts/submit_chunked.sh "$MANIFEST" "$NEXT" "$CHUNK" "$TOTAL" "$WINDOW")
+        scripts/submit_chunked.sh "$MANIFEST" "$NEXT" "$CHUNK" "$TOTAL" "$WINDOW" "$GRES")
     echo "chained next submitter (start=${NEXT}) as job ${CHAIN_ID}, fires after ${JOB_ID} drains"
 else
     echo "chain lane complete (next start ${NEXT} >= ${TOTAL})"
