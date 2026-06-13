@@ -314,9 +314,21 @@ to the `mini_experiment.py` invocation at the bottom.
 | `run_mini_experiment.sh` | `cv_quixer_mini` | `02:00:00` | `gpu:nv:1` / 16G / 4 | `mini_experiment.py` (200/50, 100 epochs) |
 | `run_full_experiment.sh` | `cv_quixer_full` | `03:00:00` | `gpu:a100-40:1` / 32G / 4 | `full_experiment.py --train-fraction 0.1 --test-fraction 0.1` (3 epochs on a 10% subset; edit the script to resume or change fractions) |
 | `run_eval_cutoff_sweep.sh` | `cv_quixer_eval` | `12:00:00` | `gpu:a100-40:1` / 32G / 4 | `eval_cutoff_sweep.py` — takes a checkpoint as `$1`, extra flags passed through |
-| `run_sweep.sh` | `cv_quixer_sweep` | `03:00:00` | `gpu:a100-40:1` / 32G / 4 | job ARRAY — takes a `sweep_manifest.json` as `$1`, runs the `full_experiment.py` entry for `$SLURM_ARRAY_TASK_ID` |
+| `run_sweep.sh` | `cv_quixer_sweep` | `08:00:00` | `gpu:a100-40:1` / 32G / 4 | job ARRAY — takes a `sweep_manifest.json` as `$1`, runs the `full_experiment.py` entry for `$SLURM_ARRAY_TASK_ID` |
 | `run_eval_cutoff_sweep_array.sh` | `cv_quixer_eval_all` | `12:00:00` | `gpu:a100-40:1` / 32G / 4 | job ARRAY — takes a `cutoff_sweep_manifest.json` as `$1`, runs the `eval_cutoff_sweep.py` entry for `$SLURM_ARRAY_TASK_ID` |
+| `run_report_array.sh` | `cv_quixer_report` | `04:00:00` | **CPU-only** / 16G / 4 | job ARRAY — takes a `<sweep_dir>` as `$1`, renders `report_diagnostics.py` for a round-robin stripe of the sweep's runs (stripe = `$SLURM_ARRAY_TASK_ID % $SLURM_ARRAY_TASK_COUNT`). No GPU → 0 GPU slots used |
+| `run_report_crossrun.sh` | `cv_quixer_report_crossrun` | `00:30:00` | **CPU-only** / 8G / 4 | takes a `<sweep_dir>` as `$1`, runs `report_sweep.py --skip-per-run-figures` (cross-run table + figures only). JSON-only, no GPU |
 | `triage_cuda.sh` | `cuda_triage` | — | `gpu:nv:1` | CUDA/GPU sanity diagnostics |
+
+`submit_report.sh` (login-node launcher, NOT sbatch'd — returns in seconds)
+chains both report jobs for one sweep: `bash scripts/submit_report.sh
+<sweep_dir> [array_spec] [-- diag args]` submits `run_report_array.sh`
+(`--array`, default `0-23`) then `run_report_crossrun.sh`
+(`--dependency=afterany`). Both report scripts are **CPU-only** so they cost
+nothing against the 8-GPU GRES limit, only against `MaxSubmitJobs=32`: one sweep
+at a time → `0-23` (25 queued); all three concurrently → `0-7` each (3×9=27).
+This is the cluster-side replacement for running `report_sweep.py` (which renders
+~one `report_diagnostics` subprocess per run, sequentially) on a laptop.
 
 ```bash
 # Full experiment (edit the script to resume / change fractions)
@@ -340,6 +352,16 @@ uv run python experiments/sweep.py \
 # <manifest>` (one array task per run). The CUDA venv is auto-built by the job.
 uv run python experiments/eval_cutoff_sweep_all.py \
     --sweep-dir results/sweeps/<sweep>_<ts>/ --launch slurm
+
+# Sweep reporting on the cluster (CPU-only, 0 GPU slots) — fan the per-run
+# report_diagnostics figures across a striped array + a chained cross-run table.
+# One command per sweep, returns in seconds:
+bash scripts/submit_report.sh results/sweeps/<sweep>_<ts>/            # default --array=0-23
+bash scripts/submit_report.sh results/sweeps/<sweep>_<ts>/ 0-7        # smaller array (run all 3 sweeps at once)
+bash scripts/submit_report.sh results/sweeps/<sweep>_<ts>/ 0-23 -- --epoch final  # forward args to report_diagnostics
+# Or the two jobs by hand (crossrun is JSON-only — submit standalone anytime for the table):
+sbatch --array=0-23 scripts/run_report_array.sh results/sweeps/<sweep>_<ts>/
+sbatch scripts/run_report_crossrun.sh results/sweeps/<sweep>_<ts>/
 ```
 
 All cluster scripts `source scripts/setup_cuda_env.sh` (after `cd
