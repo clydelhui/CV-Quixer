@@ -103,3 +103,18 @@ architecture knob — everything except the training seed. Cross-run reports
 seed-average only within one configuration identity; runs differing in it are
 never averaged together.
 _Avoid_: grid point (the manifest's view of it), run group.
+
+**Artefact tier**:
+A named, nested subset of a run's output artefacts, ordered by how much local
+disk it costs to pull from the cluster. The ladder is
+`figures` ⊂ `light` ⊂ `excl_train_ckpt` ⊂ `full`: `figures` is the derived
+outputs only (tables + every `.png`), `light` (the default pull) adds the small
+text/raw artefacts that drive local re-reporting (`config.json`, `history.json`,
+`subset_indices.npz`, `debug/`), `excl_train_ckpt` adds the evaluation-payload
+npz needed to re-derive test-side figures (test `predictions`, `diagnostics`,
+`test_images`) but not the *training payload*, and `full` is a complete mirror.
+The training payload — `checkpoints/` and the per-epoch `_train.npz` — is the
+heaviest artefact and is only needed to resume training or re-derive train-side
+figures, so it lands only in `full`.
+_Avoid_: artefact level (ambiguous with log levels), bundle (suggests a single
+archive — a tier is a filter over the live tree, not a tarball).

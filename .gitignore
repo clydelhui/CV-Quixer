@@ -4,6 +4,7 @@ plans/
 results/
 audits/
 tests/audit/
+scripts/.pull_config
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

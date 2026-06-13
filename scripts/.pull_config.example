@@ -1,0 +1,13 @@
+# Remote config for scripts/pull_results.sh.
+# Copy this file to scripts/.pull_config (gitignored) and fill in REMOTE.
+#
+#   cp scripts/.pull_config.example scripts/.pull_config
+#
+# REMOTE       user@host of the cluster login node (required).
+# REMOTE_ROOT  path to the CV-Quixer checkout on the cluster
+#              (optional; default ~/CV-Quixer). The local repo layout is
+#              mirrored under it, so the same results/... path names a dir
+#              on both machines.
+
+REMOTE=user@login-node.example.edu
+REMOTE_ROOT=~/CV-Quixer

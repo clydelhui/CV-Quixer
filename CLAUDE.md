@@ -441,6 +441,39 @@ squeue --me                          # check job status
 cat slurm_logs/slurm-cuda_triage-<JOBID>.out   # view triage output (logs → slurm_logs/)
 ```
 
+### Pulling results to local (`scripts/pull_results.sh`)
+
+The repo's only **local-side** script (every other `scripts/*.sh` runs on the
+cluster). A full sweep is ~23 GB, ~95% of which is raw npz dominated by the
+~94 MB/epoch `_train.npz`. Since `report_sweep.py` runs on the cluster and
+writes `summary.*` + `figures/` in-place, you usually only need the figures
+plus a little raw data locally. `pull_results.sh` rsyncs a chosen **artefact
+tier** (see CONTEXT.md "Artefact tier" + ADR-0005) of one or more repo-relative
+paths down to the identical local path. First-time setup:
+`cp scripts/.pull_config.example scripts/.pull_config` and set
+`REMOTE=user@host` (gitignored; `REMOTE_ROOT` defaults to `~/CV-Quixer`).
+
+```bash
+# default `light` pull (figures + tables + config/history/debug; ~3.5 MB/run):
+bash scripts/pull_results.sh results/sweeps/grid_quantum_<ts>/
+
+# also pull the raw eval npz to re-derive test-side figures locally (~25 MB/run):
+bash scripts/pull_results.sh results/sweeps/grid_quantum_<ts>/ --tier excl_train_ckpt
+
+# preview a complete mirror of one run (checkpoints + _train.npz):
+bash scripts/pull_results.sh results/runs/full_fashionmnist_<ts>/ --tier full --dry-run
+
+# reclaim disk: drop a sweep back to `light`, deleting the heavy npz it pulled:
+bash scripts/pull_results.sh results/sweeps/grid_quantum_<ts>/ --tier light --prune
+```
+
+Tiers (each a superset of the previous): `figures` ⊂ `light` (default) ⊂
+`excl_train_ckpt` ⊂ `full`. The pull is **additive** (never `rsync --delete`),
+so re-pulling at a lower tier keeps what you already have; `--prune` is the only
+deletion path and removes only the heavy artefacts in tiers *above* `--tier`
+(by an explicit whitelist — never figures/tables/config), prompting unless
+`--yes`. `--dry-run` previews both transfer and prune.
+
 ## Package structure
 
 ```
@@ -497,6 +530,7 @@ scripts/
 ├── run_eval_cutoff_sweep_array.sh SLURM job ARRAY for eval_cutoff_sweep_all manifests (A100, one task/run)
 ├── run_sweep.sh                  SLURM job ARRAY for sweep.py manifests (A100, one task/run)
 ├── triage_cuda.sh                SLURM GPU/CUDA diagnostic job
+├── pull_results.sh               LOCAL-side: tiered, additive rsync of run/sweep artefacts FROM the cluster (see below)
 └── debug_imports.py              Sequential import diagnostics with tracebacks
 
 configs/                 LEGACY — not loaded by any current experiment script.
