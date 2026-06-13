@@ -146,7 +146,12 @@ rsync_filters() {
     esac
 }
 
-RSYNC_OPTS=(-a -P --info=progress2)   # no -z: png/npz already compressed
+# -P = --partial --progress: resumable + per-file progress, supported by both
+# GNU rsync and macOS's openrsync. --info=progress2 (one aggregate bar) is a
+# GNU rsync >= 3.1 flag absent from openrsync / old rsync, so add it only when
+# this rsync advertises it (else it errors out: "unrecognized option").
+RSYNC_OPTS=(-a -P)                    # no -z: png/npz already compressed
+if rsync --help 2>&1 | grep -q 'info='; then RSYNC_OPTS+=(--info=progress2); fi
 [ "$DRY_RUN" -eq 1 ] && RSYNC_OPTS+=(--dry-run)
 # read into array via a loop (not `mapfile` — absent on macOS's bash 3.2)
 FILTERS=()
