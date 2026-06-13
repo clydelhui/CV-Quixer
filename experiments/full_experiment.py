@@ -92,6 +92,7 @@ from cv_quixer.utils.debug_nan import (
     init_fingerprint,
     nonfinite_heads,
 )
+from cv_quixer.utils.debug_oom import build_oom_record, dump_oom_event
 from cv_quixer.utils.logging import finish_logging, init_logging, log_metrics
 
 # ---------------------------------------------------------------------------
@@ -978,62 +979,72 @@ def train_epoch(epoch: int) -> tuple[float, float, float]:
     model.train()
     total_trunc, total_cvqnn_trunc, total_query_trunc, total = 0.0, 0.0, 0.0, 0
     _logged_first_batch_mem = False
-    for patches, labels in tqdm(
+    for batch_index, (patches, labels) in enumerate(tqdm(
         train_loader, desc=f"Epoch {epoch:>3}/{EPOCHS}", leave=False, unit="batch"
-    ):
+    )):
         patches, labels = patches.to(device), labels.to(device)
         optimizer.zero_grad()
-        loss, ce_loss, query_trunc_loss, out = _batch_loss(patches, labels)
-        logits, trunc_loss = out.logits, out.trunc_loss
-        cvqnn_trunc_loss = out.cvqnn_trunc_loss
-        loss.backward()
+        # --- Catchable CUDA OOM (see cv_quixer/utils/debug_oom.py): the train
+        # step holds the peak footprint (forward + autograd graph + step), so
+        # this is where the heavy Fock-sim grid corners blow the GPU budget.
+        # Record into the run dir, then re-raise (ADR-0004: fail loudly). ---
+        try:
+            loss, ce_loss, query_trunc_loss, out = _batch_loss(patches, labels)
+            logits, trunc_loss = out.logits, out.trunc_loss
+            cvqnn_trunc_loss = out.cvqnn_trunc_loss
+            loss.backward()
 
-        grad_norm = _grad_l2_norm(model.parameters())
+            grad_norm = _grad_l2_norm(model.parameters())
 
-        # --- NaN forensics: detect BEFORE optimizer.step() so an event dump
-        # captures the last finite params + the first non-finite grads. ---
-        group_norms = grad_group_norms(grad_groups)
-        record = _collect_debug_record(
-            out, group_norms,
-            {
-                "step": global_step + 1,
-                "epoch": epoch,
-                "total_loss": float(loss.item()),
-                "grad_norm": float(grad_norm),
-            },
-        )
-        num_heads = int(getattr(quantum_cfg, "num_heads", 0))
-        bad_heads = nonfinite_heads(record, num_heads)
-        all_finite = math.isfinite(record["total_loss"]) and math.isfinite(
-            record["grad_norm"]
-        )
-        new_dead = bad_heads - nan_watch["dead_heads"]
-        new_global = (not all_finite) and not bad_heads \
-            and not nan_watch["global_event"]
-        if new_dead or new_global:
-            nan_watch["last_event_epoch"] = epoch
-            nan_watch["dead_heads"] |= new_dead
-            nan_watch["global_event"] = nan_watch["global_event"] or new_global
-            if nan_watch["n_dumps"] < MAX_EVENT_DUMPS:
-                _handle_nan_event(
-                    new_dead, patches, labels, record,
-                    step=global_step + 1, epoch=epoch,
-                )
-                # The anomaly replay left the grads in an undefined state;
-                # recompute them so the step matches the natural trajectory.
-                optimizer.zero_grad()
-                replay_loss, _, _, _ = _batch_loss(patches, labels)
-                replay_loss.backward()
-                debug_stream.save()   # persist the stream up to the event
-        # npz stream wants homogeneous arrays: vectorise the grad-group dict
-        # in the writer's canonical group order.
-        stream_record = {k: v for k, v in record.items() if k != "grad_groups"}
-        stream_record["grad_group_norms"] = np.array(
-            [group_norms[n] for n in grad_group_names], dtype=np.float64
-        )
-        debug_stream.append(stream_record)
+            # --- NaN forensics: detect BEFORE optimizer.step() so an event dump
+            # captures the last finite params + the first non-finite grads. ---
+            group_norms = grad_group_norms(grad_groups)
+            record = _collect_debug_record(
+                out, group_norms,
+                {
+                    "step": global_step + 1,
+                    "epoch": epoch,
+                    "total_loss": float(loss.item()),
+                    "grad_norm": float(grad_norm),
+                },
+            )
+            num_heads = int(getattr(quantum_cfg, "num_heads", 0))
+            bad_heads = nonfinite_heads(record, num_heads)
+            all_finite = math.isfinite(record["total_loss"]) and math.isfinite(
+                record["grad_norm"]
+            )
+            new_dead = bad_heads - nan_watch["dead_heads"]
+            new_global = (not all_finite) and not bad_heads \
+                and not nan_watch["global_event"]
+            if new_dead or new_global:
+                nan_watch["last_event_epoch"] = epoch
+                nan_watch["dead_heads"] |= new_dead
+                nan_watch["global_event"] = nan_watch["global_event"] or new_global
+                if nan_watch["n_dumps"] < MAX_EVENT_DUMPS:
+                    _handle_nan_event(
+                        new_dead, patches, labels, record,
+                        step=global_step + 1, epoch=epoch,
+                    )
+                    # The anomaly replay left the grads in an undefined state;
+                    # recompute them so the step matches the natural trajectory.
+                    optimizer.zero_grad()
+                    replay_loss, _, _, _ = _batch_loss(patches, labels)
+                    replay_loss.backward()
+                    debug_stream.save()   # persist the stream up to the event
+            # npz stream wants homogeneous arrays: vectorise the grad-group dict
+            # in the writer's canonical group order.
+            stream_record = {k: v for k, v in record.items() if k != "grad_groups"}
+            stream_record["grad_group_norms"] = np.array(
+                [group_norms[n] for n in grad_group_names], dtype=np.float64
+            )
+            debug_stream.append(stream_record)
 
-        optimizer.step()
+            optimizer.step()
+        except torch.cuda.OutOfMemoryError as exc:
+            _handle_oom_event(
+                exc, epoch=epoch, step=global_step + 1, batch_index=batch_index,
+            )
+            raise
 
         # Early OOM-headroom signal: the steady-state footprint (fwd+bwd+step)
         # is reached on the first batch. Print it once to stdout (the tee'd
@@ -1076,6 +1087,35 @@ def train_epoch(epoch: int) -> tuple[float, float, float]:
 def save_history() -> None:
     with open(run_dir / "history.json", "w") as f:
         json.dump(history, f, indent=2)
+
+
+def _handle_oom_event(exc, *, epoch: int, step: int, batch_index: int) -> None:
+    """Record a caught CUDA OOM into the run dir; the caller then re-raises.
+
+    Mirrors the NaN-abort marker (``debug/aborted_nan.json`` +
+    ``history["meta"]["nan_aborted"]``) for the *catchable* OOM path: writes
+    ``debug/oom_event.json`` and copies the same dict into
+    ``history["meta"]["oom_aborted"]`` before persisting. Per ADR-0004 this
+    only logs — it never swallows the OOM or continues; the caller re-raises so
+    the process exits non-zero and the original CUDA traceback still reaches the
+    SLURM ``.err``. The grid corner is read straight from ``history["meta"]``
+    (already populated above), so the record self-describes which Fock-sim
+    corner blew the 40 GB budget (see the grid-sweep-oom post-mortem).
+    """
+    record = build_oom_record(
+        exc, epoch=epoch, step=step, batch_index=batch_index,
+        device=device, meta=history["meta"],
+    )
+    dump_oom_event(debug_dir, record)
+    history["meta"]["oom_aborted"] = record
+    save_history()
+    peak = record.get("peak_mem_mb")
+    peak_str = f"{peak:,.0f} MB" if peak is not None else "n/a"
+    print(
+        f"\n[OOM abort] CUDA out-of-memory at epoch {epoch} batch "
+        f"{batch_index} (peak {peak_str}). Record written to "
+        f"{debug_dir}/oom_event.json — re-raising."
+    )
 
 
 # ---------------------------------------------------------------------------
