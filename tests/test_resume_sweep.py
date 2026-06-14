@@ -12,6 +12,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 # resume_sweep lives in experiments/ (not a package); import it the same way
 # the other experiment-script tests do — via sys.path.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "experiments"))
@@ -23,8 +25,10 @@ def make_sweep(tmp_path, runs):
     """Write a synthetic sweep dir: sweep_manifest.json + per-run dirs.
 
     ``runs`` is a list of dicts: ``run_name``, ``args`` (original argv), and
-    optionally ``n_epochs`` (history.json epoch count; None = no history.json)
-    and ``ckpt`` (whether checkpoints/latest.pt exists).
+    optionally ``n_epochs`` (history.json epoch count; None = no history.json),
+    ``ckpt`` (whether checkpoints/latest.pt exists), and ``config`` (a dict
+    written as config.json — e.g. {"quantum": {...}} — for coordinate-filter
+    tests; omitted = no config.json, as for a never-started run).
     """
     sweep_dir = tmp_path / "sweep_test_2026-01-01_00-00-00"
     sweep_dir.mkdir()
@@ -56,6 +60,9 @@ def make_sweep(tmp_path, runs):
             ckpt_dir = run_dir / "checkpoints"
             ckpt_dir.mkdir()
             (ckpt_dir / "latest.pt").write_bytes(b"fake")
+        if r.get("config") is not None:
+            with open(run_dir / "config.json", "w") as f:
+                json.dump(r["config"], f)
     return sweep_dir, manifest
 
 
@@ -227,6 +234,113 @@ def test_main_dry_run_writes_manifest_and_preserves_original(
                  "p13760__obs-x__seed42"):
         assert name in out
     assert "resume" in out  # planned action shown per run
+
+
+def _config(num_modes, num_heads, seed=42):
+    return {
+        "model": "quantum",
+        "quantum": {"num_modes": num_modes, "num_heads": num_heads},
+        "training": {"seed": seed},
+    }
+
+
+def _filter_sweep(tmp_path):
+    """Three runs with config.json: (nm2,nh5), (nm3,nh10), (nm4,nh5)."""
+    specs = [("a", 2, 5), ("b", 3, 10), ("c", 4, 5)]
+    runs = []
+    for name, nm, nh in specs:
+        args = list(BASE_ARGS)
+        args[args.index("--run-name") + 1] = name
+        runs.append({"run_name": name, "args": args, "n_epochs": 3, "ckpt": True,
+                     "config": _config(nm, nh)})
+    return make_sweep(tmp_path, runs)
+
+
+def test_coordinate_filter_selects_matching_runs(tmp_path):
+    """A coordinate filter keeps only runs whose config.json matches: OR within a
+    field, AND across fields. a=(nm2,nh5) and b=(nm3,nh10) both satisfy
+    nm in {2,3} AND nh in {5,10}; c=(nm4,nh5) fails on num_modes."""
+    sweep_dir, _ = _filter_sweep(tmp_path)
+    manifest = resume_sweep.build_manifest(
+        sweep_dir, target_epochs=6,
+        filters={"num_modes": {2, 3}, "num_heads": {5, 10}},
+    )
+    assert [r["run_name"] for r in manifest["runs"]] == ["a", "b"]
+    # The applied filter is recorded (sets -> sorted lists) for provenance.
+    assert manifest["filters"] == {"num_modes": [2, 3], "num_heads": [5, 10]}
+
+
+def test_coordinate_filter_or_within_field(tmp_path):
+    sweep_dir, _ = _filter_sweep(tmp_path)
+    manifest = resume_sweep.build_manifest(
+        sweep_dir, target_epochs=6, filters={"num_modes": {2, 4}},
+    )
+    assert [r["run_name"] for r in manifest["runs"]] == ["a", "c"]
+
+
+def test_coordinate_filter_ands_with_runs_pattern(tmp_path):
+    """--runs fnmatch and the coordinate filter are AND'd together."""
+    sweep_dir, _ = _filter_sweep(tmp_path)
+    manifest = resume_sweep.build_manifest(
+        sweep_dir, target_epochs=6, patterns=["a", "b"],
+        filters={"num_heads": {5}},
+    )
+    assert [r["run_name"] for r in manifest["runs"]] == ["a"]  # b is nh10
+
+
+def test_filter_prefers_config_over_args_for_autoscaled_knob(tmp_path):
+    """config.json (resolved) overrides args: a budget run whose args omit
+    num_heads but whose config resolved it to 5 matches a num_heads filter."""
+    args = list(BASE_ARGS)
+    args[args.index("--run-name") + 1] = "p8000"
+    # args carry no --num-heads (budget mode auto-scales it); config has nh=5.
+    sweep_dir, _ = make_sweep(tmp_path, [
+        {"run_name": "p8000", "args": args, "n_epochs": 3, "ckpt": True,
+         "config": _config(2, 5)},
+    ])
+    manifest = resume_sweep.build_manifest(
+        sweep_dir, target_epochs=6, filters={"num_heads": {5}},
+    )
+    assert [r["run_name"] for r in manifest["runs"]] == ["p8000"]
+
+
+def test_filter_on_neverstarted_run_falls_back_to_args(tmp_path):
+    """A run with no config.json (died before epoch 1) is still matchable on a
+    coordinate present in its replayed args."""
+    args = list(BASE_ARGS) + ["--num-modes", "3"]
+    args[args.index("--run-name") + 1] = "fresh"
+    sweep_dir, _ = make_sweep(tmp_path, [
+        {"run_name": "fresh", "args": args, "n_epochs": None, "ckpt": False},
+    ])
+    manifest = resume_sweep.build_manifest(
+        sweep_dir, target_epochs=6, filters={"num_modes": {3}},
+    )
+    (entry,) = manifest["runs"]
+    assert entry["run_name"] == "fresh" and entry["action"] == "fresh"
+
+
+def test_filter_on_unresolvable_coordinate_excludes_with_warning(tmp_path):
+    """A never-started run (no config.json) filtered on a coordinate absent from
+    its args (an auto-scaled knob) is unresolvable -> excluded with a warning."""
+    args = list(BASE_ARGS)  # no --num-heads, no config.json
+    args[args.index("--run-name") + 1] = "fresh"
+    sweep_dir, _ = make_sweep(tmp_path, [
+        {"run_name": "fresh", "args": args, "n_epochs": None, "ckpt": False},
+    ])
+    with pytest.warns(RuntimeWarning, match="num_heads"):
+        manifest = resume_sweep.build_manifest(
+            sweep_dir, target_epochs=6, filters={"num_heads": {5}},
+        )
+    assert manifest["runs"] == []
+
+
+def test_no_filter_is_a_noop(tmp_path):
+    """Empty/omitted filter selects exactly what the unfiltered plan would."""
+    sweep_dir, _ = _filter_sweep(tmp_path)
+    a = resume_sweep.build_manifest(sweep_dir, target_epochs=6)
+    b = resume_sweep.build_manifest(sweep_dir, target_epochs=6, filters={})
+    assert ([r["run_name"] for r in a["runs"]]
+            == [r["run_name"] for r in b["runs"]] == ["a", "b", "c"])
 
 
 def test_slurm_command_uses_run_sweep_sh_unchanged(tmp_path):

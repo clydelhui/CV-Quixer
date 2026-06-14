@@ -118,6 +118,15 @@ seed-average only within one configuration identity; runs differing in it are
 never averaged together.
 _Avoid_: grid point (the manifest's view of it), run group.
 
+**Coordinate filter**:
+A selection of runs by matching a subset of their configuration coordinates
+against allowed value sets — within one coordinate the allowed values are OR'd,
+across coordinates they are AND'd (e.g. `num_modes ∈ {2,3}` *and*
+`num_heads ∈ {5,10}`). Shared by the top-up and reporting tools so the same
+filter selects the same runs in both; a run whose value for a filtered
+coordinate is absent or unresolvable is excluded with a warning, never matched.
+_Avoid_: subset filter, run mask, query.
+
 **All-else-equal trend line**:
 In an accuracy-versus-one-coordinate figure, the set of configurations that agree
 on every *independent* sweep coordinate except the one on the x-axis — the runs

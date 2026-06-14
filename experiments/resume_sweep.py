@@ -38,6 +38,13 @@ Top up a subset to 6 total epochs as a SLURM array::
     uv run python experiments/resume_sweep.py \\
         --sweep-dir results/sweeps/<sweep>_<ts>/ --epochs 6 \\
         --runs 'p8000__*' --launch slurm
+
+Top up a coordinate-filtered subset (num_modes in {2,3} AND num_heads in {5,10});
+see _run_selection / CONTEXT.md "Coordinate filter"::
+
+    uv run python experiments/resume_sweep.py \\
+        --sweep-dir results/sweeps/<sweep>_<ts>/ --epochs 6 \\
+        --num-modes 2 3 --num-heads 5 10 --dry-run
 """
 
 from __future__ import annotations
@@ -50,6 +57,13 @@ from fnmatch import fnmatch
 from pathlib import Path
 
 from _orchestration import launch_local, submit_slurm_array
+from _run_selection import (
+    add_filter_args,
+    coords_from_args,
+    coords_from_config_json,
+    parse_filter_args,
+    run_matches,
+)
 
 from cv_quixer.provenance import invocation_record
 
@@ -84,13 +98,38 @@ def rewrite_run_args(
     return out
 
 
+def _run_coords(run_dir: Path, args: list[str]) -> dict:
+    """Resolve a run's filterable coordinates (see _run_selection / ADR-0006).
+
+    Start from the always-present replayed argv, then overlay the resolved
+    ``config.json`` when it exists — config wins because it carries auto-scaled
+    knobs (e.g. a binary-searched ``num_heads``) that the argv does not. A run
+    that died before writing ``config.json`` falls back to args only.
+    """
+    coords = coords_from_args(args)
+    config_path = run_dir / "config.json"
+    if config_path.is_file():
+        try:
+            with open(config_path) as f:
+                coords.update(coords_from_config_json(json.load(f)))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return coords
+
+
 def build_manifest(
-    sweep_dir: Path, target_epochs: int, patterns: list[str] | None = None
+    sweep_dir: Path,
+    target_epochs: int,
+    patterns: list[str] | None = None,
+    filters: dict[str, set] | None = None,
 ) -> dict:
     """Plan the top-up for the selected runs in the sweep's manifest.
 
-    ``patterns`` (fnmatch on run_name, any-match) narrows selection; None = all.
+    ``patterns`` (fnmatch on run_name, any-match) and ``filters`` (coordinate
+    filter, see _run_selection.run_matches) both narrow selection and are AND'd
+    together; None/empty means no narrowing on that axis.
     """
+    filters = filters or {}
     with open(sweep_dir / "sweep_manifest.json") as f:
         source = json.load(f)
 
@@ -99,6 +138,11 @@ def build_manifest(
     for run in source["runs"]:
         if patterns is not None and not any(
             fnmatch(run["run_name"], p) for p in patterns
+        ):
+            continue
+        if filters and not run_matches(
+            _run_coords(sweep_dir / run["run_name"], run["args"]),
+            filters, run_name=run["run_name"],
         ):
             continue
         run_dir = sweep_dir / run["run_name"]
@@ -126,6 +170,8 @@ def build_manifest(
         "source_manifest": str(sweep_dir / "sweep_manifest.json"),
         "target_epochs": target_epochs,
         "patterns": list(patterns) if patterns is not None else None,
+        # Coordinate filter applied (sets -> sorted lists for JSON); {} = none.
+        "filters": {k: sorted(v) for k, v in filters.items()},
         "n_runs": len(entries),
         "runs": entries,
         "skipped": skipped,
@@ -147,6 +193,7 @@ def main() -> None:
                         metavar="PATTERN",
                         help="fnmatch pattern(s) on run_name to select a "
                              "subset (default: all runs in the manifest)")
+    add_filter_args(parser)
     parser.add_argument("--launch", choices=["local", "slurm", "none"],
                         default="none",
                         help="local: run sequentially here; slurm: submit a "
@@ -160,7 +207,9 @@ def main() -> None:
     if not (args.sweep_dir / "sweep_manifest.json").is_file():
         parser.error(f"no sweep_manifest.json under {args.sweep_dir}")
 
-    manifest = build_manifest(args.sweep_dir, args.epochs, args.runs)
+    manifest = build_manifest(
+        args.sweep_dir, args.epochs, args.runs, parse_filter_args(args)
+    )
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     manifest_path = args.sweep_dir / f"resume_manifest_{timestamp}.json"
@@ -176,7 +225,9 @@ def main() -> None:
         print(f"    [-] {run['run_name']}: "
               f"skip (already at {run['current_epochs']} >= {args.epochs})")
     if not manifest["runs"]:
-        print("Nothing to do — every selected run is already at the target.")
+        print("Nothing to do — no run matched the selection (--runs / "
+              "coordinate filters), or every selected run is already at the "
+              "target.")
         return
 
     launch = "none" if args.dry_run else args.launch
