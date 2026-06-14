@@ -142,3 +142,34 @@ def test_registry_is_superset_of_sweep_arch_axes():
     arch_dests = {dest for dest, *_ in sweep.ARCH_AXES}
     registry = {f.name for f in rs.FILTERABLE_FIELDS}
     assert arch_dests <= registry, arch_dests - registry
+
+
+# --- coords_from_meta (report_sweep's extraction source, ADR-0006) -----------
+
+def test_meta_extracts_resolved_coords():
+    meta = {"num_modes": 2, "num_heads": 7, "model": "quantum",
+            "observables_name": "xpxsps"}
+    coords = rs.coords_from_meta(meta)
+    assert coords["num_modes"] == 2
+    assert coords["num_heads"] == 7
+    assert coords["model"] == "quantum"
+    assert coords["observables"] == "xpxsps"
+
+
+def test_meta_reads_observables_from_either_key():
+    # report_sweep's row uses "observables"; raw history meta uses "observables_name".
+    assert rs.coords_from_meta({"observables": "pnr"})["observables"] == "pnr"
+    assert rs.coords_from_meta({"observables_name": "pnr"})["observables"] == "pnr"
+
+
+def test_meta_omits_none_so_filter_reports_unresolved():
+    # An old run whose meta lacks/None's a field must stay out of coords, so a
+    # filter on it warn-excludes rather than matching None.
+    coords = rs.coords_from_meta({"num_modes": 2, "decoder_hidden_mult": None})
+    assert "decoder_hidden_mult" not in coords
+    assert "num_seq2seq_blocks" not in coords
+
+
+def test_meta_normalizes_block_residual_bool_to_string():
+    assert rs.coords_from_meta({"block_residual": True})["block_residual"] == "on"
+    assert rs.coords_from_meta({"block_residual": False})["block_residual"] == "off"

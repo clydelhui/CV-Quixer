@@ -46,8 +46,21 @@ the full `report_diagnostics.py` figure suite into each run's own `figures/` dir
 heavy torch imports stay deferred). Pass --skip-per-run-figures for the fast
 cross-run-only pass.
 
+A *coordinate filter* (CONTEXT.md) restricts the tables + cross-run figures to a
+subset of runs by configuration value — ``--num-modes 2 3 --num-heads 5 10`` keeps
+runs with ``num_modes ∈ {2,3}`` *and* ``num_heads ∈ {5,10}`` (OR within a flag,
+AND across; same flags + semantics as experiments/resume_sweep.py, shared via
+experiments/_run_selection.py). A run missing a filtered coordinate is excluded
+with a warning. When a filter is active and ``--out-dir`` is omitted, output
+defaults to ``<sweep>/subsets/<filter-slug>/`` so the full-sweep artefacts at the
+sweep root are left intact.
+
 Usage:
     uv run python experiments/report_sweep.py --sweep-dir results/sweeps/<sweep>_<ts>/
+
+    # only the num_modes∈{2,3} runs → results/sweeps/<sweep>_<ts>/subsets/num_modes-2-3/
+    uv run python experiments/report_sweep.py --sweep-dir results/sweeps/<sweep>_<ts>/ \
+        --num-modes 2 3
 """
 
 from __future__ import annotations
@@ -69,6 +82,14 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+
+from _run_selection import (
+    FILTERABLE_FIELDS,
+    add_filter_args,
+    coords_from_meta,
+    parse_filter_args,
+    run_matches,
+)
 
 # Repo root (experiments/ -> repo root); used to invoke report_diagnostics.py.
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -228,9 +249,15 @@ def read_exclude_file(path: Path) -> set[str]:
 
 
 def load_sweep(sweep_dir: Path, max_epoch: int | None = None) -> list[dict]:
-    """Load every run row under `sweep_dir`, sorted for stable output."""
+    """Load every run row under `sweep_dir`, sorted for stable output.
+
+    The ``subsets/`` directory (where coordinate-filtered runs write their own
+    tables + figures) is skipped — it is this tool's own output, never a run.
+    """
     rows: list[dict] = []
     for run_dir in sorted(p for p in sweep_dir.iterdir() if p.is_dir()):
+        if run_dir.name == "subsets":
+            continue
         row = _load_run(run_dir, max_epoch=max_epoch)
         if row is not None:
             rows.append(row)
@@ -742,6 +769,23 @@ def render_per_run_figures(sweep_dir: Path, rows: list[dict]) -> None:
             )
 
 
+def _filter_slug(filters: dict[str, set]) -> str:
+    """Filesystem-safe directory name encoding an active coordinate filter.
+
+    Fields appear in registry order (deterministic regardless of flag order),
+    each as ``{field}-{v1}-{v2}…`` with values sorted, joined by ``__`` — e.g.
+    ``{num_modes: {3, 2}, num_heads: {5, 10}}`` → ``num_modes-2-3__num_heads-5-10``.
+    Used to default a filtered run's output under ``<sweep>/subsets/<slug>/`` so it
+    never clobbers the full-sweep artefacts.
+    """
+    parts = []
+    for field in FILTERABLE_FIELDS:
+        if field.name in filters:
+            vals = "-".join(str(v) for v in sorted(filters[field.name]))
+            parts.append(f"{field.name}-{vals}")
+    return "__".join(parts)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -782,8 +826,11 @@ def main() -> None:
     parser.add_argument(
         "--out-dir", type=str, default=None, metavar="DIR",
         help="write tables + cross-run figures here instead of into the sweep "
-             "dir (use with --exclude-* to keep the full-set artefacts intact)",
+             "dir (use with --exclude-* / coordinate filters to keep the "
+             "full-set artefacts intact). When a coordinate filter is active and "
+             "this is omitted, output defaults to <sweep>/subsets/<filter-slug>/",
     )
+    add_filter_args(parser)
     args = parser.parse_args()
 
     # Line-buffer stdout so progress streams live even when piped / redirected /
@@ -799,6 +846,25 @@ def main() -> None:
     if not rows:
         print(f"No runs found under {sweep_dir} (need per-run history.json).")
         return
+
+    # Coordinate filter (CONTEXT.md): keep only runs whose resolved coordinates
+    # match. Applied before the name exclusions so the two compose (AND). Each
+    # run's coordinates come from history["meta"] via its row (ADR-0006: no
+    # config.json re-read on this side); a run missing a filtered coordinate is
+    # excluded with a warning by run_matches.
+    filters = parse_filter_args(args)
+    if filters:
+        before = len(rows)
+        rows = [
+            r for r in rows
+            if run_matches(coords_from_meta(r), filters, run_name=r["run_name"])
+        ]
+        spec = ", ".join(f"{k}∈{{{', '.join(map(str, sorted(v)))}}}"
+                         for k, v in filters.items())
+        print(f"Coordinate filter kept {len(rows)}/{before} run(s): {spec}")
+        if not rows:
+            print("No runs match the coordinate filter — nothing to plot.")
+            return
 
     excluded: set[str] = set(args.exclude_run)
     for fpath in args.exclude_file:
@@ -824,7 +890,16 @@ def main() -> None:
             print("All runs excluded — nothing to plot.")
             return
 
-    out_dir = Path(args.out_dir) if args.out_dir else sweep_dir
+    if args.out_dir:
+        out_dir = Path(args.out_dir)
+    elif filters:
+        # Default a filtered run under subsets/<slug> so the full-sweep tables +
+        # figures at the sweep root are never overwritten (override with --out-dir).
+        out_dir = sweep_dir / "subsets" / _filter_slug(filters)
+        print(f"Writing filtered artefacts to {out_dir} "
+              "(full-sweep artefacts untouched; override with --out-dir)")
+    else:
+        out_dir = sweep_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Aggregating {len(rows)} run(s) under {sweep_dir}")

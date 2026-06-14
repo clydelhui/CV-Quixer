@@ -547,3 +547,119 @@ def test_compare_inherits_max_epoch_and_heterogeneity_guard(
     by_label = {r["sweep_label"]: r for r in rows}
     assert float(by_label["b"]["best_test_acc"]) == pytest.approx(0.6)
     assert by_label["b"]["n_epochs"] == "2"
+
+
+# ---------------------------------------------------------------------------
+# Coordinate filter (CONTEXT.md; ADR-0006) — subset figures/tables
+# ---------------------------------------------------------------------------
+
+
+def _summary_run_names(csv_path):
+    with open(csv_path) as f:
+        return {row["run_name"] for row in csv.DictReader(f)}
+
+
+def test_coordinate_filter_subset_dir_and_rows(tmp_path, monkeypatch):
+    """A coordinate filter writes to subsets/<slug> with only the matching runs,
+    leaving the full-sweep root untouched."""
+    sweep = tmp_path / "sweep"
+    for nm in (2, 3, 4):
+        make_run(sweep, f"manual__obs-xpxsps__seed42__nm{nm}", num_modes=nm)
+    run_report_sweep(sweep, monkeypatch, "--num-modes", "2", "3")
+    sub = sweep / "subsets" / "num_modes-2-3"
+    assert sub.is_dir()
+    assert _summary_run_names(sub / "summary.csv") == {
+        "manual__obs-xpxsps__seed42__nm2", "manual__obs-xpxsps__seed42__nm3",
+    }
+    # Full-sweep artefacts at the root are never written by a filtered run.
+    assert not (sweep / "summary.csv").exists()
+
+
+def test_coordinate_filter_and_across_flags(tmp_path, monkeypatch):
+    sweep = tmp_path / "sweep"
+    for nm in (2, 3):
+        for nh in (4, 8):
+            make_run(sweep, f"m__seed42__nm{nm}__nh{nh}", num_modes=nm, num_heads=nh)
+    run_report_sweep(sweep, monkeypatch, "--num-modes", "2", "3", "--num-heads", "8")
+    sub = sweep / "subsets" / "num_modes-2-3__num_heads-8"
+    assert _summary_run_names(sub / "summary.csv") == {
+        "m__seed42__nm2__nh8", "m__seed42__nm3__nh8",
+    }
+
+
+def test_coordinate_filter_normalizes_block_residual(tmp_path, monkeypatch):
+    sweep = tmp_path / "sweep"
+    make_run(sweep, "on__seed42", block_residual=True)
+    make_run(sweep, "off__seed42", block_residual=False)
+    run_report_sweep(sweep, monkeypatch, "--block-residual", "off")
+    sub = sweep / "subsets" / "block_residual-off"
+    assert _summary_run_names(sub / "summary.csv") == {"off__seed42"}
+
+
+def test_coordinate_filter_absent_field_warns_and_excludes(tmp_path, monkeypatch):
+    sweep = tmp_path / "sweep"
+    make_run(sweep, "has__seed42", num_seq2seq_blocks=1)
+    make_run(sweep, "lacks__seed42", num_seq2seq_blocks=None)
+    with pytest.warns(RuntimeWarning, match="num_seq2seq_blocks"):
+        run_report_sweep(sweep, monkeypatch, "--num-seq2seq-blocks", "1")
+    sub = sweep / "subsets" / "num_seq2seq_blocks-1"
+    assert _summary_run_names(sub / "summary.csv") == {"has__seed42"}
+
+
+def test_coordinate_filter_out_dir_override(tmp_path, monkeypatch):
+    sweep = tmp_path / "sweep"
+    make_run(sweep, "a__seed42", num_modes=2)
+    make_run(sweep, "b__seed42", num_modes=3)
+    out = tmp_path / "custom"
+    run_report_sweep(sweep, monkeypatch, "--num-modes", "2", "--out-dir", str(out))
+    assert _summary_run_names(out / "summary.csv") == {"a__seed42"}
+    assert not (sweep / "subsets").exists()
+
+
+def test_coordinate_filter_composes_with_exclude(tmp_path, monkeypatch):
+    sweep = tmp_path / "sweep"
+    for nm in (2, 3):
+        for seed in (42, 43):
+            make_run(sweep, f"m__seed{seed}__nm{nm}", num_modes=nm, seed=seed)
+    run_report_sweep(
+        sweep, monkeypatch, "--num-modes", "2", "3",
+        "--exclude-run", "m__seed43__nm3", "--out-dir", str(tmp_path / "o"),
+    )
+    names = _summary_run_names(tmp_path / "o" / "summary.csv")
+    assert names == {"m__seed42__nm2", "m__seed43__nm2", "m__seed42__nm3"}
+
+
+def test_no_filter_writes_to_sweep_root(tmp_path, monkeypatch):
+    sweep = tmp_path / "sweep"
+    make_run(sweep, "manual__obs-xpxsps__seed42", seed=42)
+    make_run(sweep, "manual__obs-xpxsps__seed43", seed=43)
+    run_report_sweep(sweep, monkeypatch)
+    assert (sweep / "summary.csv").is_file()
+    assert not (sweep / "subsets").exists()
+
+
+def test_registry_consistent_with_identity_fields():
+    """Drift guard for the 'keep literals' decision: every filterable coordinate
+    must be a report_sweep configuration-identity field (plus seed, which the
+    identity set excludes by definition) — so a new registry field can't silently
+    bypass cross-run grouping / the identity drift guard."""
+    import _run_selection as rs
+
+    registry = {f.name for f in rs.FILTERABLE_FIELDS}
+    assert registry <= set(report_sweep.CONFIG_IDENTITY_FIELDS) | {"seed"}, (
+        registry - (set(report_sweep.CONFIG_IDENTITY_FIELDS) | {"seed"})
+    )
+
+
+def test_subsets_dir_not_rescanned_as_run(tmp_path, monkeypatch):
+    """A leftover subsets/ dir (this tool's own filtered output) must never be
+    picked up as a run by a later load_sweep / unfiltered report run."""
+    sweep = tmp_path / "sweep"
+    make_run(sweep, "a__seed42", num_modes=2)
+    make_run(sweep, "b__seed42", num_modes=3)
+    # First, a filtered run creates sweep/subsets/num_modes-2/.
+    run_report_sweep(sweep, monkeypatch, "--num-modes", "2")
+    assert (sweep / "subsets" / "num_modes-2").is_dir()
+    # load_sweep must still see exactly the two real runs, not "subsets".
+    names = {r["run_name"] for r in report_sweep.load_sweep(sweep)}
+    assert names == {"a__seed42", "b__seed42"}
