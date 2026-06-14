@@ -231,12 +231,18 @@ def test_main_dry_run_writes_manifest_and_preserves_original(
 
 def test_slurm_command_uses_run_sweep_sh_unchanged(tmp_path):
     """The SLURM submission targets the existing scripts/run_sweep.sh (no new
-    array script) with --array sized to the re-indexed launchable count."""
+    array script) with --array sized to the re-indexed launchable count. The
+    command is built by the shared orchestration seam, passed resume_sweep's
+    RUN_SWEEP_SH so a top-up reuses the sweep array script."""
+    import _orchestration
+
     sweep_dir, _ = _three_run_sweep(tmp_path)
     manifest = resume_sweep.build_manifest(sweep_dir, target_epochs=6)
     manifest_path = sweep_dir / "resume_manifest_test.json"
 
-    cmd = resume_sweep.slurm_command(manifest, manifest_path)
+    cmd = _orchestration.array_command(
+        manifest, manifest_path, resume_sweep.RUN_SWEEP_SH
+    )
 
     assert cmd == [
         "sbatch", "--array=0-2", "scripts/run_sweep.sh", str(manifest_path)

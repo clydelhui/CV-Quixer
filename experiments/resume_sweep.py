@@ -44,21 +44,19 @@ from __future__ import annotations
 
 import argparse
 import json
-import shlex
-import shutil
-import subprocess
 import sys
 from datetime import datetime
 from fnmatch import fnmatch
 from pathlib import Path
 
+from _orchestration import launch_local, submit_slurm_array
+
 from cv_quixer.provenance import invocation_record
 
-# Repo root = this file's grandparent (experiments/ -> repo root).
-REPO_ROOT = Path(__file__).resolve().parent.parent
-FULL_EXPERIMENT = "experiments/full_experiment.py"
+# Repo-relative entry / array scripts the launchers drive (see _orchestration).
 # The resume manifest keeps sweep_manifest.json's runs[] schema (index,
 # run_name, args), so the existing sweep array script consumes it unchanged.
+FULL_EXPERIMENT = "experiments/full_experiment.py"
 RUN_SWEEP_SH = "scripts/run_sweep.sh"
 
 
@@ -134,53 +132,6 @@ def build_manifest(
     }
 
 
-def slurm_command(manifest: dict, manifest_path: Path) -> list[str]:
-    """The sbatch job-array command for this top-up manifest."""
-    n = manifest["n_runs"]
-    return ["sbatch", f"--array=0-{n - 1}", RUN_SWEEP_SH, str(manifest_path)]
-
-
-def launch_local(manifest: dict) -> int:
-    """Run each top-up sequentially via subprocess. Returns failure count."""
-    failures = 0
-    for run in manifest["runs"]:
-        cmd = [sys.executable, FULL_EXPERIMENT, *run["args"]]
-        print(f"\n=== [{run['index'] + 1}/{manifest['n_runs']}] {run['run_name']} ===")
-        print("  " + " ".join(cmd))
-        if subprocess.run(cmd, cwd=REPO_ROOT).returncode != 0:
-            failures += 1
-            print(f"  ✗ {run['run_name']} failed")
-    return failures
-
-
-def launch_slurm(manifest: dict, manifest_path: Path) -> dict | None:
-    """Submit the top-up as a SLURM array (or print the command if no sbatch).
-
-    Returns ``{"sbatch_command", "job_id"}`` for the manifest's invocation
-    record, or None when sbatch is unavailable and the command was only printed.
-    """
-    cmd = slurm_command(manifest, manifest_path)
-    print("\nSLURM array submission:")
-    print("  " + " ".join(cmd))
-    if shutil.which("sbatch") is None:
-        print(
-            "\nsbatch not found on PATH — run the command above on the cluster "
-            "login node (from the repo root)."
-        )
-        return None
-    result = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
-    out = result.stdout.strip()
-    if out:
-        print("  " + out)
-    if result.returncode != 0:
-        if result.stderr.strip():
-            print("  " + result.stderr.strip())
-        raise subprocess.CalledProcessError(result.returncode, cmd)
-    # sbatch prints "Submitted batch job <id>"; tolerate other formats.
-    job_id = out.split()[-1] if out.startswith("Submitted batch job") else None
-    return {"sbatch_command": shlex.join(cmd), "job_id": job_id}
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Top up a sweep: raise selected runs to a target total "
@@ -230,22 +181,13 @@ def main() -> None:
 
     launch = "none" if args.dry_run else args.launch
     if launch == "local":
-        failures = launch_local(manifest)
+        failures = launch_local(manifest, FULL_EXPERIMENT)
         print(f"\nTop-up finished: "
               f"{manifest['n_runs'] - failures}/{manifest['n_runs']} succeeded.")
         if failures:
             sys.exit(1)
     elif launch == "slurm":
-        submission = launch_slurm(manifest, manifest_path)
-        if submission is not None:
-            # Close the loop in the invocation record: how the top-up entered
-            # the queue. Atomic replace — the just-submitted array tasks read
-            # this file.
-            tmp_path = manifest_path.with_suffix(".json.tmp")
-            manifest["invocations"][-1]["slurm"] = submission
-            with open(tmp_path, "w") as f:
-                json.dump(manifest, f, indent=2)
-            tmp_path.replace(manifest_path)
+        submit_slurm_array(manifest, manifest_path, RUN_SWEEP_SH)
     else:
         print("\n(manifest written; no runs launched — use --launch local|slurm)")
 

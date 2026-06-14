@@ -130,6 +130,7 @@ rsync_filters() {
                 '--include=figures/**' \
                 '--include=summary.csv' '--include=summary.md' \
                 '--include=*_manifest.json' \
+                '--include=resume_manifest_*.json' \
                 '--include=cutoff_summary.csv' '--include=cutoff_summary.md' \
                 '--exclude=*' ;;
         light)
@@ -139,6 +140,7 @@ rsync_filters() {
                 '--include=figures/**' \
                 '--include=summary.csv' '--include=summary.md' \
                 '--include=*_manifest.json' \
+                '--include=resume_manifest_*.json' \
                 '--include=cutoff_summary.csv' '--include=cutoff_summary.md' \
                 '--include=config.json' '--include=history.json' \
                 '--include=meta.json' \
