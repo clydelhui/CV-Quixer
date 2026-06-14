@@ -220,6 +220,137 @@ def test_varying_axis_renders_its_figure(tmp_path, monkeypatch):
     assert not (figs / "acc_vs_num_heads.png").exists()  # constant field
 
 
+def test_acc_vs_field_all_else_equal_lines(tmp_path, monkeypatch):
+    """acc_vs_<field> connects all-else-equal chains when other axes also vary.
+
+    A 2x2 (num_heads x num_modes) sweep: acc_vs_num_modes must draw one line per
+    num_heads value (2 chains), each connecting that value's 2 num_modes points
+    — not a single scatter (the pre-trend-line behaviour, where num_modes is not
+    the sole varying axis would have suppressed the line).
+    """
+    sweep = tmp_path / "sweep"
+    acc = 0.5
+    for nh in (4, 6):
+        for nm in (2, 3):
+            acc += 0.02
+            make_run(
+                sweep, f"manual__obs-xpxsps__seed42__nh{nh}__nm{nm}",
+                test_acc=(0.4, acc), num_heads=nh, num_modes=nm,
+                achieved_params=1000 * nh + 10 * nm,
+            )
+
+    import matplotlib.axes
+
+    calls: list[dict] = []
+    orig_errorbar = matplotlib.axes.Axes.errorbar
+
+    def spy(self, x, y, *a, **kw):
+        calls.append(
+            {"x": list(x), "label": kw.get("label"), "ls": kw.get("linestyle")}
+        )
+        return orig_errorbar(self, x, y, *a, **kw)
+
+    monkeypatch.setattr(matplotlib.axes.Axes, "errorbar", spy)
+
+    rows = report_sweep.load_sweep(sweep)
+    fig_dir = sweep / "figures"
+    fig_dir.mkdir()
+    report_sweep.plot_acc_vs_hyperparam(rows, fig_dir)
+
+    assert (fig_dir / "acc_vs_num_modes.png").is_file()
+    assert (fig_dir / "acc_vs_num_heads.png").is_file()
+    # Isolate the num_modes figure's chains (x sweeps {2, 3}): one per num_heads.
+    modes_chains = [c for c in calls if sorted(c["x"]) == [2, 3]]
+    assert len(modes_chains) == 2
+    assert all(len(c["x"]) == 2 and c["ls"] == "-" for c in modes_chains)
+    assert {c["label"] for c in modes_chains} == {"4", "6"}
+
+
+def test_acc_vs_field_excludes_dependent_decoder_hidden_dim(tmp_path, monkeypatch):
+    """A multiplier-sized decoder_hidden_dim must not break num_modes lines.
+
+    With decoder_hidden_mult set, decoder_hidden_dim is slaved to (num_modes,
+    num_heads), so it co-varies with the axis being plotted. It must be excluded
+    from the all-else-equal key, otherwise every num_modes chain is a lone point.
+    """
+    sweep = tmp_path / "sweep"
+    for nh in (4, 6):
+        for nm in (2, 3):
+            make_run(
+                sweep, f"manual__obs-xpxsps__seed42__nh{nh}__nm{nm}",
+                test_acc=(0.4, 0.5), num_heads=nh, num_modes=nm,
+                decoder_hidden_mult=4.0,
+                decoder_hidden_dim=100 * nh * nm,  # slaved to both axes
+                achieved_params=1000 * nh + nm,
+            )
+
+    rows = report_sweep.load_sweep(sweep)
+    assert report_sweep._dependent_fields(rows) == {"decoder_hidden_dim"}
+
+    import matplotlib.axes
+
+    calls: list[dict] = []
+    orig_errorbar = matplotlib.axes.Axes.errorbar
+
+    def spy(self, x, y, *a, **kw):
+        calls.append({"x": list(x), "label": kw.get("label")})
+        return orig_errorbar(self, x, y, *a, **kw)
+
+    monkeypatch.setattr(matplotlib.axes.Axes, "errorbar", spy)
+
+    fig_dir = sweep / "figures"
+    fig_dir.mkdir()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # the duplicate-x guard must not fire
+        report_sweep.plot_acc_vs_hyperparam(rows, fig_dir)
+
+    # num_modes: one 2-point line per num_heads (decoder_hidden_dim excluded).
+    modes_chains = [c for c in calls if sorted(c["x"]) == [2, 3]]
+    assert len(modes_chains) == 2
+    assert {c["label"] for c in modes_chains} == {"4", "6"}  # labelled by num_heads
+    # decoder_hidden_dim is dependent → no connected line (all single-point).
+    assert (fig_dir / "acc_vs_decoder_hidden_dim.png").is_file()
+    dhd_chains = [c for c in calls if c["x"] and c["x"][0] in (800, 1200, 1800)]
+    assert all(len(c["x"]) == 1 for c in dhd_chains)
+
+
+def test_acc_vs_field_legend_suppressed_when_many_lines(tmp_path, monkeypatch):
+    """Past MAX_LEGEND_CHAINS trend lines the legend is dropped, lines kept."""
+    sweep = tmp_path / "sweep"
+    n_chains = report_sweep.MAX_LEGEND_CHAINS + 1
+    # One chain per cnn_channels_2 value (the "other" varying field), each with
+    # two num_modes points so it is a genuine 2-point line.
+    for c2 in range(8, 8 + n_chains):
+        for nm in (2, 3):
+            make_run(
+                sweep, f"manual__obs-xpxsps__seed42__c2{c2}__nm{nm}",
+                test_acc=(0.4, 0.5), cnn_channels_2=c2, num_modes=nm,
+                achieved_params=100 * c2 + nm,
+            )
+
+    import matplotlib.axes
+
+    legend_calls: list = []
+    orig_legend = matplotlib.axes.Axes.legend
+
+    def spy(self, *a, **kw):
+        legend_calls.append((a, kw))
+        return orig_legend(self, *a, **kw)
+
+    monkeypatch.setattr(matplotlib.axes.Axes, "legend", spy)
+
+    rows = report_sweep.load_sweep(sweep)
+    fig_dir = sweep / "figures"
+    fig_dir.mkdir()
+    report_sweep.plot_acc_vs_hyperparam(rows, fig_dir)
+
+    # acc_vs_num_modes has n_chains (>cap) lines → no legend; acc_vs_cnn_channels_2
+    # has 2 lines (one per num_modes) → legend drawn. So exactly one legend call.
+    assert (fig_dir / "acc_vs_num_modes.png").is_file()
+    assert (fig_dir / "acc_vs_cnn_channels_2.png").is_file()
+    assert len(legend_calls) == 1
+
+
 def test_two_observables_render_bar_figure(tmp_path, monkeypatch):
     sweep = tmp_path / "sweep"
     for obs, ach in [("x", 9000), ("xpxsps", 11000)]:

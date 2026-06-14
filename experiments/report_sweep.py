@@ -16,7 +16,10 @@ directory:
                                      grouped by budget (only when ≥2 knobs swept)
     figures/acc_vs_trunc_lambda.png  acc vs truncation penalty weight λ
                                      (only when ≥2 λ values are swept)
-    figures/acc_vs_<field>.png       one per architecture field that varies
+    figures/acc_vs_<field>.png       one per architecture field that varies;
+                                     points connected into all-else-equal trend
+                                     lines (one line per combination of the
+                                     other varying fields)
 
 Cross-run figures group runs by *configuration identity* — every recorded sweep
 coordinate except the training seed (``CONFIG_IDENTITY_FIELDS``) — so only seed
@@ -70,6 +73,10 @@ import numpy as np
 # Repo root (experiments/ -> repo root); used to invoke report_diagnostics.py.
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REPORT_DIAGNOSTICS = "experiments/report_diagnostics.py"
+
+# Above this many all-else-equal trend lines in one acc_vs_<field> figure, the
+# legend is suppressed (it would dwarf the plot) — the lines + colours stay.
+MAX_LEGEND_CHAINS = 12
 
 # Resolved architecture knobs recorded in history["meta"] by full_experiment.py.
 # Surfaced per-run in the table and used as the candidate axes for the
@@ -201,6 +208,23 @@ def _load_run(run_dir: Path, max_epoch: int | None = None) -> dict | None:
     for field in ARCH_META_FIELDS:
         row[field] = meta.get(field)
     return row
+
+
+def read_exclude_file(path: Path) -> set[str]:
+    """Parse run names to exclude from a text file.
+
+    Tolerant of the ``low_accuracy_runs.txt`` format written alongside a sweep:
+    blank lines and ``#`` comment lines are ignored, and only the first
+    whitespace-delimited token of each remaining line is taken as the run name
+    (so the trailing accuracy columns in that file are harmless).
+    """
+    names: set[str] = set()
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        names.add(line.split()[0])
+    return names
 
 
 def load_sweep(sweep_dir: Path, max_epoch: int | None = None) -> list[dict]:
@@ -376,6 +400,25 @@ def _varying_fields(keys: Iterable[tuple]) -> list[str]:
         f for i, f in enumerate(CONFIG_IDENTITY_FIELDS)
         if len({k[i] for k in keys}) > 1
     ]
+
+
+def _dependent_fields(rows: list[dict]) -> set[str]:
+    """Identity fields that are *derived* from other coordinates in this sweep.
+
+    A dependent field is a deterministic function of the independent sweep axes,
+    so it co-varies with them and must NOT count toward "all else equal" in the
+    acc_vs_<field> trend lines — otherwise it splits every chain into lone points
+    (the reason num_modes / num_heads never connected: decoder_hidden_dim follows
+    them, so no two runs differ in num_modes *alone*). Currently the only derived
+    architecture field is ``decoder_hidden_dim``, which is sized as
+    ``decoder_hidden_mult × (num_heads × readout_width)`` whenever
+    ``decoder_hidden_mult`` is set — readout_width depending on num_modes and the
+    observable preset, so the decoder width is slaved to those axes.
+    """
+    dependent: set[str] = set()
+    if any(r.get("decoder_hidden_mult") is not None for r in rows):
+        dependent.add("decoder_hidden_dim")
+    return dependent
 
 
 def _series_key(cfg_key: tuple, series_by: Sequence[str]) -> tuple:
@@ -559,92 +602,121 @@ def plot_acc_by_scaling_knob(rows: list[dict], fig_dir: Path) -> None:
     print(f"  ✓ {out}")
 
 
-def plot_acc_vs_trunc_lambda(
-    rows: list[dict], fig_dir: Path, series_by: Sequence[str]
-) -> None:
-    """Best test acc vs truncation penalty weight λ, one point per configuration.
+def _plot_acc_vs_field(
+    rows: list[dict], fig_dir: Path, field: str,
+    xlabel: str, title: str, out_name: str,
+) -> bool:
+    """Best test acc vs one identity field ``field``, as all-else-equal trend lines.
 
-    Skipped unless ≥2 distinct λ values are present. Series group by the
-    --series-by fields (λ itself excluded — it is the x-axis); a series' points
-    are connected only when λ is the *only* identity field varying across them.
+    The plotted configurations (those with a non-None ``field``) are partitioned
+    into *all-else-equal trend lines*: each line connects the configs that agree
+    on every other identity coordinate and differ only in ``field``, so a
+    multi-axis sweep yields one line per combination of the *other* varying
+    fields (legend title = those field names, each line labelled by its values)
+    rather than a single scatter. A chain with only one present x-value renders
+    as a lone marker; ``--series-by`` does not affect this figure (the series are
+    derived automatically). Above ``MAX_LEGEND_CHAINS`` lines the legend is
+    suppressed (it would dwarf the plot) while the lines + colours remain.
+    Returns False (and plots nothing) when ``field`` takes <2 distinct values
+    across the runs.
+
+    *Dependent fields* (``_dependent_fields`` — e.g. ``decoder_hidden_dim`` when
+    sized by a multiplier) are excluded from the "all else equal" key: they are
+    slaved to the independent axes, so counting them would split every chain into
+    lone points. They are allowed to vary freely along a trend line (that is what
+    lets num_modes / num_heads connect).
     """
-    li = _FIELD_INDEX["trunc_lambda"]
-    groups = {k: g for k, g in _config_groups(rows).items() if k[li] is not None}
-    if len({k[li] for k in groups}) < 2:
-        print("  (need ≥2 distinct trunc_lambda values — skipping acc_vs_trunc_lambda)")
-        return
-    series_fields = [f for f in series_by if f != "trunc_lambda"]
-    by_series: dict[tuple, dict[tuple, dict]] = defaultdict(dict)
+    fi = _FIELD_INDEX[field]
+    groups = {k: g for k, g in _config_groups(rows).items() if k[fi] is not None}
+    if len({k[fi] for k in groups}) < 2:
+        return False
+    # Group into chains keyed by the *other* identity fields that vary across the
+    # plotted configs, minus this sweep's dependent (derived) fields — within each
+    # chain only `field` (and the slaved dependents) differs, so every chain is a
+    # genuine 1-D trend in `field` and is always line-connected.
+    dependent = _dependent_fields(rows) - {field}
+    other_varying = [
+        f for f in _varying_fields(groups) if f != field and f not in dependent
+    ]
+    ov_idx = [_FIELD_INDEX[f] for f in other_varying]
+    by_chain: dict[tuple, dict[tuple, dict]] = defaultdict(dict)
     for key, g in groups.items():
-        by_series[_series_key(key, series_fields)][key] = g
+        by_chain[tuple(key[i] for i in ov_idx)][key] = g
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    for skey in sorted(by_series, key=str):
-        sgroups = by_series[skey]
-        pts = sorted((k[li], g["acc"][0], g["acc"][1]) for k, g in sgroups.items())
-        varying = [f for f in _varying_fields(sgroups) if f != "trunc_lambda"]
-        linestyle = "-" if not varying else "none"
+    for chain_key in sorted(by_chain, key=str):
+        chain = by_chain[chain_key]
+        pts = sorted((k[fi], g["acc"][0], g["acc"][1]) for k, g in chain.items())
+        xs = [p[0] for p in pts]
+        if len(set(xs)) != len(xs):
+            # Two distinct configs share a chain key and an x-value — only
+            # possible if a dropped "dependent" field was in fact independent.
+            warnings.warn(
+                f"acc_vs_{field}: a trend line has duplicate {field} values after "
+                f"excluding dependent fields {sorted(dependent)} — distinct "
+                "configs overlap; the exclusion may be wrong for this sweep.",
+                RuntimeWarning, stacklevel=2,
+            )
         ax.errorbar(
             [p[0] for p in pts], [p[1] for p in pts], yerr=[p[2] for p in pts],
-            marker="o", linestyle=linestyle, capsize=3, label=_series_label(skey),
+            marker="o", linestyle="-", capsize=3, label=_series_label(chain_key),
         )
-    ax.set_xlabel("Truncation penalty weight λ (trunc_lambda)")
+    ax.set_xlabel(xlabel)
     ax.set_ylabel("Best test accuracy")
-    ax.set_title("Accuracy vs truncation penalty weight")
+    ax.set_title(title)
     ax.grid(alpha=0.3)
-    ax.legend(title=" / ".join(series_fields) or None)
+    # Suppress the legend once there are too many trend lines to label legibly
+    # (the lines + colours remain); otherwise title it with the varying fields.
+    if len(by_chain) <= MAX_LEGEND_CHAINS:
+        ax.legend(title=" / ".join(other_varying) or None)
+    else:
+        print(
+            f"    ({len(by_chain)} trend lines > {MAX_LEGEND_CHAINS} — "
+            f"legend suppressed for {out_name})"
+        )
     fig.tight_layout()
-    out = fig_dir / "acc_vs_trunc_lambda.png"
+    out = fig_dir / out_name
     fig.savefig(out, dpi=150)
     plt.close(fig)
     print(f"  ✓ {out}")
+    return True
 
 
-def plot_acc_vs_hyperparam(
-    rows: list[dict], fig_dir: Path, series_by: Sequence[str]
-) -> None:
+def plot_acc_vs_trunc_lambda(rows: list[dict], fig_dir: Path) -> None:
+    """Best test acc vs truncation penalty weight λ, as all-else-equal trend lines.
+
+    Skipped unless ≥2 distinct λ values are present. Points are grouped into
+    all-else-equal trend lines (see ``_plot_acc_vs_field``): each line connects
+    the configs differing only in λ, legend-labelled by the other fields that
+    vary across the sweep.
+    """
+    if not _plot_acc_vs_field(
+        rows, fig_dir, "trunc_lambda",
+        xlabel="Truncation penalty weight λ (trunc_lambda)",
+        title="Accuracy vs truncation penalty weight",
+        out_name="acc_vs_trunc_lambda.png",
+    ):
+        print("  (need ≥2 distinct trunc_lambda values — skipping acc_vs_trunc_lambda)")
+
+
+def plot_acc_vs_hyperparam(rows: list[dict], fig_dir: Path) -> None:
     """One ``acc_vs_<field>.png`` per architecture field that varies across runs.
 
     The figure for manual-hyperparameter sweeps: for every candidate field
     (``ARCH_META_FIELDS`` + ``num_layers``) that takes ≥2 distinct non-None
     values, plot one seed-averaged point per configuration against that field's
-    value, one series per --series-by group (the x-axis field excluded). Fields
-    constant across the sweep, or absent (older runs), are skipped. Configs that
-    differ along *other* axes stay separate points at the same x (no silent
-    averaging); a series is line-connected only when the x field is its sole
-    varying axis.
+    value, grouped into *all-else-equal trend lines* (see ``_plot_acc_vs_field``)
+    — each line connects the configs that agree on every other identity
+    coordinate and differ only in this field, so a multi-axis sweep gets one line
+    per combination of the other varying fields. Fields constant across the
+    sweep, or absent (older runs), are skipped.
     """
     candidates = ARCH_META_FIELDS + ["num_layers"]
-    all_groups = _config_groups(rows)
     for field in candidates:
-        fi = _FIELD_INDEX[field]
-        groups = {k: g for k, g in all_groups.items() if k[fi] is not None}
-        if len({k[fi] for k in groups}) < 2:
-            continue
-        series_fields = [f for f in series_by if f != field]
-        by_series: dict[tuple, dict[tuple, dict]] = defaultdict(dict)
-        for key, g in groups.items():
-            by_series[_series_key(key, series_fields)][key] = g
-        fig, ax = plt.subplots(figsize=(7, 4.5))
-        for skey in sorted(by_series, key=str):
-            sgroups = by_series[skey]
-            pts = sorted((k[fi], g["acc"][0], g["acc"][1]) for k, g in sgroups.items())
-            varying = [f for f in _varying_fields(sgroups) if f != field]
-            linestyle = "-" if not varying else "none"
-            ax.errorbar(
-                [p[0] for p in pts], [p[1] for p in pts], yerr=[p[2] for p in pts],
-                marker="o", linestyle=linestyle, capsize=3,
-                label=_series_label(skey),
-            )
-        ax.set_xlabel(field)
-        ax.set_ylabel("Best test accuracy")
-        ax.set_title(f"Accuracy vs {field}")
-        ax.grid(alpha=0.3)
-        ax.legend(title=" / ".join(series_fields) or None)
-        fig.tight_layout()
-        out = fig_dir / f"acc_vs_{field}.png"
-        fig.savefig(out, dpi=150)
-        plt.close(fig)
-        print(f"  ✓ {out}")
+        _plot_acc_vs_field(
+            rows, fig_dir, field,
+            xlabel=field, title=f"Accuracy vs {field}",
+            out_name=f"acc_vs_{field}.png",
+        )
 
 
 def render_per_run_figures(sweep_dir: Path, rows: list[dict]) -> None:
@@ -679,10 +751,12 @@ def main() -> None:
     parser.add_argument(
         "--series-by", nargs="+", default=["model", "observables"],
         choices=CONFIG_IDENTITY_FIELDS, metavar="FIELD",
-        help="meta fields defining the legend/series of the line figures "
+        help="meta fields defining the legend/series of acc_vs_params "
              "(default: model observables — e.g. add scaling_knob to recover "
-             "per-knob lines in a multi-knob budget sweep; choices: "
-             + ", ".join(CONFIG_IDENTITY_FIELDS) + ")",
+             "per-knob lines in a multi-knob budget sweep). The acc_vs_<field> "
+             "and acc_vs_trunc_lambda figures derive their series automatically "
+             "(all-else-equal trend lines) and ignore this. choices: "
+             + ", ".join(CONFIG_IDENTITY_FIELDS),
     )
     parser.add_argument(
         "--max-epoch", type=int, default=None, metavar="N",
@@ -694,6 +768,21 @@ def main() -> None:
         "--skip-per-run-figures", action="store_true",
         help="skip rendering report_diagnostics for each run "
              "(cross-run figures + tables only — the fast JSON-only pass)",
+    )
+    parser.add_argument(
+        "--exclude-file", type=str, action="append", default=[], metavar="PATH",
+        help="path to a text file of run names to drop before plotting (one per "
+             "line; '#' comments and trailing columns ignored — reads the "
+             "low_accuracy_runs.txt format directly). Repeatable",
+    )
+    parser.add_argument(
+        "--exclude-run", type=str, action="append", default=[], metavar="NAME",
+        help="run_name to drop before plotting. Repeatable",
+    )
+    parser.add_argument(
+        "--out-dir", type=str, default=None, metavar="DIR",
+        help="write tables + cross-run figures here instead of into the sweep "
+             "dir (use with --exclude-* to keep the full-set artefacts intact)",
     )
     args = parser.parse_args()
 
@@ -711,19 +800,46 @@ def main() -> None:
         print(f"No runs found under {sweep_dir} (need per-run history.json).")
         return
 
+    excluded: set[str] = set(args.exclude_run)
+    for fpath in args.exclude_file:
+        fpath = Path(fpath)
+        if not fpath.is_file():
+            parser.error(f"--exclude-file does not exist: {fpath}")
+        excluded |= read_exclude_file(fpath)
+    if excluded:
+        before = len(rows)
+        kept = [r for r in rows if r["run_name"] not in excluded]
+        dropped = before - len(kept)
+        matched = {r["run_name"] for r in rows} & excluded
+        unmatched = excluded - matched
+        print(f"Excluding {dropped} run(s) from {before} ({len(matched)} names matched)")
+        if unmatched:
+            warnings.warn(
+                f"{len(unmatched)} excluded name(s) matched no run under "
+                f"{sweep_dir}: {sorted(unmatched)}",
+                RuntimeWarning,
+            )
+        rows = kept
+        if not rows:
+            print("All runs excluded — nothing to plot.")
+            return
+
+    out_dir = Path(args.out_dir) if args.out_dir else sweep_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     print(f"Aggregating {len(rows)} run(s) under {sweep_dir}")
     _check_identity_drift(rows)
     _check_epoch_heterogeneity(rows)
-    write_table(rows, sweep_dir)
+    write_table(rows, out_dir)
 
-    fig_dir = sweep_dir / "figures"
+    fig_dir = out_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
     plotters = (
         partial(plot_acc_vs_params, series_by=args.series_by),
         plot_acc_by_observable,
         plot_acc_by_scaling_knob,
-        partial(plot_acc_vs_trunc_lambda, series_by=args.series_by),
-        partial(plot_acc_vs_hyperparam, series_by=args.series_by),
+        plot_acc_vs_trunc_lambda,
+        plot_acc_vs_hyperparam,
     )
     for fn in plotters:
         try:
