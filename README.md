@@ -128,7 +128,8 @@ uv run pytest tests/
   default 1; `0` disables it and reproduces the pre-W model exactly). Its
   truncation leakage is penalised separately via `cvqnn_trunc_lambda`. Enabling
   `W` is checkpoint-incompatible with pre-W runs — migrate old run configs with
-  `experiments/migrate_add_cvqnn_field.py` (see CLAUDE.md / ADR-0001).
+  `experiments/migrate_add_cvqnn_field.py` (archived/frozen one-shot, still
+  runnable; see CLAUDE.md / ADR-0001).
 * **No Trainer class** — each experiment script owns its training loop and
   drives models only through `BaseVisionTransformer`; `build_model(config)`
   is the only model factory.

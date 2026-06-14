@@ -96,6 +96,20 @@ plus each resume or top-up — and records all of them in order.
 _Avoid_: command (only the argv string — an invocation includes its context),
 launch (ambiguous with the SLURM submission it may contain).
 
+**Run manifest**:
+The JSON plan an orchestrator (`sweep.py`, `resume_sweep.py`,
+`eval_cutoff_sweep_all.py`) writes to launch a batch of runs: a `runs[]` list —
+each entry a dense `index` (the SLURM array task id), a `run_name`, and the
+`args` argv replayed verbatim by the entry-point script — plus `n_runs` and the
+launch invocations. It is the seam between the Python orchestrators and the
+shell job-array scripts (`run_sweep.sh`, `run_eval_cutoff_sweep_array.sh`),
+which select their task by `index` and print each `args` element on its own
+line. All three orchestrators share this schema, so one array script consumes
+any of their manifests; the shared launch helpers live in
+`experiments/_orchestration.py`.
+_Avoid_: config (that is the per-run ExperimentConfig), grid (only the sweep's
+axes, not the launch plan it expands into).
+
 **Configuration identity**:
 The full set of sweep coordinates that makes two runs "the same experiment
 repeated" — model variant, observable preset, budget fields, and every
@@ -103,6 +117,28 @@ architecture knob — everything except the training seed. Cross-run reports
 seed-average only within one configuration identity; runs differing in it are
 never averaged together.
 _Avoid_: grid point (the manifest's view of it), run group.
+
+**All-else-equal trend line**:
+In an accuracy-versus-one-coordinate figure, the set of configurations that agree
+on every *independent* sweep coordinate except the one on the x-axis — the runs
+that isolate the effect of varying that single coordinate. A sweep that varies
+several coordinates produces one such trend line per combination of the *other*
+varying independent coordinates; each is plotted as its own connected series.
+Dependent coordinates are deliberately not held fixed (see below), so they are
+free to follow the x-axis coordinate along the line.
+_Avoid_: series (the generic colour/legend grouping, which may be coarser),
+sweep axis (the coordinate itself, not the runs along it).
+
+**Dependent coordinate**:
+A configuration coordinate whose value is a deterministic function of the
+independent sweep axes rather than a freely chosen knob — e.g. the decoder hidden
+width when it is sized as a multiple of the model's readout width (itself set by
+the head count and mode count). A dependent coordinate co-varies with the axes
+that drive it, so it is excluded from the "all else equal" comparison: holding it
+fixed would make it impossible to vary any of its driving axes alone, collapsing
+every trend line to a single point.
+_Avoid_: derived field (implementation phrasing), hyperparameter (suggests an
+independently chosen knob, which a dependent coordinate is not).
 
 **Artefact tier**:
 A named, nested subset of a run's output artefacts, ordered by how much local
@@ -118,3 +154,21 @@ heaviest artefact and is only needed to resume training or re-derive train-side
 figures, so it lands only in `full`.
 _Avoid_: artefact level (ambiguous with log levels), bundle (suggests a single
 archive — a tier is a filter over the live tree, not a tarball).
+
+**Epoch artefacts**:
+The per-epoch raw output payload an experiment writes for one evaluation pass:
+the test (and optionally train) prediction arrays — `y_true`, `y_pred`,
+`y_probs`, `readouts`, and `success_probs` where the model post-selects —
+together with the quantum-diagnostics arrays (gate-param samples, state norms,
+mean photon number) and the coefficient snapshots (`lcu_coeffs`/`poly_coeffs`,
+plus `cvqnn_params` and the block-prefixed stacked keys where present). One
+bundle per epoch, persisted as `predictions/epoch_NNNN[_train].npz` +
+`diagnostics/epoch_NNNN.npz`. The live writers (`full_experiment`,
+`eval_cutoff_sweep`) produce it through one shared module, and
+`report_diagnostics` consumes it; the bundle, its model-variant key set, and its
+on-disk layout are the single contract between them. (`backfill_artefacts` is a
+frozen, archived writer that predates the shared module and emits the older
+canonical-only key set — deliberately not migrated.)
+_Avoid_: artefact (too generic — qualify as epoch artefacts), diagnostics (only
+the quantum-diagnostics arrays, not the predictions), Artefact tier (a pull-time
+subset of a whole run, not one epoch's payload).
