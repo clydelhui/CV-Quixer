@@ -44,7 +44,7 @@
 #SBATCH --job-name=cv_quixer_report
 #SBATCH --output=slurm_logs/slurm-%x-%A_%a.out
 #SBATCH --error=slurm_logs/slurm-%x-%A_%a.err
-#SBATCH --time=04:00:00
+#SBATCH --time=00:20:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 
