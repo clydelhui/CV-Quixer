@@ -26,7 +26,10 @@ coordinates from different sources (ADR-0006). `resume_sweep` works off
 ``config.json``), so it uses ``coords_from_config_json`` (resolved values,
 catches auto-scaled knobs) overlaid on ``coords_from_args`` (the always-present
 replayed argv). `report_sweep` already has each run's resolved coordinates from
-``history["meta"]`` and feeds that straight to ``run_matches``.
+``history["meta"]`` and uses ``coords_from_meta`` (no ``config.json`` re-read).
+The three ``coords_from_*`` helpers live here only so the field registry stays
+their single source of truth; *which* source a tool reads is the tool's choice
+(ADR-0006), not this module's.
 
 Torch-free on purpose (argparse/warnings/stdlib only) so importing it never
 breaks the orchestrators' deferred-torch fast path.
@@ -200,6 +203,32 @@ def coords_from_args(args: list[str]) -> dict:
     return coords
 
 
+def coords_from_meta(meta: dict) -> dict:
+    """Extract registry coordinates from a ``report_sweep`` summary row / history meta.
+
+    `report_sweep` builds one row per run from ``history["meta"]`` with the
+    *resolved* (post-auto-scaling) values already keyed by registry field name, so
+    this is its extraction source (ADR-0006) — no ``config.json`` re-read. Only
+    non-``None`` values are kept: a field absent or ``None`` for a run (e.g. an old
+    run that never wrote it) stays out of the dict, so ``run_matches`` reports it
+    *unresolved* (warn + exclude) rather than matching it as ``None``.
+    ``block_residual`` (a bool in meta) is normalised to the "on"/"off" string the
+    filter uses. The observable preset is read from ``observables`` or, in raw
+    meta, ``observables_name``.
+    """
+    coords: dict = {}
+    for field in FILTERABLE_FIELDS:
+        if field.name == "observables":
+            value = meta.get("observables")
+            if value is None:
+                value = meta.get("observables_name")
+        else:
+            value = meta.get(field.name)
+        if value is not None:
+            coords[field.name] = _normalize(field, value)
+    return coords
+
+
 def run_matches(coords: dict, filters: dict, *, run_name: str | None = None) -> bool:
     """True iff ``coords`` satisfies every coordinate filter.
 
@@ -215,7 +244,8 @@ def run_matches(coords: dict, filters: dict, *, run_name: str | None = None) -> 
             where = f"{run_name}: " if run_name else ""
             warnings.warn(
                 f"{where}cannot apply coordinate filter on '{field}' — value "
-                "unresolved for this run (no config.json and not in its args); "
+                "unresolved for this run (not recorded in its metadata/config/"
+                "args, e.g. an auto-scaled knob or a field newer than the run); "
                 "excluding it.",
                 RuntimeWarning, stacklevel=2,
             )
