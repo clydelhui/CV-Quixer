@@ -73,11 +73,11 @@ from cv_quixer.evaluation.diagnostics import (
     ensure_history_schema,
     evaluate,
     new_history,
-    quantum_diagnostics,
     save_test_images_once,
-    snapshot_coefficients,
-    snapshot_cvqnn_params,
-    snapshot_stacked_coefficients,
+)
+from cv_quixer.evaluation.epoch_artefacts import (
+    build_epoch_artefacts,
+    eval_epoch_metrics,
 )
 from cv_quixer.models import build_model
 from cv_quixer.provenance import invocation_record
@@ -1164,16 +1164,13 @@ for epoch in range(start_epoch, EPOCHS + 1):
     train_loss, train_acc = train_eval["loss"], train_eval["acc"]
     test_loss, test_acc = test_eval["loss"], test_eval["acc"]
 
-    history["epoch"]["train_loss"].append(train_loss)
-    history["epoch"]["train_acc"].append(train_acc)
-    history["epoch"]["test_loss"].append(test_loss)
-    history["epoch"]["test_acc"].append(test_acc)
+    # Eval-derived per-epoch fields are single-sourced via eval_epoch_metrics;
+    # the train-time trunc streams come from train_epoch(), not evaluate().
+    for _hk, _hv in eval_epoch_metrics(test_eval, train_eval).items():
+        history["epoch"][_hk].append(_hv)
     history["epoch"]["trunc_loss"].append(trunc_loss)
-    history["epoch"]["test_trunc_loss"].append(float(test_eval["trunc_loss"]))
     history["epoch"]["cvqnn_trunc_loss"].append(cvqnn_trunc_loss)
-    history["epoch"]["test_cvqnn_trunc_loss"].append(float(test_eval["cvqnn_trunc_loss"]))
     history["epoch"]["query_trunc_loss"].append(query_trunc_loss)
-    history["epoch"]["test_query_trunc_loss"].append(float(test_eval["query_trunc_loss"]))
 
     log_metrics(
         {
@@ -1192,61 +1189,19 @@ for epoch in range(start_epoch, EPOCHS + 1):
         use_wandb=config.use_wandb,
     )
 
-    # success_probs is absent for models without LCU post-selection.
-    test_pred_kwargs = dict(
-        y_true=test_eval["y_true"],
-        y_pred=test_eval["y_pred"],
-        y_probs=test_eval["y_probs"],
-        readouts=test_eval["readouts"],
-    )
-    if test_eval.get("success_probs") is not None:
-        test_pred_kwargs["success_probs"] = test_eval["success_probs"]
-    np.savez_compressed(preds_dir / f"epoch_{epoch:04d}.npz",
-                        **test_pred_kwargs)
-    train_pred_kwargs = dict(
-        y_true=train_eval["y_true"],
-        y_pred=train_eval["y_pred"],
-        y_probs=train_eval["y_probs"],
-        readouts=train_eval["readouts"],
-    )
-    if train_eval.get("success_probs") is not None:
-        train_pred_kwargs["success_probs"] = train_eval["success_probs"]
-    np.savez_compressed(preds_dir / f"epoch_{epoch:04d}_train.npz",
-                        **train_pred_kwargs)
-
-    # Coefficient snapshots: canonical models keep the historic flat keys;
-    # the stacked model writes block-prefixed keys (block{b}_*/agg_*, ADR-0003).
-    if args.model == "quantum_stacked":
-        coeff_snaps = snapshot_stacked_coefficients(model)
-    else:
-        lcu_snap, poly_snap = snapshot_coefficients(model)
-        cvqnn_snap = snapshot_cvqnn_params(model)   # None when cvqnn_num_layers == 0
-        coeff_snaps = {"lcu_coeffs": lcu_snap, "poly_coeffs": poly_snap}
-        if cvqnn_snap is not None:
-            coeff_snaps["cvqnn_params"] = cvqnn_snap
-
+    # Per-epoch artefacts (predictions + coefficient snapshots + quantum
+    # diagnostics) are assembled and written by the shared epoch-artefacts
+    # module, which owns the model-variant key dispatch + the swallow-and-warn
+    # diagnostics degrade (a failed diag pass degrades to coeff-only rather than
+    # killing a multi-hour run; ADR-0004's non-finite-value loudness is unaffected).
     t_diag = time.time()
-    try:
-        stats_summary, mean_photon, diag_raw = quantum_diagnostics(
-            model, diag_loader, device,
-            progress="diagnostics",
-        )
-        diag_raw.update(coeff_snaps)
-        np.savez_compressed(diag_dir / f"epoch_{epoch:04d}.npz", **diag_raw)
-        diag_status = f"  (diag {time.time() - t_diag:.1f}s)"
-    except Exception as e:
-        # Don't let a diagnostic-pass failure kill a multi-hour training run.
-        # Still persist lcu/poly snapshots so cross-epoch coefficient figures
-        # have data for this epoch.
-        import warnings
-
-        warnings.warn(
-            f"quantum_diagnostics failed at epoch {epoch}: {type(e).__name__}: {e}. "
-            "Saving only lcu/poly snapshots for this epoch.",
-            RuntimeWarning,
-        )
-        np.savez_compressed(diag_dir / f"epoch_{epoch:04d}.npz", **coeff_snaps)
-        diag_status = "  (diag skipped)"
+    art = build_epoch_artefacts(
+        model, device,
+        test_eval=test_eval, train_eval=train_eval,
+        diag_loader=diag_loader,
+    )
+    art.write(run_dir, epoch)
+    diag_status = f"  (diag {time.time() - t_diag:.1f}s)"
 
     elapsed = time.time() - t0
     mem_str = f"{peak_mem_mb:,.0f} MB" if peak_mem_mb is not None else "n/a"

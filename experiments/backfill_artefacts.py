@@ -1,4 +1,13 @@
-"""Backfill the artefacts that the current `report_diagnostics.py` consumes for
+"""ARCHIVED (2026-06): frozen one-time tool — kept as the record of how the
+old-run figures were generated. It deliberately predates the shared
+``cv_quixer.evaluation.epoch_artefacts`` module and emits the older
+canonical-only key set (no ``cvqnn_params``, no stacked block-prefixed keys),
+which is correct for the pre-W / pre-stacked runs it was used on. Still the
+recovery path for old runs missing artefacts (``report_diagnostics`` points
+here), but NOT maintained — do not modify or migrate onto the shared module.
+See memory ``project_backfill_archived``.
+
+Backfill the artefacts that the current `report_diagnostics.py` consumes for
 an older `full_experiment.py` run that predates the diagnostics/predictions
 schema.
 

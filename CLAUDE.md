@@ -238,9 +238,21 @@ only when exactly one identity field varies), `figures/acc_by_observable.png`
 (needs ≥2 presets; bars grouped by budget, or by configuration for manual-only
 sweeps), `figures/acc_vs_trunc_lambda.png` (needs ≥2 λ values), plus one
 `figures/acc_vs_<field>.png` per architecture field that *varies* across the
-runs (e.g. `acc_vs_num_heads.png`). `--series-by FIELD…` (default
-`model observables`) picks the legend/series fields of the line figures — e.g.
-add `scaling_knob` to recover per-knob lines in a multi-knob budget sweep.
+runs (e.g. `acc_vs_num_heads.png`). In `acc_vs_<field>` and
+`acc_vs_trunc_lambda` the points are connected into **all-else-equal trend
+lines** — one connected series per combination of the *other* varying
+coordinates, each connecting the runs that differ only in the x-axis field (a
+chain with a single x-value shows as a lone marker); the legend title names
+those other fields, but is suppressed past `MAX_LEGEND_CHAINS` (=12) lines (the
+coloured lines stay). *Dependent* coordinates (`_dependent_fields` —
+`decoder_hidden_dim` when sized by `decoder_hidden_mult`) are excluded from the
+all-else-equal key, since they are slaved to the independent axes and would
+otherwise split every chain into single points (the reason `acc_vs_num_modes` /
+`acc_vs_num_heads` had no lines); they vary freely along each trend line.
+`--series-by FIELD…` (default `model observables`) picks the
+legend/series fields of `acc_vs_params` only — e.g. add `scaling_knob` to
+recover per-knob lines in a multi-knob budget sweep — and does **not** affect
+the auto-derived `acc_vs_<field>` / `acc_vs_trunc_lambda` series.
 Epoch fairness: a `RuntimeWarning` fires whenever the compared runs' epoch
 counts differ (e.g. a mid-top-up sweep); `--max-epoch N` derives
 best/best-epoch/final/n_epochs from each run's first N epochs only (ignoring
@@ -521,7 +533,7 @@ experiments/
 ├── report_sweep_compare.py  Overlay ≥2 sweeps (e.g. quantum vs quantum_shared) → combined table + cross-sweep figures
 ├── report_cutoff_sweep.py Cross-run cutoff table + figures/cutoff/ + per-cutoff diagnostics
 ├── report_diagnostics.py  All figures (training curves + diagnostics) from a full_experiment run
-└── migrate_add_cvqnn_field.py  One-shot: bake cvqnn_num_layers=0 into pre-W run config.json (so old checkpoints reload as pre-W models)
+└── migrate_add_cvqnn_field.py  One-shot: bake cvqnn_num_layers=0 into pre-W run config.json (so old checkpoints reload as pre-W models). ARCHIVED/frozen — still runnable for old runs, not maintained
 
 scripts/
 ├── run_mini_experiment.sh        SLURM batch job for mini_experiment
@@ -541,6 +553,18 @@ configs/                 LEGACY — not loaded by any current experiment script.
     ├── quixer_fewer_modes.yaml        num_modes=4
     └── quixer_gaussian_backend.yaml   cutoff_dim=6 near-Gaussian regime
 ```
+
+**Per-epoch artefacts.** The live writers `full_experiment.py` and
+`eval_cutoff_sweep.py` produce the per-epoch predictions/diagnostics npz bundle
+through one shared module — `cv_quixer/evaluation/epoch_artefacts.py`
+(`build_epoch_artefacts` assembles it with the model-variant coeff-key dispatch +
+the swallow-and-warn diagnostics degrade; `EpochArtefacts.write` persists it;
+`eval_epoch_metrics` single-sources the eval-derived history fields) — and
+`cv_quixer/evaluation/artefact_schema.py` (the torch-free npz key/filename
+contract, also imported by `report_diagnostics.py`). `backfill_artefacts.py` and
+`migrate_add_cvqnn_field.py` are **ARCHIVED/frozen** one-time tools: still
+runnable for old runs (backfill is the recovery path `report_diagnostics` points
+to), kept as a record, but not maintained and not migrated onto the shared module.
 
 ## CV-Quixer model architecture
 

@@ -71,9 +71,12 @@ from cv_quixer.evaluation.diagnostics import (
     evaluate,
     load_subset_indices,
     new_history,
-    quantum_diagnostics,
     save_test_images_once,
-    snapshot_coefficients,
+)
+from cv_quixer.evaluation.epoch_artefacts import (
+    EpochArtefacts,
+    build_epoch_artefacts,
+    eval_epoch_metrics,
 )
 from cv_quixer.models import build_model
 from cv_quixer.provenance import invocation_record
@@ -336,13 +339,7 @@ def _relative_symlink(target: Path, link: Path) -> None:
 def _synthesize_cutoff_rundir(
     D_new: int,
     cfg_eval: ExperimentConfig,
-    test_eval: dict,
-    train_eval: dict | None,
-    quantum_stats: dict,
-    mean_photon: np.ndarray,
-    diag_raw: dict,
-    lcu_snap: np.ndarray,
-    poly_snap: np.ndarray,
+    art: EpochArtefacts,
     n_params: int,
 ) -> Path:
     """Write a self-contained, report_diagnostics-runnable single-epoch run
@@ -364,16 +361,23 @@ def _synthesize_cutoff_rundir(
 
     # history.json — single-epoch training-log entries only. Derived metrics
     # (per-class acc, confusion, lcu/poly coeffs, mean photon, hypernet stats)
-    # are read from the npz artefacts by report_diagnostics.
-    src = train_eval if train_eval is not None else test_eval
+    # are read from the npz artefacts by report_diagnostics. Eval-derived fields
+    # are single-sourced via eval_epoch_metrics, so the cutoff sub-run carries
+    # the same field set as a real run (incl. cvqnn/query trunc).
+    test_eval, train_eval = art.test_eval, art.train_eval
     h = new_history(int(n_params), str(device))
-    h["epoch"]["train_loss"]      = [float(src["loss"])]
-    h["epoch"]["train_acc"]       = [float(src["acc"])]
-    h["epoch"]["test_loss"]       = [float(test_eval["loss"])]
-    h["epoch"]["test_acc"]        = [float(test_eval["acc"])]
-    h["epoch"]["trunc_loss"]      = [float(src["trunc_loss"])]
-    h["epoch"]["test_trunc_loss"] = [float(test_eval["trunc_loss"])]
-    h["epoch"]["elapsed_sec"]     = [0.0]
+    for _hk, _hv in eval_epoch_metrics(test_eval, train_eval).items():
+        h["epoch"][_hk] = [_hv]
+    if train_eval is None:
+        # No separate train split evaluated — mirror test into the train slots,
+        # matching the historic synth-history behaviour.
+        h["epoch"]["train_loss"] = [float(test_eval["loss"])]
+        h["epoch"]["train_acc"]  = [float(test_eval["acc"])]
+    # The train-time trunc stream has no analogue in an eval-only context; mirror
+    # the eval trunc of the train (or test) split, as the historic synth did.
+    src = train_eval if train_eval is not None else test_eval
+    h["epoch"]["trunc_loss"]  = [float(src["trunc_loss"])]
+    h["epoch"]["elapsed_sec"] = [0.0]
     h["meta"]["best_test_acc"]    = float(test_eval["acc"])
     h["meta"]["best_epoch"]       = 1
     h["meta"]["total_runtime_sec"] = 0.0
@@ -381,37 +385,11 @@ def _synthesize_cutoff_rundir(
     with open(sub / "history.json", "w") as f:
         json.dump(h, f, indent=2)
 
-    # predictions/epoch_0001.npz (test) + optionally _train counterpart.
-    # success_probs is absent for models without LCU post-selection.
-    test_pred_kwargs = dict(
-        y_true=test_eval["y_true"],
-        y_pred=test_eval["y_pred"],
-        y_probs=test_eval["y_probs"],
-        readouts=test_eval["readouts"],
-    )
-    if test_eval.get("success_probs") is not None:
-        test_pred_kwargs["success_probs"] = test_eval["success_probs"]
-    np.savez_compressed(sub / "predictions" / "epoch_0001.npz",
-                        **test_pred_kwargs)
-    if train_eval is not None:
-        train_pred_kwargs = dict(
-            y_true=train_eval["y_true"],
-            y_pred=train_eval["y_pred"],
-            y_probs=train_eval["y_probs"],
-            readouts=train_eval["readouts"],
-        )
-        if train_eval.get("success_probs") is not None:
-            train_pred_kwargs["success_probs"] = train_eval["success_probs"]
-        np.savez_compressed(sub / "predictions" / "epoch_0001_train.npz",
-                            **train_pred_kwargs)
-
-    # diagnostics/epoch_0001.npz — raw quantum-diagnostic arrays plus the
-    # lcu/poly coefficient snapshots (so the post-hoc report_diagnostics
-    # figures don't need to rebuild the model).
-    diag_raw_with_coeffs = dict(diag_raw)
-    diag_raw_with_coeffs["lcu_coeffs"] = lcu_snap
-    diag_raw_with_coeffs["poly_coeffs"] = poly_snap
-    np.savez_compressed(sub / "diagnostics" / "epoch_0001.npz", **diag_raw_with_coeffs)
+    # predictions/epoch_0001.npz (+ _train) and diagnostics/epoch_0001.npz are
+    # written by the shared epoch-artefacts module, so the cutoff sub-run carries
+    # the exact same key set (incl. cvqnn_params / stacked block-prefixed keys)
+    # as a real run — the live drift fix for W-enabled / stacked checkpoints.
+    art.write(sub, epoch=1)
 
     # Shared heavy artefacts — relative symlinks back to the parent run.
     parent_test_images = run_dir / "predictions" / "test_images.npz"
@@ -504,29 +482,30 @@ def evaluate_at_cutoff(D_new: int) -> tuple[list[dict], Path | None]:
 
     sub_dir: Path | None = None
     if "test" in evals:
-        # quantum diagnostics on the reused diag subset (test only)
-        stats_summary, mean_photon, diag_raw = quantum_diagnostics(
-            model, diag_loader, device,
-            progress=f"D={D_new} diagnostics",
-        )
-        lcu_snap, poly_snap = snapshot_coefficients(model)
-
-        sub_dir = _synthesize_cutoff_rundir(
-            D_new, cfg_eval,
+        # Per-epoch artefacts (coeff snapshots + quantum diagnostics on the
+        # reused diag subset, with the model-variant key dispatch + degrade) are
+        # assembled by the shared module; the synth dir just persists them.
+        art = build_epoch_artefacts(
+            model, device,
             test_eval=evals["test"],
             train_eval=evals.get("train"),
-            quantum_stats=stats_summary,
-            mean_photon=mean_photon,
-            diag_raw=diag_raw,
-            lcu_snap=lcu_snap,
-            poly_snap=poly_snap,
-            n_params=int(n_params),
+            diag_loader=diag_loader,
+            diag_progress=f"D={D_new} diagnostics",
         )
 
-        # Aggregate diag-derived columns on the test row
-        norm_arrays = [diag_raw[k] for k in diag_raw if k.endswith("_state_norms")]
+        sub_dir = _synthesize_cutoff_rundir(
+            D_new, cfg_eval, art, int(n_params),
+        )
+
+        # Aggregate diag-derived columns on the test row (from the possibly
+        # degraded diagnostics dict — None if the diag pass was skipped).
+        diag = art.diagnostics
+        norm_arrays = [diag[k] for k in diag if k.endswith("_state_norms")]
         mean_state_norm = float(np.concatenate(norm_arrays).mean()) if norm_arrays else None
-        mean_photon_val = float(mean_photon.mean())
+        mean_photon_val = (
+            float(diag["mean_photon_number"].mean())
+            if "mean_photon_number" in diag else None
+        )
         for r in rows:
             if r["split"] == "test":
                 r["mean_state_norm"] = mean_state_norm

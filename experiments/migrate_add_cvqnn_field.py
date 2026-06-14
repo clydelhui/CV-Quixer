@@ -1,5 +1,11 @@
 #!/usr/bin/env python
-"""Migrate pre-CVQNN run configs so they still load as W-free (pre-W) models.
+"""ARCHIVED (2026-06): frozen one-shot maintenance tool — kept as a record. Its
+live referents stay valid (``tests/test_cvqnn_block.py``, the guard hint in
+``cv_quixer/config/utils.experiment_config_from_dict``, ADR-0001), and it remains
+runnable for any remaining un-migrated pre-W run, but it is NOT maintained — do
+not modify. See memory ``project_backfill_archived``.
+
+Migrate pre-CVQNN run configs so they still load as W-free (pre-W) models.
 
 The CVQNN block W (``QuantumConfig.cvqnn_num_layers``, default 1) post-dates the
 original frozen model. The canonical default now builds *with* W, which is

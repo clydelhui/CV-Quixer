@@ -1,5 +1,10 @@
 #!/bin/bash
 # -----------------------------------------------------------------------
+# ARCHIVED (2026-06): frozen wrapper for the one-time experiments/backfill_artefacts.py
+# (see memory project_backfill_archived). Still the recovery path for old runs
+# missing artefacts, but NOT maintained — do not modify. The invocation below is
+# unchanged.
+# -----------------------------------------------------------------------
 # SLURM directives — A100 (40 GB), 2 h wall time.
 #
 # Replays the post-epoch evaluation + quantum-diagnostic passes the current

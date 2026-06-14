@@ -44,6 +44,7 @@ from tqdm import tqdm
 
 from cv_quixer.config.schema import ExperimentConfig
 from cv_quixer.config.utils import experiment_config_from_dict
+from cv_quixer.evaluation import artefact_schema as schema
 from cv_quixer.evaluation.labels import class_names
 
 # Heavy / torch-dependent imports (build_model, PatchedDataset, DataLoader,
@@ -74,8 +75,8 @@ def _require_predictions(run_dir: Path, epoch: int, side: str) -> dict:
     `predictions/epoch_NNNN_train.npz` (side='train'). Raises
     `MissingArtefactError` with a backfill hint when absent.
     """
-    suffix = "" if side == "test" else "_train"
-    path = run_dir / "predictions" / f"epoch_{epoch:04d}{suffix}.npz"
+    path = run_dir / "predictions" / schema.prediction_filename(
+        epoch, train=(side != "test"))
     if not path.is_file():
         raise MissingArtefactError(
             f"required artefact missing: {path.relative_to(run_dir)} — "
@@ -135,7 +136,7 @@ def _load_all_diagnostics(run_dir: Path,
             out[epoch] = dict(np.load(path))
         return out
     for e in range(1, n_epochs + 1):
-        path = diag_dir / f"epoch_{e:04d}.npz"
+        path = diag_dir / schema.diagnostics_filename(e)
         if not path.is_file():
             raise MissingArtefactError(
                 f"required artefact missing: {path.relative_to(run_dir)} — "
@@ -366,7 +367,7 @@ def _load_artefacts_recomputed(run: dict) -> dict | None:
     imgs = run["test_images"]
     if preds is None or imgs is None:
         return None
-    needed_pred_keys = {"y_true", "y_pred", "y_probs", "readouts"}
+    needed_pred_keys = set(schema.PREDICTION_KEYS_REQUIRED)
     if not needed_pred_keys.issubset(preds.keys()):
         warnings.warn(
             "predictions npz is missing one of "
@@ -1184,7 +1185,7 @@ def plot_state_norm_histogram(run: dict) -> None:
 def plot_lcu_coefficients_heatmap(run: dict) -> None:
     diag = run["diagnostics"]
     stages = _diag_stages(diag) if diag is not None else []
-    if diag is None or not any(f"{p}lcu_coeffs" in diag for p, _, _ in stages):
+    if diag is None or not any(f"{p}{schema.LCU_COEFFS}" in diag for p, _, _ in stages):
         raise MissingArtefactError(
             f"diagnostics/epoch_{run['epoch']:04d}.npz missing or has no "
             f"`lcu_coeffs` key — run `uv run python "
@@ -1192,7 +1193,7 @@ def plot_lcu_coefficients_heatmap(run: dict) -> None:
             "to produce it."
         )
     for prefix, suffix, label in stages:
-        key = f"{prefix}lcu_coeffs"
+        key = f"{prefix}{schema.LCU_COEFFS}"
         if key not in diag:
             continue
         arr = np.asarray(diag[key])   # (num_heads, num_patches, 2)
@@ -1220,14 +1221,14 @@ def plot_polynomial_coefficient_trajectory(run: dict) -> None:
         return
     diag_per_epoch = _load_all_diagnostics(run["run_dir"], n_epochs=n_epochs)
     stages = _diag_stages(diag_per_epoch[1])
-    if not any(f"{p}poly_coeffs" in diag_per_epoch[1] for p, _, _ in stages):
+    if not any(f"{p}{schema.POLY_COEFFS}" in diag_per_epoch[1] for p, _, _ in stages):
         raise MissingArtefactError(
             f"diagnostics/epoch_0001.npz missing `poly_coeffs` — "
             f"run `uv run python experiments/backfill_artefacts.py "
             f"--run-dir {run['run_dir']}` to produce it."
         )
     for prefix, suffix, label in stages:
-        key = f"{prefix}poly_coeffs"
+        key = f"{prefix}{schema.POLY_COEFFS}"
         if key not in diag_per_epoch[1]:
             continue
         poly_chunks = []
@@ -1268,7 +1269,7 @@ def plot_success_prob_histogram(run: dict) -> None:
     ‖P(M)|ψ⟩‖²/λ² across the test set at the selected epoch, per head.
     λ is derived from the saved lcu/poly coefficients (ADR-0002)."""
     preds = run["predictions"]
-    if preds is None or "success_probs" not in preds:
+    if preds is None or schema.SUCCESS_PROBS not in preds:
         raise MissingArtefactError(
             f"predictions/epoch_{run['epoch']:04d}.npz missing or has no "
             f"`success_probs` key — run `uv run python "
@@ -1276,7 +1277,7 @@ def plot_success_prob_histogram(run: dict) -> None:
             "to produce it."
         )
     diag = run["diagnostics"]
-    if diag is None or "lcu_coeffs" not in diag or "poly_coeffs" not in diag:
+    if diag is None or schema.LCU_COEFFS not in diag or schema.POLY_COEFFS not in diag:
         raise MissingArtefactError(
             f"diagnostics/epoch_{run['epoch']:04d}.npz missing or lacks "
             f"`lcu_coeffs`/`poly_coeffs` (needed to derive λ) — run "
