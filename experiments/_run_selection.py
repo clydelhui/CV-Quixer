@@ -39,7 +39,30 @@ from __future__ import annotations
 
 import argparse
 import warnings
+from pathlib import Path
 from typing import Callable, NamedTuple
+
+# Re-roll dirs (CONTEXT.md "Re-roll", ADR-0007) carry this run-name prefix — the
+# explicit provenance marker, shared by the producer (rerun_sweep) and the
+# consumer (report_sweep) so the naming contract lives in exactly one place.
+REROLL_PREFIX = "reroll__"
+
+
+def read_run_names_file(path: Path) -> set[str]:
+    """Parse run names from a text file (the ``low_accuracy_runs.txt`` format).
+
+    Blank lines and ``#`` comments are ignored; only the first whitespace-delimited
+    token of each remaining line is taken as the run name, so trailing accuracy
+    columns are harmless. Shared by the tools that consume that file as an
+    *include* list (re-roll) or an *exclude* list (report_sweep).
+    """
+    names: set[str] = set()
+    for line in Path(path).read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        names.add(line.split()[0])
+    return names
 
 
 class Field(NamedTuple):
@@ -83,6 +106,7 @@ FILTERABLE_FIELDS: tuple[Field, ...] = (
     Field("trunc_lambda", float, ("quantum", "trunc_lambda")),
     Field("decoder_hidden_mult", float, ("quantum", "decoder_hidden_mult")),
     Field("query_trunc_lambda", float, ("quantum", "query_trunc_lambda")),
+    Field("poly_init_noise", float, ("quantum", "poly_init_noise")),
     # String knobs. block_residual is stored as a bool in config.json but the
     # flag (and replayed arg) is "on"/"off" — normalised in _normalize().
     Field("model", str, ("model",)),
@@ -121,14 +145,19 @@ def _normalize(field: Field, value):
         return value
 
 
-def add_filter_args(parser: argparse.ArgumentParser) -> None:
+def add_filter_args(
+    parser: argparse.ArgumentParser, exclude: set[str] | None = None
+) -> None:
     """Add one ``--<field>`` coordinate-filter flag per registry entry.
 
     Each is ``nargs="+"`` (OR within the flag) and defaults to ``None`` (flag
     absent → that coordinate is unconstrained). Grouped under "coordinate
     filters" in ``--help``. ``block_residual`` takes the "on"/"off" strings the
-    matching arg uses rather than a bool.
+    matching arg uses rather than a bool. ``exclude`` skips named fields whose
+    ``--<field>`` flag a tool defines for its own purpose (e.g. rerun_sweep owns
+    ``--poly-init-noise`` as the value to set, not a coordinate to filter on).
     """
+    exclude = exclude or set()
     group = parser.add_argument_group(
         "coordinate filters",
         "Keep only runs whose configuration matches. Within a flag the values "
@@ -137,6 +166,8 @@ def add_filter_args(parser: argparse.ArgumentParser) -> None:
         "with a warning.",
     )
     for field in FILTERABLE_FIELDS:
+        if field.name in exclude:
+            continue
         arg_type = str if field.name == "block_residual" else field.py_type
         group.add_argument(
             flag_for(field.name), nargs="+", type=arg_type, default=None,
@@ -145,15 +176,22 @@ def add_filter_args(parser: argparse.ArgumentParser) -> None:
         )
 
 
-def parse_filter_args(ns: argparse.Namespace) -> dict[str, set]:
+def parse_filter_args(
+    ns: argparse.Namespace, exclude: set[str] | None = None
+) -> dict[str, set]:
     """Collect the set coordinate-filter flags from a parsed namespace.
 
     Returns ``{field_name: {allowed values}}`` for every flag the user set,
     typed via the registry. Unset flags are omitted, so an empty dict means
-    "no coordinate filter" (``run_matches`` then keeps everything).
+    "no coordinate filter" (``run_matches`` then keeps everything). ``exclude``
+    skips fields a tool re-purposed as its own flag (must match the ``exclude``
+    passed to ``add_filter_args``), so their value never leaks in as a filter.
     """
+    exclude = exclude or set()
     filters: dict[str, set] = {}
     for field in FILTERABLE_FIELDS:
+        if field.name in exclude:
+            continue
         values = getattr(ns, field.name, None)
         if values is not None:
             filters[field.name] = {_normalize(field, v) for v in values}

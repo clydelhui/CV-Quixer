@@ -70,8 +70,21 @@ uv run python experiments/sweep.py \
 uv run python experiments/resume_sweep.py \
     --sweep-dir results/sweeps/<sweep>_<ts>/ --epochs 6 --dry-run
 
+# Re-roll the runs that hit uniform-predictor collapse (ADR-0007): fresh restart
+# (NOT a resume — the collapsed latest.pt IS the failure) with --poly-init-noise on,
+# selected from the sweep's low_accuracy_runs.txt. Re-rolls land in the same sweep
+# dir, named reroll__<orig>__pin{eps}, and record reroll_of in history meta.
+# --runs / coordinate filters narrow further; --dry-run / --launch local|slurm.
+uv run python experiments/rerun_sweep.py \
+    --sweep-dir results/sweeps/<sweep>_<ts>/ \
+    --runs-file results/sweeps/<sweep>_<ts>/low_accuracy_runs.txt \
+    --poly-init-noise 0.05 --dry-run
+
 # Aggregate a finished/partial sweep into a thesis table + comparison plots
-# (also renders the full report_diagnostics suite per run; --skip-per-run-figures to skip)
+# (also renders the full report_diagnostics suite per run; --skip-per-run-figures to skip).
+# --rerolls {ignore(default)|replace|compare}: ignore drops reroll__ dirs (report
+# unchanged); replace substitutes each re-roll for its original; compare keeps only
+# the paired re-roll+original configs at their max-common epoch (escape-rate figure).
 uv run python experiments/report_sweep.py \
     --sweep-dir results/sweeps/<sweep>_<ts>/
 
@@ -210,7 +223,7 @@ runs, one process per grid point, in **two combinable modes**:
   mutually exclusive with `--decoder-hidden-dim`). Run dirs are named
   `manual__obs-{preset}__seed{seed}` plus a short marker per active axis
   (`__nh6`, `__nm3`, `__pd2`, `__ncl3`, `__hll2`, `__dnl3`, `__dhm1.0`, `__sb2`,
-  `__pool-quixer`, `__nores`, `__qtl0.02`, …).
+  `__pool-quixer`, `__nores`, `__qtl0.02`, `__pin0.05`, …).
 
 At least one of `--target-params` or a manual axis is required; they can coexist
 (fix some fields manually while auto-scaling one knob). It writes
@@ -529,6 +542,7 @@ experiments/
 ├── eval_cutoff_sweep_all.py  Fan eval_cutoff_sweep over EVERY run in a sweep (manifest + local/slurm)
 ├── sweep.py               Fan a (param × observable × seed) grid into full_experiment runs
 ├── resume_sweep.py        Top up a sweep: raise selected runs to a target total epoch count (manifest + local/slurm)
+├── rerun_sweep.py         Re-roll selected runs: fresh restart with --poly-init-noise to escape uniform-predictor collapse (ADR-0007; manifest + local/slurm)
 ├── report_sweep.py        Cross-run sweep table (summary.csv/md) + plots + per-run diagnostics
 ├── report_sweep_compare.py  Overlay ≥2 sweeps (e.g. quantum vs quantum_shared) → combined table + cross-sweep figures
 ├── report_cutoff_sweep.py Cross-run cutoff table + figures/cutoff/ + per-cutoff diagnostics
@@ -719,6 +733,7 @@ hard-wired to `num_modes`. See `QuantumConfig.readout_observables` /
 | `hypernet_num_linear_layers` | 1 | Total Linear layers in the hypernet DNN (after the 2D-PE add). 1 = historic single `feature_dim→gate_params`; >1 prepends `(n−1)` `feature_dim→feature_dim` Tanh blocks. Additive (empty at 1 ⇒ unchanged keys). A valid `scaling_knob` |
 | `decoder_num_layers` | 2 | Total Linear layers in the CVDecoder MLP. 2 = historic `Linear→ReLU→Linear` (keys `net.0`/`net.2`); >2 inserts `(n−2)` `h→h` ReLU blocks. A valid `scaling_knob` |
 | `poly_degree` | 2 | Matrix polynomial degree (keep ≤ 4) |
+| `poly_init_noise` | 0.0 | Std of symmetry-breaking noise seeded into the polynomial coeffs `c_{j≥1}` at init (per-head, seeded RNG). Mitigates **uniform-predictor collapse** (CONTEXT.md): the default `c=[1,0,…]` makes `P(M)=I` so the readout is input-independent at init and the loss pins at `ln(num_classes)`. `0.0` = off → no draw, `c=[1,0,…]` exactly, RNG untouched → state_dict byte-identical to a pre-feature model (absent key reloads silently as 0.0; no migration). Keep small (~0.01–0.1). A valid manual sweep / re-roll axis (`__pin{eps}` marker) |
 | `cvqnn_num_layers` | 1 | CVQNN block W depth L_W: a fixed, per-head, trainable Killoran circuit applied to the post-polynomial (post-selected) state before readout. Each layer is the canonical two-interferometer form `(BS→R)→S→(BS→R)→D→K` (the per-patch `U_i` drops the leading interferometer, trivial on its vacuum input). Owned `nn.Parameter`s, small-random init (W≈I). **`0` disables W** → state_dict byte-identical to a pre-W model (ablation / checkpoint-compat baseline). A valid `scaling_knob` but too coarse for budget targeting |
 | `cvqnn_trunc_lambda` | 0.01 | Weight of the **separate** W truncation penalty `1 − ‖W|ψ⟩‖²` added to the training loss (independent of `trunc_lambda`/`trunc_penalty` — W's single-block leakage compounds far less than the per-patch penalty does through the polynomial powers, hence a lighter default). Free to compute (it is the norm used for the post-W renorm). `0` → tracked but not penalised |
 | `target_params` | -1 | If > 0, binary-search the configured `scaling_knob` (build-and-count) to hit this count (warns if the closest achievable is >10% off — `tol=0.10` in `utils/params.py`) |

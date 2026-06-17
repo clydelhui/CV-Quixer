@@ -131,6 +131,7 @@ CNN_KERNEL_SIZE = 3
 DECODER_HIDDEN_DIM = 32
 DECODER_HIDDEN_MULT = None  # if set (float >0), decoder_hidden_dim = round(mult * decoder_in_dim)
 POLY_DEGREE = 3
+POLY_INIT_NOISE = 0.0   # >0 seeds c_{j>=1} to break uniform-predictor collapse (off by default)
 CNN_NUM_CONV_LAYERS = 2          # total conv layers in the CNN stack
 HYPERNET_NUM_LINEAR_LAYERS = 1   # total Linear layers in the hypernet DNN
 DECODER_NUM_LAYERS = 2           # total Linear layers in the decoder MLP
@@ -239,6 +240,15 @@ parser.add_argument("--decoder-hidden-mult", type=float, default=None,
                     "Mutually exclusive with --decoder-hidden-dim")
 parser.add_argument("--poly-degree", type=int, default=None,
                     help=f"matrix polynomial degree d (default {POLY_DEGREE})")
+parser.add_argument("--poly-init-noise", type=float, default=None,
+                    help=f"std of the symmetry-breaking noise seeded into the "
+                    f"polynomial coeffs c_{{j>=1}} at init (default "
+                    f"{POLY_INIT_NOISE}; 0 = off, c=[1,0,…], byte-identical). "
+                    f"Breaks uniform-predictor collapse; keep small (~0.01–0.1)")
+parser.add_argument("--reroll-of", type=str, default=None, metavar="RUN_NAME",
+                    help="provenance: the original run_name this run re-rolls "
+                    "(stamped into history meta so report_sweep can pair a "
+                    "re-roll with its original). Set by rerun_sweep.py")
 parser.add_argument("--cnn-num-conv-layers", type=int, default=None,
                     help=f"total conv layers in the CNN stack (default "
                     f"{CNN_NUM_CONV_LAYERS}); >2 appends same-padding C2→C2 convs")
@@ -420,6 +430,8 @@ if args.decoder_hidden_mult is not None:
     DECODER_HIDDEN_MULT = args.decoder_hidden_mult
 if args.poly_degree is not None:
     POLY_DEGREE = args.poly_degree
+if args.poly_init_noise is not None:
+    POLY_INIT_NOISE = args.poly_init_noise
 if args.cnn_num_conv_layers is not None:
     CNN_NUM_CONV_LAYERS = args.cnn_num_conv_layers
 if args.hypernet_num_linear_layers is not None:
@@ -490,6 +502,7 @@ quantum_cfg = QuantumConfig(
     decoder_hidden_dim=DECODER_HIDDEN_DIM,
     decoder_hidden_mult=DECODER_HIDDEN_MULT,
     poly_degree=POLY_DEGREE,
+    poly_init_noise=POLY_INIT_NOISE,
     cnn_num_conv_layers=CNN_NUM_CONV_LAYERS,
     hypernet_num_linear_layers=HYPERNET_NUM_LINEAR_LAYERS,
     decoder_num_layers=DECODER_NUM_LAYERS,
@@ -830,6 +843,18 @@ history["meta"]["query_trunc_lambda"] = float(QUERY_TRUNC_LAMBDA)
 # decoder_hidden_dim above), kept separately from the int-cast loop.
 _dhm = getattr(_resolved_q, "decoder_hidden_mult", None)
 history["meta"]["decoder_hidden_mult"] = None if _dhm is None else float(_dhm)
+# Symmetry-breaking poly-init perturbation (a float coordinate, like the lambdas).
+history["meta"]["poly_init_noise"] = float(
+    getattr(_resolved_q, "poly_init_noise", 0.0)
+)
+# Re-roll provenance (CONTEXT.md "Re-roll"): the original run_name this run
+# re-rolls, or None for an ordinary run. report_sweep pairs by this reference.
+# Idempotent across resumes: only (over)write when --reroll-of is explicitly
+# passed; a bare --resume (args.reroll_of is None) keeps the value restored from
+# the checkpoint rather than clobbering it to None.
+history["meta"].setdefault("reroll_of", None)
+if args.reroll_of is not None:
+    history["meta"]["reroll_of"] = args.reroll_of
 # Launch provenance (CONTEXT.md: Invocation). Append-only: entry 0 is the
 # launch that created the run; each --resume appends. Lives in history (not
 # config.json, which is rewritten verbatim on every launch) because history

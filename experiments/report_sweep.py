@@ -85,9 +85,11 @@ import numpy as np
 
 from _run_selection import (
     FILTERABLE_FIELDS,
+    REROLL_PREFIX,
     add_filter_args,
     coords_from_meta,
     parse_filter_args,
+    read_run_names_file,
     run_matches,
 )
 
@@ -112,6 +114,10 @@ ARCH_META_FIELDS = [
     "num_seq2seq_blocks", "pooling", "block_residual",
     # Loss-weight knobs (query_trunc_lambda is a sweep axis, __qtl marker).
     "query_trunc_lambda", "cvqnn_trunc_lambda",
+    # Symmetry-breaking poly-init perturbation (__pin marker); the axis a re-roll
+    # varies vs its original, so it must be a config-identity coordinate (off and
+    # on are different configurations, never seed-averaged together).
+    "poly_init_noise",
 ]
 
 # A run's *configuration identity*: every sweep coordinate except the training
@@ -226,26 +232,66 @@ def _load_run(run_dir: Path, max_epoch: int | None = None) -> dict | None:
     }
     # Resolved architecture knobs (present for runs from the manual-sweep-aware
     # full_experiment.py; None for older runs — kept as None in the identity key).
+    # poly_init_noise is defaulted separately just below, so skip it here.
     for field in ARCH_META_FIELDS:
+        if field == "poly_init_noise":
+            continue
         row[field] = meta.get(field)
+    # poly_init_noise: a pre-feature run has no key — default to 0.0 (off), like
+    # scaling_knob's pre-axis default, so a re-roll (on) pairs against an original
+    # (off) instead of (None) in the compare figure.
+    _pin = meta.get("poly_init_noise")
+    row["poly_init_noise"] = 0.0 if _pin is None else float(_pin)
+    # Re-roll provenance (CONTEXT.md "Re-roll"): the original this run re-rolls,
+    # or None for an ordinary run. Used by --rerolls to pair re-rolls to originals.
+    row["reroll_of"] = meta.get("reroll_of")
     return row
 
 
-def read_exclude_file(path: Path) -> set[str]:
-    """Parse run names to exclude from a text file.
+# The ``low_accuracy_runs.txt`` parser is shared (the same format is an *exclude*
+# list here and an *include* list for rerun_sweep) — single source in
+# _run_selection so a format tweak can never make the two tools disagree.
+read_exclude_file = read_run_names_file
 
-    Tolerant of the ``low_accuracy_runs.txt`` format written alongside a sweep:
-    blank lines and ``#`` comment lines are ignored, and only the first
-    whitespace-delimited token of each remaining line is taken as the run name
-    (so the trailing accuracy columns in that file are harmless).
+
+def is_reroll(row: dict) -> bool:
+    """True if this run is a re-roll (identified by its run-name prefix)."""
+    return str(row.get("run_name", "")).startswith(REROLL_PREFIX)
+
+
+def select_for_rerolls(rows: list[dict], mode: str) -> list[dict]:
+    """Filter rows per the --rerolls mode (CONTEXT.md "Re-roll", ADR-0007).
+
+    Pairing is by ``reroll_of`` reference (set from history meta), never by name
+    stripping — a re-roll may change any knob, not just the one in its dir name.
+
+      * ``ignore``  — drop every re-roll row (the full-sweep report is unchanged).
+      * ``replace`` — substitute each re-roll for its original (drop the originals
+        that have a re-roll; keep everything else).
+      * ``compare`` — keep ONLY the paired configs: the re-rolls and the originals
+        they reference. The escape-rate comparison is about exactly those.
     """
-    names: set[str] = set()
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        names.add(line.split()[0])
-    return names
+    if mode == "ignore":
+        return [r for r in rows if not is_reroll(r)]
+    rerolls = [r for r in rows if is_reroll(r)]
+    paired_originals = {r.get("reroll_of") for r in rerolls}
+    if mode == "replace":
+        return [r for r in rows
+                if is_reroll(r) or r["run_name"] not in paired_originals]
+    if mode == "compare":
+        return [r for r in rows
+                if is_reroll(r) or r["run_name"] in paired_originals]
+    raise ValueError(f"unknown --rerolls mode: {mode}")
+
+
+def _common_max_epoch(rows: list[dict]) -> int | None:
+    """The max epoch count common to all rows (min n_epochs); None if empty.
+
+    The fair horizon for a re-roll compare: an original and its re-roll may have
+    trained to different lengths, so best/final are compared at the shorter one.
+    """
+    counts = [r["n_epochs"] for r in rows if r.get("n_epochs")]
+    return min(counts) if counts else None
 
 
 def load_sweep(sweep_dir: Path, max_epoch: int | None = None) -> list[dict]:
@@ -809,6 +855,14 @@ def main() -> None:
              "per-run report_diagnostics figures are unaffected",
     )
     parser.add_argument(
+        "--rerolls", choices=["ignore", "replace", "compare"], default="ignore",
+        help="how to treat re-roll runs (reroll__ prefix; CONTEXT.md, ADR-0007): "
+             "'ignore' (default) drops them so the full-sweep report is unchanged; "
+             "'replace' substitutes each re-roll for its original; 'compare' keeps "
+             "only the paired re-roll+original configs, capped at their max-common "
+             "epoch (paired by the reroll_of reference)",
+    )
+    parser.add_argument(
         "--skip-per-run-figures", action="store_true",
         help="skip rendering report_diagnostics for each run "
              "(cross-run figures + tables only — the fast JSON-only pass)",
@@ -846,6 +900,24 @@ def main() -> None:
     if not rows:
         print(f"No runs found under {sweep_dir} (need per-run history.json).")
         return
+
+    # Re-roll handling (CONTEXT.md "Re-roll", ADR-0007). Applied first so the
+    # default 'ignore' drops re-roll dirs before anything else sees them (the
+    # existing full-sweep report is byte-unchanged even when re-rolls coexist in
+    # the dir). 'compare' then caps the kept rows at their max-common epoch — by
+    # reloading at that horizon when the user hasn't pinned --max-epoch — so an
+    # original and its (differently-trained) re-roll are compared fairly.
+    rows = select_for_rerolls(rows, args.rerolls)
+    if not rows:
+        print(f"No runs left after --rerolls {args.rerolls}.")
+        return
+    if args.rerolls == "compare" and args.max_epoch is None:
+        cap = _common_max_epoch(rows)
+        if cap is not None:
+            rows = select_for_rerolls(
+                load_sweep(sweep_dir, max_epoch=cap), "compare"
+            )
+            print(f"--rerolls compare: capped at max-common epoch {cap}")
 
     # Coordinate filter (CONTEXT.md): keep only runs whose resolved coordinates
     # match. Applied before the name exclusions so the two compose (AND). Each

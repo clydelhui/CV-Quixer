@@ -173,3 +173,25 @@ def test_meta_omits_none_so_filter_reports_unresolved():
 def test_meta_normalizes_block_residual_bool_to_string():
     assert rs.coords_from_meta({"block_residual": True})["block_residual"] == "on"
     assert rs.coords_from_meta({"block_residual": False})["block_residual"] == "off"
+
+
+# --- exclude param (a tool re-purposing a --<field> flag) --------------------
+
+def test_add_filter_args_exclude_skips_the_flag():
+    # rerun_sweep owns --poly-init-noise as the value to SET; excluding it from
+    # the auto-generated coordinate-filter flags avoids an argparse conflict.
+    p = argparse.ArgumentParser()
+    rs.add_filter_args(p, exclude={"poly_init_noise"})
+    p.add_argument("--poly-init-noise", type=float, nargs="+")  # must not conflict
+    ns = p.parse_args(["--poly-init-noise", "0.05", "--num-modes", "2"])
+    assert ns.poly_init_noise == [0.05]
+    assert ns.num_modes == [2]  # other filters still added
+
+
+def test_parse_filter_args_exclude_keeps_value_out_of_filters():
+    # The excluded field's value (the eps the tool sets) must not leak in as a
+    # coordinate filter.
+    ns = argparse.Namespace(poly_init_noise=[0.05], num_modes=[2])
+    filters = rs.parse_filter_args(ns, exclude={"poly_init_noise"})
+    assert "poly_init_noise" not in filters
+    assert filters["num_modes"] == {2}

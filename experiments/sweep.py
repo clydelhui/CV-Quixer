@@ -109,6 +109,8 @@ def _run_name(point: dict) -> str:
         base += f"__dhm{point['decoder_hidden_mult']}"
     if point.get("query_trunc_lambda") is not None:
         base += f"__qtl{point['query_trunc_lambda']}"
+    if point.get("poly_init_noise") is not None:
+        base += f"__pin{point['poly_init_noise']}"
     if point.get("pooling") is not None:
         base += f"__pool-{point['pooling']}"
     if point.get("block_residual") == "off":
@@ -152,6 +154,7 @@ def build_manifest(args: argparse.Namespace) -> dict:
     # Stacked-model axes (non-int, so not ARCH_AXES): query_trunc_lambda is a
     # float axis; pooling / block_residual are choice axes.
     query_trunc_lambdas = args.query_trunc_lambda if args.query_trunc_lambda else [None]
+    poly_init_noises = args.poly_init_noise if args.poly_init_noise else [None]
     poolings = args.pooling if args.pooling else [None]
     block_residuals = args.block_residual if args.block_residual else [None]
     arch_values = {dest: (getattr(args, dest) or [None]) for dest, *_ in ARCH_AXES}
@@ -160,13 +163,13 @@ def build_manifest(args: argparse.Namespace) -> dict:
     axis_names = (
         ["target_params", "observables", "seed", "num_layers", "scaling_knob",
          "trunc_lambda", "decoder_hidden_mult", "query_trunc_lambda",
-         "pooling", "block_residual"]
+         "poly_init_noise", "pooling", "block_residual"]
         + [dest for dest, *_ in ARCH_AXES]
     )
     axis_value_lists = (
         [target_params, args.observables, args.seeds, args.num_layers,
          scaling_knobs, trunc_lambdas, decoder_hidden_mults,
-         query_trunc_lambdas, poolings, block_residuals]
+         query_trunc_lambdas, poly_init_noises, poolings, block_residuals]
         + [arch_values[dest] for dest, *_ in ARCH_AXES]
     )
 
@@ -194,6 +197,8 @@ def build_manifest(args: argparse.Namespace) -> dict:
             run_args += ["--decoder-hidden-mult", str(point["decoder_hidden_mult"])]
         if point["query_trunc_lambda"] is not None:
             run_args += ["--query-trunc-lambda", str(point["query_trunc_lambda"])]
+        if point["poly_init_noise"] is not None:
+            run_args += ["--poly-init-noise", str(point["poly_init_noise"])]
         if point["pooling"] is not None:
             run_args += ["--pooling", point["pooling"]]
         if point["block_residual"] is not None:
@@ -213,6 +218,7 @@ def build_manifest(args: argparse.Namespace) -> dict:
         "trunc_lambda": list(args.trunc_lambda or []),
         "decoder_hidden_mult": list(args.decoder_hidden_mult or []),
         "query_trunc_lambda": list(args.query_trunc_lambda or []),
+        "poly_init_noise": list(args.poly_init_noise or []),
         "pooling": list(args.pooling or []),
         "block_residual": list(args.block_residual or []),
     }
@@ -235,7 +241,8 @@ def build_manifest(args: argparse.Namespace) -> dict:
     }
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the sweep CLI parser (extracted from main for testability)."""
     parser = argparse.ArgumentParser(
         description="Fan a (param-count × observables × seed) grid into "
         "independent full_experiment.py runs.",
@@ -287,6 +294,12 @@ def main() -> None:
         "--query-trunc-lambda", type=float, nargs="+", default=None,
         help="grid axis (--model quantum_stacked): one or more query-unitary "
         "truncation penalty weights. Omit to inherit full_experiment.py's default.",
+    )
+    parser.add_argument(
+        "--poly-init-noise", type=float, nargs="+", default=None,
+        help="manual grid axis: one or more poly-init-noise std values (seeds the "
+        "polynomial coeffs c_{j>=1} to break uniform-predictor collapse; __pin "
+        "marker). Omit to inherit full_experiment.py's default (off, no marker).",
     )
     parser.add_argument(
         "--pooling", type=str, nargs="+", default=None,
@@ -344,6 +357,11 @@ def main() -> None:
         "--wandb", action="store_true",
         help="enable W&B for every run, grouped under the sweep name",
     )
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
     # Require at least one budget axis or one manual arch axis, so a sweep can
@@ -352,6 +370,7 @@ def main() -> None:
     any_arch_axis = (
         any(getattr(args, dest) for dest, *_ in ARCH_AXES)
         or bool(args.decoder_hidden_mult)
+        or bool(args.poly_init_noise)
     )
     if not args.target_params and not any_arch_axis:
         parser.error(

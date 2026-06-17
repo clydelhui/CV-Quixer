@@ -175,6 +175,19 @@ class QuantumConfig:
     # Matrix polynomial degree for LCU attention (P(M) = Σ c_j M^j, j=0..d)
     poly_degree: int = 2           # keep ≤ 4; d=2 or d=3 recommended
 
+    # Symmetry-breaking perturbation of the polynomial-coefficient init. The
+    # coefficients start c = [1, 0, …] so P(M) = I and the readout is
+    # input-independent at init — the structural cause of uniform-predictor
+    # collapse (CONTEXT.md). poly_init_noise > 0 seeds c_{j>=1} with
+    # N(0, poly_init_noise) noise (drawn from the seeded RNG, per-head, so head
+    # symmetry breaks too) so input information reaches the readout from step 0.
+    #   0.0 (default) ⇒ no draw, c stays [1, 0, …] exactly, RNG untouched →
+    #     state_dict byte-identical to a pre-feature model (no migration needed;
+    #     an absent key reloads silently as 0.0, unlike the CVQNN loud guard).
+    # Keep small (~0.01–0.1): a large c_1 gives M|0⟩ real photon weight at init,
+    # fighting the truncation penalty. A valid manual sweep / re-roll axis.
+    poly_init_noise: float = 0.0
+
     # CVQNN block W applied to the post-polynomial (post-selected) state before
     # observable readout — a fixed, per-image, trainable Killoran-style circuit
     # with owned nn.Parameters (input-independent), distinct from the
@@ -266,6 +279,11 @@ class QuantumConfig:
             raise ValueError(
                 f"scaling_knob={self.scaling_knob!r} must name an integer "
                 f"QuantumConfig field; valid choices: {sorted(valid_knobs)}"
+            )
+        if self.poly_init_noise < 0:
+            raise ValueError(
+                f"poly_init_noise={self.poly_init_noise!r} must be >= 0 "
+                "(it is a noise std; 0 = off)"
             )
 
         if self.decoder_hidden_mult is not None and self.decoder_hidden_mult <= 0:

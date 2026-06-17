@@ -563,13 +563,21 @@ class PolynomialCoefficients(nn.Module):
 
     Args:
         degree: Polynomial degree d (total d+1 coefficients).
+        poly_init_noise: If > 0, seed c_{j>=1} with N(0, poly_init_noise) noise to
+            break the uniform-predictor symmetry at init (c_0 stays 1). 0.0 (the
+            default) leaves c = [1, 0, …] exactly.
     """
 
-    def __init__(self, degree: int) -> None:
+    def __init__(self, degree: int, poly_init_noise: float = 0.0) -> None:
         super().__init__()
         # Init: c_0 = 1, rest = 0 → P(M) = I at start of training
         init = torch.zeros(degree + 1)
         init[0] = 1.0
+        # Guard the draw: when the noise is off we must NOT touch the RNG, or every
+        # downstream init shifts and a poly_init_noise=0 model stops being
+        # byte-identical to a pre-feature one.
+        if poly_init_noise:
+            init[1:] = poly_init_noise * torch.randn(degree)
         assert not init.is_complex(), (
             "PolynomialCoefficients must be initialised with a real tensor; "
             "got complex — check the init code above."
@@ -682,7 +690,9 @@ class _CVHeadBase(nn.Module):
         self._gate_bound = config.gate_param_bound
 
         self.lcu_coeffs = LCUSumCoefficients(num_patches)
-        self.poly_coeffs = PolynomialCoefficients(config.poly_degree)
+        self.poly_coeffs = PolynomialCoefficients(
+            config.poly_degree, poly_init_noise=config.poly_init_noise
+        )
         self.circuit = CVCircuit(config.num_modes, config.cutoff_dim)
 
         # CVQNN block W: a fixed, per-image, trainable Killoran circuit applied to
