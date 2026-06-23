@@ -188,6 +188,16 @@ class QuantumConfig:
     # fighting the truncation penalty. A valid manual sweep / re-roll axis.
     poly_init_noise: float = 0.0
 
+    # Positional-encoding variant added to the block-1 CNN hypernetwork's conv
+    # features before the gate-parameter projection (CONTEXT.md "Positional
+    # encoding"). An ablation knob:
+    #   "2d"   (default) — the historic row/col-split sinusoid. Byte-identical to
+    #     a pre-knob model; an absent key reloads silently as "2d" (no migration).
+    #   "1d"   — standard sinusoid over the flattened patch index, full feature_dim.
+    #   "none" — an all-zeros buffer (the additive PE becomes a no-op).
+    # The buffer shape / state-dict key is identical across all three.
+    positional_encoding: str = "2d"
+
     # CVQNN block W applied to the post-polynomial (post-selected) state before
     # observable readout — a fixed, per-image, trainable Killoran-style circuit
     # with owned nn.Parameters (input-independent), distinct from the
@@ -284,6 +294,12 @@ class QuantumConfig:
             raise ValueError(
                 f"poly_init_noise={self.poly_init_noise!r} must be >= 0 "
                 "(it is a noise std; 0 = off)"
+            )
+
+        if self.positional_encoding not in ("none", "1d", "2d"):
+            raise ValueError(
+                f"positional_encoding={self.positional_encoding!r} must be one of "
+                "{'none', '1d', '2d'}"
             )
 
         if self.decoder_hidden_mult is not None and self.decoder_hidden_mult <= 0:

@@ -72,17 +72,57 @@ def array_command(manifest: dict, manifest_path: Path, array_script: str) -> lis
     return ["sbatch", f"--array=0-{n - 1}", array_script, str(manifest_path)]
 
 
+def submit_one(cmd: list[str]) -> dict:
+    """Run one `sbatch` command, parse its job id, return the submission record.
+
+    The single home of the sbatch submit + job-id parse: runs ``cmd`` at the repo
+    root, echoes stdout/stderr, raises ``CalledProcessError`` on a non-zero exit,
+    and parses the id from the canonical ``"Submitted batch job <id>"`` line
+    (None for other output formats). Shared by ``submit_slurm_array`` and the
+    multi-group submitters (e.g. ``build_pe_ablation``) so the parse lives once.
+
+    Returns ``{"sbatch_command", "job_id"}``.
+    """
+    result = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
+    out = result.stdout.strip()
+    if out:
+        print("  " + out)
+    if result.returncode != 0:
+        if result.stderr.strip():
+            print("  " + result.stderr.strip())
+        raise subprocess.CalledProcessError(result.returncode, cmd)
+    job_id = out.split()[-1] if out.startswith("Submitted batch job") else None
+    return {"sbatch_command": shlex.join(cmd), "job_id": job_id}
+
+
+def stamp_slurm_provenance(
+    manifest: dict, manifest_path: Path, submission: dict | list
+) -> None:
+    """Atomically record the SLURM submission on the manifest's last invocation.
+
+    Closes the loop in the invocation record: how the manifest entered the queue,
+    not just how it was defined. ``submission`` is whatever should land under
+    ``invocations[-1]["slurm"]`` — one ``{sbatch_command, job_id}`` dict (a single
+    array) or a list of them (one per GPU-group slice). Atomic ``.json.tmp``
+    replace because the just-submitted array tasks read this file.
+    """
+    manifest["invocations"][-1]["slurm"] = submission
+    tmp_path = manifest_path.with_suffix(".json.tmp")
+    with open(tmp_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    tmp_path.replace(manifest_path)
+
+
 def submit_slurm_array(
     manifest: dict, manifest_path: Path, array_script: str
 ) -> dict | None:
     """Submit the manifest as a SLURM array and close its provenance loop.
 
-    Prints the `sbatch` command, then — if `sbatch` is on PATH — submits it,
-    parses the job id, and atomically stamps ``slurm: {sbatch_command, job_id}``
-    onto the manifest's last invocation record (the just-submitted array tasks
-    read this file, hence the `.json.tmp` replace). When `sbatch` is absent the
-    command is only printed (for hand-running on the login node) and the
-    manifest is left untouched.
+    Prints the `sbatch` command, then — if `sbatch` is on PATH — submits it
+    (``submit_one``), and stamps the result onto the manifest's last invocation
+    record (``stamp_slurm_provenance``). When `sbatch` is absent the command is
+    only printed (for hand-running on the login node) and the manifest is left
+    untouched.
 
     Returns the recorded ``{"sbatch_command", "job_id"}`` dict, or None when
     nothing was submitted.
@@ -97,25 +137,6 @@ def submit_slurm_array(
         )
         return None
 
-    result = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
-    out = result.stdout.strip()
-    if out:
-        print("  " + out)
-    if result.returncode != 0:
-        if result.stderr.strip():
-            print("  " + result.stderr.strip())
-        raise subprocess.CalledProcessError(result.returncode, cmd)
-
-    # sbatch prints "Submitted batch job <id>"; tolerate other formats.
-    job_id = out.split()[-1] if out.startswith("Submitted batch job") else None
-    submission = {"sbatch_command": shlex.join(cmd), "job_id": job_id}
-
-    # Close the loop in the invocation record: how the manifest entered the
-    # queue, not just how it was defined. Atomic replace — the just-submitted
-    # array tasks read this file.
-    manifest["invocations"][-1]["slurm"] = submission
-    tmp_path = manifest_path.with_suffix(".json.tmp")
-    with open(tmp_path, "w") as f:
-        json.dump(manifest, f, indent=2)
-    tmp_path.replace(manifest_path)
+    submission = submit_one(cmd)
+    stamp_slurm_provenance(manifest, manifest_path, submission)
     return submission

@@ -144,6 +144,17 @@ def test_registry_is_superset_of_sweep_arch_axes():
     assert arch_dests <= registry, arch_dests - registry
 
 
+def test_string_choice_sweep_axes_are_registered():
+    """Drift guard for the string-choice axes (positional_encoding, pooling,
+    block_residual). These are NOT in sweep.ARCH_AXES (which is int-only), so the
+    superset guard above does not cover them — assert them explicitly, else a new
+    string axis silently drops out of configuration identity / report grouping."""
+    registry = {f.name for f in rs.FILTERABLE_FIELDS}
+    for name in ("positional_encoding", "pooling", "block_residual"):
+        assert name in registry, f"{name} must be a filterable coordinate"
+        assert rs._FIELDS_BY_NAME[name].py_type is str
+
+
 # --- coords_from_meta (report_sweep's extraction source, ADR-0006) -----------
 
 def test_meta_extracts_resolved_coords():

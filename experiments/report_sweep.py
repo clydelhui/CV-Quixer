@@ -118,6 +118,10 @@ ARCH_META_FIELDS = [
     # varies vs its original, so it must be a config-identity coordinate (off and
     # on are different configurations, never seed-averaged together).
     "poly_init_noise",
+    # Positional-encoding variant (__pe marker); none/1d/2d are distinct
+    # configurations, never seed-averaged together. Defaulted to "2d" on
+    # pre-knob runs just below.
+    "positional_encoding",
 ]
 
 # A run's *configuration identity*: every sweep coordinate except the training
@@ -234,7 +238,7 @@ def _load_run(run_dir: Path, max_epoch: int | None = None) -> dict | None:
     # full_experiment.py; None for older runs — kept as None in the identity key).
     # poly_init_noise is defaulted separately just below, so skip it here.
     for field in ARCH_META_FIELDS:
-        if field == "poly_init_noise":
+        if field in ("poly_init_noise", "positional_encoding"):
             continue
         row[field] = meta.get(field)
     # poly_init_noise: a pre-feature run has no key — default to 0.0 (off), like
@@ -242,6 +246,10 @@ def _load_run(run_dir: Path, max_epoch: int | None = None) -> dict | None:
     # (off) instead of (None) in the compare figure.
     _pin = meta.get("poly_init_noise")
     row["poly_init_noise"] = 0.0 if _pin is None else float(_pin)
+    # positional_encoding: a pre-knob run has no key — default to "2d" (the
+    # historic hardcoded behaviour), so it groups as the 2d arm rather than None.
+    _pe = meta.get("positional_encoding")
+    row["positional_encoding"] = "2d" if _pe is None else str(_pe)
     # Re-roll provenance (CONTEXT.md "Re-roll"): the original this run re-rolls,
     # or None for an ordinary run. Used by --rerolls to pair re-rolls to originals.
     row["reroll_of"] = meta.get("reroll_of")

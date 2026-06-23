@@ -132,6 +132,7 @@ DECODER_HIDDEN_DIM = 32
 DECODER_HIDDEN_MULT = None  # if set (float >0), decoder_hidden_dim = round(mult * decoder_in_dim)
 POLY_DEGREE = 3
 POLY_INIT_NOISE = 0.0   # >0 seeds c_{j>=1} to break uniform-predictor collapse (off by default)
+POSITIONAL_ENCODING = "2d"   # PE variant on the block-1 hypernetwork: 2d (default) | 1d | none
 CNN_NUM_CONV_LAYERS = 2          # total conv layers in the CNN stack
 HYPERNET_NUM_LINEAR_LAYERS = 1   # total Linear layers in the hypernet DNN
 DECODER_NUM_LAYERS = 2           # total Linear layers in the decoder MLP
@@ -245,6 +246,12 @@ parser.add_argument("--poly-init-noise", type=float, default=None,
                     f"polynomial coeffs c_{{j>=1}} at init (default "
                     f"{POLY_INIT_NOISE}; 0 = off, c=[1,0,…], byte-identical). "
                     f"Breaks uniform-predictor collapse; keep small (~0.01–0.1)")
+parser.add_argument("--positional-encoding", type=str, default=None,
+                    choices=["none", "1d", "2d"],
+                    help=f"positional-encoding variant on the block-1 CNN "
+                    f"hypernetwork (default {POSITIONAL_ENCODING!r}): '2d' row/col "
+                    f"sinusoid (byte-identical to pre-knob), '1d' flat-index "
+                    f"sinusoid, 'none' = no PE (zeros buffer)")
 parser.add_argument("--reroll-of", type=str, default=None, metavar="RUN_NAME",
                     help="provenance: the original run_name this run re-rolls "
                     "(stamped into history meta so report_sweep can pair a "
@@ -432,6 +439,8 @@ if args.poly_degree is not None:
     POLY_DEGREE = args.poly_degree
 if args.poly_init_noise is not None:
     POLY_INIT_NOISE = args.poly_init_noise
+if args.positional_encoding is not None:
+    POSITIONAL_ENCODING = args.positional_encoding
 if args.cnn_num_conv_layers is not None:
     CNN_NUM_CONV_LAYERS = args.cnn_num_conv_layers
 if args.hypernet_num_linear_layers is not None:
@@ -503,6 +512,7 @@ quantum_cfg = QuantumConfig(
     decoder_hidden_mult=DECODER_HIDDEN_MULT,
     poly_degree=POLY_DEGREE,
     poly_init_noise=POLY_INIT_NOISE,
+    positional_encoding=POSITIONAL_ENCODING,
     cnn_num_conv_layers=CNN_NUM_CONV_LAYERS,
     hypernet_num_linear_layers=HYPERNET_NUM_LINEAR_LAYERS,
     decoder_num_layers=DECODER_NUM_LAYERS,
@@ -846,6 +856,10 @@ history["meta"]["decoder_hidden_mult"] = None if _dhm is None else float(_dhm)
 # Symmetry-breaking poly-init perturbation (a float coordinate, like the lambdas).
 history["meta"]["poly_init_noise"] = float(
     getattr(_resolved_q, "poly_init_noise", 0.0)
+)
+# Positional-encoding variant (a string coordinate); absent on pre-knob runs → "2d".
+history["meta"]["positional_encoding"] = str(
+    getattr(_resolved_q, "positional_encoding", "2d")
 )
 # Re-roll provenance (CONTEXT.md "Re-roll"): the original run_name this run
 # re-rolls, or None for an ordinary run. report_sweep pairs by this reference.

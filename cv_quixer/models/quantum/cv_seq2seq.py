@@ -185,6 +185,7 @@ class Seq2SeqCNNHead(_Seq2SeqHeadBase):
             cnn_num_conv_layers=config.cnn_num_conv_layers,
             hypernet_num_linear_layers=config.hypernet_num_linear_layers,
             param_count_multiplier=2,
+            positional_encoding=config.positional_encoding,
         )
 
     def _features_to_params(self, features: torch.Tensor) -> torch.Tensor:

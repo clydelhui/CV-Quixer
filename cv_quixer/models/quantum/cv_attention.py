@@ -352,6 +352,65 @@ def _compute_2d_sinusoidal_pe(num_patches: int, feature_dim: int) -> torch.Tenso
     return pe
 
 
+def _compute_1d_sinusoidal_pe(num_patches: int, feature_dim: int) -> torch.Tensor:
+    """Precompute additive 1D sinusoidal PE over the flattened patch index.
+
+    The standard transformer / ViT positional encoding: a sinusoid over the
+    raw row-major patch index ``idx ∈ [0, num_patches)``, spanning the *full*
+    ``feature_dim`` (no row/col split, no grid awareness). Unlike the 2D form,
+    ``num_patches`` need not be a perfect square.
+
+    Args:
+        num_patches: Sequence length (number of patches).
+        feature_dim: Dimensionality of the CNN feature vector (must be even).
+
+    Returns:
+        Float tensor of shape (num_patches, feature_dim).
+    """
+    assert feature_dim % 2 == 0, (
+        f"feature_dim={feature_dim} must be even for 1D sinusoidal PE"
+    )
+    pe = torch.zeros(num_patches, feature_dim)
+    for idx in range(num_patches):
+        for k in range(feature_dim // 2):
+            div = 10000.0 ** (2 * k / feature_dim)
+            pe[idx, 2 * k]     = math.sin(idx / div)
+            pe[idx, 2 * k + 1] = math.cos(idx / div)
+    return pe
+
+
+def _compute_positional_encoding(
+    num_patches: int, feature_dim: int, pe_type: str = "2d"
+) -> torch.Tensor:
+    """Build the additive positional-encoding buffer for the chosen variant.
+
+    The single PE dispatch used by every CNN that emits gate parameters
+    (``CNNHypernetwork``, ``SharedPatchCNN``). All three variants return a
+    ``(num_patches, feature_dim)`` float buffer added to the flattened conv
+    features, so the buffer shape / state-dict key is identical regardless of
+    type — ``"none"`` simply adds zeros.
+
+    Args:
+        num_patches: Sequence length (number of patches).
+        feature_dim: Dimensionality of the CNN feature vector.
+        pe_type:     ``"2d"`` (row/col-split sinusoid, the default — byte-identical
+                     to the historic hardcoded PE), ``"1d"`` (full-width sinusoid
+                     over the flattened patch index), or ``"none"`` (all zeros).
+
+    Returns:
+        Float tensor of shape (num_patches, feature_dim).
+    """
+    if pe_type == "2d":
+        return _compute_2d_sinusoidal_pe(num_patches, feature_dim)
+    if pe_type == "1d":
+        return _compute_1d_sinusoidal_pe(num_patches, feature_dim)
+    if pe_type == "none":
+        return torch.zeros(num_patches, feature_dim)
+    raise ValueError(
+        f"positional_encoding={pe_type!r} must be one of {{'none', '1d', '2d'}}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # CNNHypernetwork
 # ---------------------------------------------------------------------------
@@ -398,6 +457,7 @@ class CNNHypernetwork(nn.Module):
         cnn_num_conv_layers: int = 2,
         hypernet_num_linear_layers: int = 1,
         param_count_multiplier: int = 1,
+        positional_encoding: str = "2d",
     ) -> None:
         super().__init__()
         if cnn_num_conv_layers < 2:
@@ -437,7 +497,7 @@ class CNNHypernetwork(nn.Module):
         )
         self.linear = nn.Linear(feature_dim, gate_params)
 
-        pe = _compute_2d_sinusoidal_pe(num_patches, feature_dim)
+        pe = _compute_positional_encoding(num_patches, feature_dim, positional_encoding)
         self.register_buffer('pos_enc', pe)
 
     def _conv_features(self, x: torch.Tensor) -> torch.Tensor:
@@ -1296,6 +1356,7 @@ class HyperCVAttentionHead(_CVHeadBase):
             config.bs_topology, config.num_layers,
             cnn_num_conv_layers=config.cnn_num_conv_layers,
             hypernet_num_linear_layers=config.hypernet_num_linear_layers,
+            positional_encoding=config.positional_encoding,
         )
 
     def _features_to_params(self, features: torch.Tensor) -> torch.Tensor:
@@ -1334,6 +1395,7 @@ class SharedPatchCNN(nn.Module):
         cnn_channels_2: int,
         cnn_kernel_size: int,
         cnn_num_conv_layers: int = 2,
+        positional_encoding: str = "2d",
     ) -> None:
         super().__init__()
         if cnn_num_conv_layers < 2:
@@ -1357,7 +1419,7 @@ class SharedPatchCNN(nn.Module):
             for _ in range(cnn_num_conv_layers - 2)
         )
 
-        pe = _compute_2d_sinusoidal_pe(num_patches, self.out_dim)
+        pe = _compute_positional_encoding(num_patches, self.out_dim, positional_encoding)
         self.register_buffer('pos_enc', pe)
 
     def forward_grid(self, patches: torch.Tensor) -> torch.Tensor:
@@ -1686,6 +1748,7 @@ class SharedCVAttention(nn.Module):
             patch_size, num_patches,
             config.cnn_channels_1, config.cnn_channels_2, config.cnn_kernel_size,
             cnn_num_conv_layers=config.cnn_num_conv_layers,
+            positional_encoding=config.positional_encoding,
         )
         in_dim = self.patch_cnn.out_dim
         self.heads = nn.ModuleList([
