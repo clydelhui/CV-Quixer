@@ -113,6 +113,8 @@ def _run_name(point: dict) -> str:
         base += f"__pin{point['poly_init_noise']}"
     if point.get("positional_encoding") is not None:
         base += f"__pe{point['positional_encoding']}"
+    if point.get("coeff_ablation") is not None:
+        base += f"__ca{point['coeff_ablation']}"
     if point.get("pooling") is not None:
         base += f"__pool-{point['pooling']}"
     if point.get("block_residual") == "off":
@@ -158,6 +160,7 @@ def build_manifest(args: argparse.Namespace) -> dict:
     query_trunc_lambdas = args.query_trunc_lambda if args.query_trunc_lambda else [None]
     poly_init_noises = args.poly_init_noise if args.poly_init_noise else [None]
     positional_encodings = args.positional_encoding if args.positional_encoding else [None]
+    coeff_ablations = args.coeff_ablation if args.coeff_ablation else [None]
     poolings = args.pooling if args.pooling else [None]
     block_residuals = args.block_residual if args.block_residual else [None]
     arch_values = {dest: (getattr(args, dest) or [None]) for dest, *_ in ARCH_AXES}
@@ -166,14 +169,15 @@ def build_manifest(args: argparse.Namespace) -> dict:
     axis_names = (
         ["target_params", "observables", "seed", "num_layers", "scaling_knob",
          "trunc_lambda", "decoder_hidden_mult", "query_trunc_lambda",
-         "poly_init_noise", "positional_encoding", "pooling", "block_residual"]
+         "poly_init_noise", "positional_encoding", "coeff_ablation",
+         "pooling", "block_residual"]
         + [dest for dest, *_ in ARCH_AXES]
     )
     axis_value_lists = (
         [target_params, args.observables, args.seeds, args.num_layers,
          scaling_knobs, trunc_lambdas, decoder_hidden_mults,
          query_trunc_lambdas, poly_init_noises, positional_encodings,
-         poolings, block_residuals]
+         coeff_ablations, poolings, block_residuals]
         + [arch_values[dest] for dest, *_ in ARCH_AXES]
     )
 
@@ -205,6 +209,8 @@ def build_manifest(args: argparse.Namespace) -> dict:
             run_args += ["--poly-init-noise", str(point["poly_init_noise"])]
         if point["positional_encoding"] is not None:
             run_args += ["--positional-encoding", point["positional_encoding"]]
+        if point["coeff_ablation"] is not None:
+            run_args += ["--coeff-ablation", point["coeff_ablation"]]
         if point["pooling"] is not None:
             run_args += ["--pooling", point["pooling"]]
         if point["block_residual"] is not None:
@@ -226,6 +232,7 @@ def build_manifest(args: argparse.Namespace) -> dict:
         "query_trunc_lambda": list(args.query_trunc_lambda or []),
         "poly_init_noise": list(args.poly_init_noise or []),
         "positional_encoding": list(args.positional_encoding or []),
+        "coeff_ablation": list(args.coeff_ablation or []),
         "pooling": list(args.pooling or []),
         "block_residual": list(args.block_residual or []),
     }
@@ -316,6 +323,13 @@ def build_parser() -> argparse.ArgumentParser:
         "full_experiment.py's default ('2d', no marker).",
     )
     parser.add_argument(
+        "--coeff-ablation", type=str, nargs="+", default=None,
+        choices=["none", "lcu", "lcu_poly"],
+        help="manual grid axis: one or more coefficient-ablation variants "
+        "('none' | 'lcu' | 'lcu_poly'; __ca<v> marker; ADR-0008). Omit to "
+        "inherit full_experiment.py's default ('none', no marker).",
+    )
+    parser.add_argument(
         "--pooling", type=str, nargs="+", default=None,
         choices=["mean", "quixer"],
         help="grid axis (--model quantum_stacked): one or more pooling modes "
@@ -386,6 +400,7 @@ def main() -> None:
         or bool(args.decoder_hidden_mult)
         or bool(args.poly_init_noise)
         or bool(args.positional_encoding)
+        or bool(args.coeff_ablation)
     )
     if not args.target_params and not any_arch_axis:
         parser.error(
@@ -421,7 +436,7 @@ def main() -> None:
     if manifest["axes"].get("decoder_hidden_mult"):
         print(f"  decoder_hidden_mult: {manifest['axes']['decoder_hidden_mult']}")
     for _ax in ("query_trunc_lambda", "poly_init_noise", "positional_encoding",
-                "pooling", "block_residual"):
+                "coeff_ablation", "pooling", "block_residual"):
         if manifest["axes"].get(_ax):
             print(f"  {_ax}: {manifest['axes'][_ax]}")
     for dest, *_ in ARCH_AXES:

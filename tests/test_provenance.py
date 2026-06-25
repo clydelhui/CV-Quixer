@@ -61,7 +61,7 @@ def test_sweep_manifest_carries_invocation(monkeypatch):
         target_params=None, observables=["xpxsps"], seeds=[42], num_layers=[1],
         scaling_knob=None, trunc_lambda=None, decoder_hidden_mult=None,
         query_trunc_lambda=None, poly_init_noise=None, positional_encoding=None,
-        pooling=None, block_residual=None,
+        coeff_ablation=None, pooling=None, block_residual=None,
         model="quantum", epochs=None, train_fraction=None, test_fraction=None,
         subset_seed=42, gate_param_bound=None, sweep_name="sweep_test",
         sweeps_root="results/sweeps", wandb=False,

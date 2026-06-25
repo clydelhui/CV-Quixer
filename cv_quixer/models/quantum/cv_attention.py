@@ -594,13 +594,19 @@ class LCUSumCoefficients(nn.Module):
 
     Args:
         num_patches: Sequence length N (fixed for a given dataset/patch size).
+        trainable: If False (coeff_ablation in {"lcu", "lcu_poly"}; ADR-0008),
+            freeze b_i at the 1/N uniform init with requires_grad=False — a fixed
+            uniform average M = (1/N) Σ_i U_i, removing per-position weighting.
+            The init value is unchanged, so the only effect is the frozen grad.
     """
 
-    def __init__(self, num_patches: int) -> None:
+    def __init__(self, num_patches: int, trainable: bool = True) -> None:
         super().__init__()
         # Init: b_i = 1/N + 0j → M ≈ (1/N) Σ U_i (uniform real average)
-        self.b_real = nn.Parameter(torch.full((num_patches,), 1.0 / num_patches))
-        self.b_imag = nn.Parameter(torch.zeros(num_patches))
+        self.b_real = nn.Parameter(
+            torch.full((num_patches,), 1.0 / num_patches), requires_grad=trainable
+        )
+        self.b_imag = nn.Parameter(torch.zeros(num_patches), requires_grad=trainable)
 
     def forward(self) -> torch.Tensor:
         """Return complex tensor of shape (num_patches,)."""
@@ -625,11 +631,21 @@ class PolynomialCoefficients(nn.Module):
         degree: Polynomial degree d (total d+1 coefficients).
         poly_init_noise: If > 0, seed c_{j>=1} with N(0, poly_init_noise) noise to
             break the uniform-predictor symmetry at init (c_0 stays 1). 0.0 (the
-            default) leaves c = [1, 0, …] exactly.
+            default) leaves c = [1, 0, …] exactly. Ignored when trainable=False.
+        trainable: If False (coeff_ablation == "lcu_poly"; ADR-0008), freeze c at
+            all-ones (P(M) = Σ_j M^j) with requires_grad=False — the equal-weight
+            polynomial, NOT the [1, 0, …] init (which makes P(M) = I and discards
+            the LCU). poly_init_noise is then irrelevant and the RNG is untouched.
     """
 
-    def __init__(self, degree: int, poly_init_noise: float = 0.0) -> None:
+    def __init__(
+        self, degree: int, poly_init_noise: float = 0.0, trainable: bool = True
+    ) -> None:
         super().__init__()
+        if not trainable:
+            # Frozen equal-weight polynomial: all-ones, deterministic, no RNG draw.
+            self.c = nn.Parameter(torch.ones(degree + 1), requires_grad=False)
+            return
         # Init: c_0 = 1, rest = 0 → P(M) = I at start of training
         init = torch.zeros(degree + 1)
         init[0] = 1.0
@@ -749,9 +765,17 @@ class _CVHeadBase(nn.Module):
         # resolves once under vmap.
         self._gate_bound = config.gate_param_bound
 
-        self.lcu_coeffs = LCUSumCoefficients(num_patches)
+        # Coefficient ablation (CONTEXT.md, ADR-0008): freeze the learned
+        # combination coefficients to fixed uniform values. "lcu" freezes the LCU
+        # b_i (= 1/N); "lcu_poly" additionally freezes the polynomial c_j (= 1).
+        # "none" leaves both trainable (byte-identical to a pre-knob head).
+        _lcu_trainable = config.coeff_ablation == "none"
+        _poly_trainable = config.coeff_ablation != "lcu_poly"
+        self.lcu_coeffs = LCUSumCoefficients(num_patches, trainable=_lcu_trainable)
         self.poly_coeffs = PolynomialCoefficients(
-            config.poly_degree, poly_init_noise=config.poly_init_noise
+            config.poly_degree,
+            poly_init_noise=config.poly_init_noise,
+            trainable=_poly_trainable,
         )
         self.circuit = CVCircuit(config.num_modes, config.cutoff_dim)
 

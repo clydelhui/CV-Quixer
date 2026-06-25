@@ -133,6 +133,7 @@ DECODER_HIDDEN_MULT = None  # if set (float >0), decoder_hidden_dim = round(mult
 POLY_DEGREE = 3
 POLY_INIT_NOISE = 0.0   # >0 seeds c_{j>=1} to break uniform-predictor collapse (off by default)
 POSITIONAL_ENCODING = "2d"   # PE variant on the block-1 hypernetwork: 2d (default) | 1d | none
+COEFF_ABLATION = "none"      # freeze learned combination coeffs: none (default) | lcu | lcu_poly
 CNN_NUM_CONV_LAYERS = 2          # total conv layers in the CNN stack
 HYPERNET_NUM_LINEAR_LAYERS = 1   # total Linear layers in the hypernet DNN
 DECODER_NUM_LAYERS = 2           # total Linear layers in the decoder MLP
@@ -252,6 +253,12 @@ parser.add_argument("--positional-encoding", type=str, default=None,
                     f"hypernetwork (default {POSITIONAL_ENCODING!r}): '2d' row/col "
                     f"sinusoid (byte-identical to pre-knob), '1d' flat-index "
                     f"sinusoid, 'none' = no PE (zeros buffer)")
+parser.add_argument("--coeff-ablation", type=str, default=None,
+                    choices=["none", "lcu", "lcu_poly"],
+                    help=f"freeze a head's learned combination coefficients to "
+                    f"fixed uniform values (default {COEFF_ABLATION!r}; ADR-0008): "
+                    f"'lcu' freezes the LCU b_i=1/N, 'lcu_poly' additionally "
+                    f"freezes the polynomial c_j=1, 'none' trains both")
 parser.add_argument("--reroll-of", type=str, default=None, metavar="RUN_NAME",
                     help="provenance: the original run_name this run re-rolls "
                     "(stamped into history meta so report_sweep can pair a "
@@ -441,6 +448,8 @@ if args.poly_init_noise is not None:
     POLY_INIT_NOISE = args.poly_init_noise
 if args.positional_encoding is not None:
     POSITIONAL_ENCODING = args.positional_encoding
+if args.coeff_ablation is not None:
+    COEFF_ABLATION = args.coeff_ablation
 if args.cnn_num_conv_layers is not None:
     CNN_NUM_CONV_LAYERS = args.cnn_num_conv_layers
 if args.hypernet_num_linear_layers is not None:
@@ -513,6 +522,7 @@ quantum_cfg = QuantumConfig(
     poly_degree=POLY_DEGREE,
     poly_init_noise=POLY_INIT_NOISE,
     positional_encoding=POSITIONAL_ENCODING,
+    coeff_ablation=COEFF_ABLATION,
     cnn_num_conv_layers=CNN_NUM_CONV_LAYERS,
     hypernet_num_linear_layers=HYPERNET_NUM_LINEAR_LAYERS,
     decoder_num_layers=DECODER_NUM_LAYERS,
@@ -745,7 +755,12 @@ print(f"Forward shape OK — logits: {tuple(_logits.shape)}\n")
 # Optimizer + state
 # ---------------------------------------------------------------------------
 
-optimizer = torch.optim.Adam(model.parameters(), lr=config.training.lr)
+# Only optimise trainable params: coeff_ablation (ADR-0008) freezes some
+# coefficients with requires_grad=False, so they must not enter the optimiser.
+# A no-op for runs where every parameter is trainable (the historic case).
+optimizer = torch.optim.Adam(
+    (p for p in model.parameters() if p.requires_grad), lr=config.training.lr
+)
 
 history: dict = new_history(int(n_params), str(device))
 
@@ -860,6 +875,10 @@ history["meta"]["poly_init_noise"] = float(
 # Positional-encoding variant (a string coordinate); absent on pre-knob runs → "2d".
 history["meta"]["positional_encoding"] = str(
     getattr(_resolved_q, "positional_encoding", "2d")
+)
+# Coefficient-ablation variant (a string coordinate); absent on pre-knob runs → "none".
+history["meta"]["coeff_ablation"] = str(
+    getattr(_resolved_q, "coeff_ablation", "none")
 )
 # Re-roll provenance (CONTEXT.md "Re-roll"): the original run_name this run
 # re-rolls, or None for an ordinary run. report_sweep pairs by this reference.

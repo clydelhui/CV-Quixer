@@ -198,6 +198,23 @@ class QuantumConfig:
     # The buffer shape / state-dict key is identical across all three.
     positional_encoding: str = "2d"
 
+    # Coefficient ablation: freeze a head's learned combination coefficients to
+    # fixed uniform values to ablate the learned weighting structure (CONTEXT.md
+    # "Coefficient ablation", ADR-0008). Three cumulative levels:
+    #   "none"     (default) — b_i and c_j trained as normal. Byte-identical to a
+    #     pre-knob model; an absent key reloads silently as "none" (no migration).
+    #   "lcu"      — freeze the LCU coeffs b_i = 1/N (requires_grad=False), a fixed
+    #     uniform average M = (1/N) Σ_i U_i with no per-position weighting; c_j
+    #     still trained.
+    #   "lcu_poly" — additionally freeze the polynomial coeffs c_j = 1 (all-ones,
+    #     P = Σ_j M^j; NOT the [1,0,..] init, which makes P=I and kills the LCU).
+    # Frozen scalars are deliberately non-trainable: a single trainable scalar is
+    # gauge-redundant (b folds into c_j) / renorm-inert (global c cancels), so it
+    # carries no expressivity (ADR-0008). The coeffs live in the shared head base,
+    # so this applies uniformly across all model variants. A valid manual sweep
+    # axis (__calcu / __calcu_poly markers).
+    coeff_ablation: str = "none"
+
     # CVQNN block W applied to the post-polynomial (post-selected) state before
     # observable readout — a fixed, per-image, trainable Killoran-style circuit
     # with owned nn.Parameters (input-independent), distinct from the
@@ -300,6 +317,12 @@ class QuantumConfig:
             raise ValueError(
                 f"positional_encoding={self.positional_encoding!r} must be one of "
                 "{'none', '1d', '2d'}"
+            )
+
+        if self.coeff_ablation not in ("none", "lcu", "lcu_poly"):
+            raise ValueError(
+                f"coeff_ablation={self.coeff_ablation!r} must be one of "
+                "{'none', 'lcu', 'lcu_poly'}"
             )
 
         if self.decoder_hidden_mult is not None and self.decoder_hidden_mult <= 0:

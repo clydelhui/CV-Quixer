@@ -114,6 +114,7 @@ FILTERABLE_FIELDS: tuple[Field, ...] = (
     Field("pooling", str, ("quantum", "pooling")),
     Field("block_residual", str, ("quantum", "block_residual")),
     Field("positional_encoding", str, ("quantum", "positional_encoding")),
+    Field("coeff_ablation", str, ("quantum", "coeff_ablation")),
     Field("observables", str, None),  # config-less: name only in meta / --observables
 )
 

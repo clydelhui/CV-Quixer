@@ -216,14 +216,16 @@ runs, one process per grid point, in **two combinable modes**:
   auto-scaling): `--num-heads`, `--num-modes`, `--cutoff-dim`, `--poly-degree`,
   `--cnn-channels-1`, `--cnn-channels-2`, `--cnn-kernel-size`,
   `--decoder-hidden-dim`, `--cnn-num-conv-layers`, `--hypernet-num-linear-layers`,
-  `--decoder-num-layers`, `--decoder-hidden-mult`, plus the stacked-model axes
-  `--num-seq2seq-blocks`, `--pooling`, `--block-residual`,
+  `--decoder-num-layers`, `--decoder-hidden-mult`, `--positional-encoding`,
+  `--coeff-ablation`, plus the
+  stacked-model axes `--num-seq2seq-blocks`, `--pooling`, `--block-residual`,
   `--query-trunc-lambda` (each `nargs='+'`; the same flags
   exist on `full_experiment.py` for single runs; `--decoder-hidden-mult` is
   mutually exclusive with `--decoder-hidden-dim`). Run dirs are named
   `manual__obs-{preset}__seed{seed}` plus a short marker per active axis
   (`__nh6`, `__nm3`, `__pd2`, `__ncl3`, `__hll2`, `__dnl3`, `__dhm1.0`, `__sb2`,
-  `__pool-quixer`, `__nores`, `__qtl0.02`, `__pin0.05`, …).
+  `__pool-quixer`, `__nores`, `__qtl0.02`, `__pin0.05`,
+  `__penone`/`__pe1d`/`__pe2d`, `__calcu`/`__calcu_poly`, …).
 
 At least one of `--target-params` or a manual axis is required; they can coexist
 (fix some fields manually while auto-scaling one knob). It writes
@@ -543,6 +545,8 @@ experiments/
 ├── sweep.py               Fan a (param × observable × seed) grid into full_experiment runs
 ├── resume_sweep.py        Top up a sweep: raise selected runs to a target total epoch count (manifest + local/slurm)
 ├── rerun_sweep.py         Re-roll selected runs: fresh restart with --poly-init-noise to escape uniform-predictor collapse (ADR-0007; manifest + local/slurm)
+├── build_pe_ablation.py     Build the positional-encoding ablation sweep: 16 curated configs × {none, 1d} from scratch, 2d arm reused (manifest + local/slurm)
+├── build_coeff_ablation.py  Build the coefficient-ablation sweep: 16 curated configs × {lcu, lcu_poly} from scratch, 'none' baseline reused (ADR-0008; manifest + local/slurm)
 ├── report_sweep.py        Cross-run sweep table (summary.csv/md) + plots + per-run diagnostics
 ├── report_sweep_compare.py  Overlay ≥2 sweeps (e.g. quantum vs quantum_shared) → combined table + cross-sweep figures
 ├── report_cutoff_sweep.py Cross-run cutoff table + figures/cutoff/ + per-cutoff diagnostics
@@ -705,8 +709,11 @@ hard-wired to `num_modes`. See `QuantumConfig.readout_observables` /
   diagonal gates use `apply_single_mode_phases` with broadcasting (not
   `torch.diag` + einsum) for vmap compatibility.
 - **CNN hypernetwork**: Each patch's gate parameters come from a 2-layer CNN
-  (`CNNHypernetwork`) with 2D sinusoidal positional encodings injected before the linear
-  projection. The circuit is input-dependent — every token sees a different unitary.
+  (`CNNHypernetwork`) with a positional encoding injected before the linear
+  projection — a configurable `positional_encoding` knob (`2d` default / `1d` /
+  `none`; see the config reference and CONTEXT.md "Positional encoding"), not a
+  hardcoded sinusoid. The circuit is input-dependent — every token sees a
+  different unitary.
 - **Identical data pipeline**: Both models receive the same `DataLoader` output — same
   patches, same normalisation.
 
@@ -734,6 +741,8 @@ hard-wired to `num_modes`. See `QuantumConfig.readout_observables` /
 | `decoder_num_layers` | 2 | Total Linear layers in the CVDecoder MLP. 2 = historic `Linear→ReLU→Linear` (keys `net.0`/`net.2`); >2 inserts `(n−2)` `h→h` ReLU blocks. A valid `scaling_knob` |
 | `poly_degree` | 2 | Matrix polynomial degree (keep ≤ 4) |
 | `poly_init_noise` | 0.0 | Std of symmetry-breaking noise seeded into the polynomial coeffs `c_{j≥1}` at init (per-head, seeded RNG). Mitigates **uniform-predictor collapse** (CONTEXT.md): the default `c=[1,0,…]` makes `P(M)=I` so the readout is input-independent at init and the loss pins at `ln(num_classes)`. `0.0` = off → no draw, `c=[1,0,…]` exactly, RNG untouched → state_dict byte-identical to a pre-feature model (absent key reloads silently as 0.0; no migration). Keep small (~0.01–0.1). A valid manual sweep / re-roll axis (`__pin{eps}` marker) |
+| `positional_encoding` | `"2d"` | Positional-encoding variant added to the **block-1 CNN hypernetwork's** conv features before the gate-param projection (CONTEXT.md "Positional encoding"). `"2d"` (default) = the historic row/col-split sinusoid (byte-identical to a pre-knob model; absent key reloads as `"2d"`, no migration); `"1d"` = a standard sinusoid over the flattened patch index spanning the full feature_dim (no grid awareness, no perfect-square requirement); `"none"` = an all-zeros buffer (the additive PE becomes a no-op). The `pos_enc` buffer key/shape is identical across all three. Enters only at the first stage consuming raw patches → in a stacked model, only block 1 carries it. Threads to all model variants. A valid manual sweep axis (`__pe{none,1d,2d}` markers) |
+| `coeff_ablation` | `"none"` | Freeze a head's learned combination coefficients to fixed uniform values to ablate the learned weighting structure (CONTEXT.md "Coefficient ablation", ADR-0008). `"none"` (default) trains `b_i` and `c_j` as normal (byte-identical to a pre-knob model; absent key reloads as `"none"`); `"lcu"` freezes the LCU `b_i = 1/N` (`requires_grad=False`, removing per-position weighting); `"lcu_poly"` additionally freezes the polynomial `c_j = 1` (all-ones, `P=Σ_j M^j` — **not** the `[1,0,…]` init, which would make `P=I` and discard the LCU). Frozen coeffs are excluded from the param count + optimiser; gradients still flow through them to the trainable `U_i`. Lives in the shared head base → applies to all model variants. A valid manual sweep axis (`__calcu`/`__calcu_poly` markers) |
 | `cvqnn_num_layers` | 1 | CVQNN block W depth L_W: a fixed, per-head, trainable Killoran circuit applied to the post-polynomial (post-selected) state before readout. Each layer is the canonical two-interferometer form `(BS→R)→S→(BS→R)→D→K` (the per-patch `U_i` drops the leading interferometer, trivial on its vacuum input). Owned `nn.Parameter`s, small-random init (W≈I). **`0` disables W** → state_dict byte-identical to a pre-W model (ablation / checkpoint-compat baseline). A valid `scaling_knob` but too coarse for budget targeting |
 | `cvqnn_trunc_lambda` | 0.01 | Weight of the **separate** W truncation penalty `1 − ‖W|ψ⟩‖²` added to the training loss (independent of `trunc_lambda`/`trunc_penalty` — W's single-block leakage compounds far less than the per-patch penalty does through the polynomial powers, hence a lighter default). Free to compute (it is the norm used for the post-W renorm). `0` → tracked but not penalised |
 | `target_params` | -1 | If > 0, binary-search the configured `scaling_knob` (build-and-count) to hit this count (warns if the closest achievable is >10% off — `tol=0.10` in `utils/params.py`) |
@@ -807,7 +816,9 @@ param count off the historic 13,530 (set `--cvqnn-num-layers 0` to reproduce the
 exact pre-W model). Trained on the full 60k/10k split. CLI-overridable:
 `--epochs`, `--train-fraction`, `--test-fraction`, `--resume`, `--target-params`
 (re-enables auto-scaling on `--scaling-knob`, default `num_heads`),
-`--cvqnn-num-layers`, `--cvqnn-trunc-lambda`.
+`--cvqnn-num-layers`, `--cvqnn-trunc-lambda`, `--coeff-ablation`
+(`none`/`lcu`/`lcu_poly`; ADR-0008), `--positional-encoding`
+(`none`/`1d`/`2d`).
 
 | Constant | Value | Description |
 |---|---|---|

@@ -89,6 +89,26 @@ that consumes raw patches — so in a stacked model, only the first
 _Avoid_: positional embedding (it is a fixed sinusoid, not a learned
 parameter), patch index (that is only the `1d` ordinate, not the encoding).
 
+**Coefficient ablation** (`none` / `lcu` / `lcu_poly`):
+An ablation that *freezes* a head's learned combination coefficients to fixed
+uniform values, removing learned weighting structure while leaving the
+hypernetwork-emitted [[per-patch unitary]]s and the [[CVQNN block]] `W`
+trainable. Three cumulative levels: `none` (the default — `bᵢ` and `cⱼ` trained
+as normal); `lcu` (freeze the [[LCU]] coefficients to `bᵢ = 1/N`, a fixed
+uniform average `M = (1/N) Σᵢ Uᵢ` with no per-position weighting); `lcu_poly`
+(additionally freeze the [[polynomial]] coefficients to all-ones,
+`P(M) = Σⱼ Mʲ`). The frozen scalars are deliberately *not* trainable: a single
+trainable scalar would be gauge-redundant — a global LCU scalar folds into the
+trainable `cⱼ` (`(b·ΣUᵢ)ʲ = bʲ(ΣUᵢ)ʲ`), and a global polynomial scalar cancels
+in the post-selection renormalisation (so it is [[success probability]]-/trunc
+only, readout-inert). The freeze therefore targets the *weighting pattern*, not
+a magnitude. Applies uniformly across all heads of every model variant (the
+coefficients live in the shared head base), including any [[aggregator block]].
+_Avoid_: coefficient sharing (the values are frozen, not merely tied, and
+"shared" collides with the `quantum_shared` model), uniform-predictor collapse
+(a training failure, not a knob — though `lcu_poly` structurally precludes the
+`P(M)=I` init that drives it).
+
 **Uniform-predictor collapse**:
 A training failure in which a run stays pinned at the trivial constant predictor —
 `train_loss = ln(num_classes)` (≈2.3026 for 10 classes) and accuracy at chance from
