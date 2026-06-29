@@ -49,6 +49,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # Reuse the single-sweep loader + configuration-identity helpers (JSON only).
+from _run_selection import read_run_names_file
+
 from report_sweep import (
     CONFIG_IDENTITY_FIELDS,
     _FIELD_INDEX,
@@ -79,15 +81,26 @@ def _fmt(v: object) -> str:
 
 
 def load_sweeps(
-    sweep_dirs: list[Path], labels: list[str], max_epoch: int | None = None
+    sweep_dirs: list[Path], labels: list[str], max_epoch: int | None = None,
+    include: set[str] | None = None,
 ) -> list[dict]:
-    """Load every run across all sweeps, each row tagged with its sweep label."""
+    """Load every run across all sweeps, each row tagged with its sweep label.
+
+    When ``include`` is given, only runs whose ``run_name`` is in the set are
+    kept (applied per sweep, before the drift check) — the way to restrict the
+    comparison to a curated subset (e.g. a degree ablation vs only its source
+    configs, not the rest of the baseline sweep).
+    """
     rows: list[dict] = []
     for sweep_dir, label in zip(sweep_dirs, labels):
         sweep_rows = load_sweep(sweep_dir, max_epoch=max_epoch)
+        if include is not None:
+            sweep_rows = [r for r in sweep_rows if r["run_name"] in include]
         if not sweep_rows:
             warnings.warn(
-                f"no runs with history.json under {sweep_dir} — skipping",
+                f"no runs with history.json under {sweep_dir}"
+                + (" matching --include-*" if include is not None else "")
+                + " — skipping",
                 RuntimeWarning,
             )
             continue
@@ -334,6 +347,17 @@ def main() -> None:
              "(fair comparison across sweeps trained to different lengths)",
     )
     parser.add_argument(
+        "--include-file", type=str, action="append", default=[], metavar="PATH",
+        help="restrict the comparison to the run names listed in this file "
+             "(low_accuracy_runs.txt format: one name per line, # comments ok); "
+             "repeatable. Use to compare an ablation vs only its source configs",
+    )
+    parser.add_argument(
+        "--include-run", type=str, action="append", default=[], metavar="NAME",
+        help="restrict the comparison to this run name (repeatable; unions with "
+             "--include-file)",
+    )
+    parser.add_argument(
         "--out-dir", type=str, default=None,
         help="output directory (default: results/sweeps/compare_<ts>/)",
     )
@@ -360,7 +384,16 @@ def main() -> None:
     )
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    rows = load_sweeps(sweep_dirs, labels, max_epoch=args.max_epoch)
+    include: set[str] | None = None
+    if args.include_file or args.include_run:
+        include = set(args.include_run)
+        for fpath in args.include_file:
+            if not Path(fpath).is_file():
+                parser.error(f"--include-file does not exist: {fpath}")
+            include |= read_run_names_file(Path(fpath))
+        print(f"Restricting comparison to {len(include)} included run name(s)")
+
+    rows = load_sweeps(sweep_dirs, labels, max_epoch=args.max_epoch, include=include)
     if not rows:
         print("No runs found across the given sweeps (need per-run history.json).")
         return
