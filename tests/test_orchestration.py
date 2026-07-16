@@ -51,6 +51,24 @@ def test_array_command_sizes_array_to_n_runs(tmp_path):
     ]
 
 
+def test_array_command_threads_extra_sbatch_args_after_sbatch(tmp_path):
+    """extra_sbatch_args land right after `sbatch` (before the array script), so
+    the caller can override the script's #SBATCH --gres / --time directives."""
+    manifest = _manifest(3)
+    manifest_path = tmp_path / "sweep_manifest.json"
+
+    cmd = _orchestration.array_command(
+        manifest, manifest_path, "scripts/run_sweep.sh",
+        ["--gres=gpu:h200-141:1", "--time=03:00:00"],
+    )
+
+    assert cmd == [
+        "sbatch", "--array=0-2",
+        "--gres=gpu:h200-141:1", "--time=03:00:00",
+        "scripts/run_sweep.sh", str(manifest_path),
+    ]
+
+
 # --- launch_local --------------------------------------------------------
 
 

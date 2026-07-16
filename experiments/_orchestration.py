@@ -61,15 +61,26 @@ def launch_local(manifest: dict, entry_script: str) -> int:
     return failures
 
 
-def array_command(manifest: dict, manifest_path: Path, array_script: str) -> list[str]:
+def array_command(
+    manifest: dict,
+    manifest_path: Path,
+    array_script: str,
+    extra_sbatch_args: list[str] | None = None,
+) -> list[str]:
     """The ``sbatch`` job-array command for this manifest (pure; no side effects).
 
     One array task per run: ``--array=0-{n_runs-1}`` matches the dense ``index``
     values the shell array script selects on. ``array_script`` is the
     repo-relative `.sh` that runs one task (e.g. ``scripts/run_sweep.sh``).
+
+    ``extra_sbatch_args`` are inserted right after ``sbatch`` (before the array
+    script), so a caller can override the array script's ``#SBATCH`` directives —
+    e.g. ``["--gres=gpu:h200-141:1", "--time=03:00:00"]`` to retarget the GPU /
+    wall. Command-line ``sbatch`` flags take precedence over the script's own.
     """
     n = manifest["n_runs"]
-    return ["sbatch", f"--array=0-{n - 1}", array_script, str(manifest_path)]
+    extra = list(extra_sbatch_args or [])
+    return ["sbatch", f"--array=0-{n - 1}", *extra, array_script, str(manifest_path)]
 
 
 def submit_one(cmd: list[str]) -> dict:
@@ -114,7 +125,10 @@ def stamp_slurm_provenance(
 
 
 def submit_slurm_array(
-    manifest: dict, manifest_path: Path, array_script: str
+    manifest: dict,
+    manifest_path: Path,
+    array_script: str,
+    extra_sbatch_args: list[str] | None = None,
 ) -> dict | None:
     """Submit the manifest as a SLURM array and close its provenance loop.
 
@@ -124,10 +138,13 @@ def submit_slurm_array(
     only printed (for hand-running on the login node) and the manifest is left
     untouched.
 
+    ``extra_sbatch_args`` (e.g. ``["--gres=…", "--time=…"]``) are threaded into
+    the command to override the array script's ``#SBATCH`` directives.
+
     Returns the recorded ``{"sbatch_command", "job_id"}`` dict, or None when
     nothing was submitted.
     """
-    cmd = array_command(manifest, manifest_path, array_script)
+    cmd = array_command(manifest, manifest_path, array_script, extra_sbatch_args)
     print("\nSLURM array submission:")
     print("  " + " ".join(cmd))
     if shutil.which("sbatch") is None:

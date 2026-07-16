@@ -45,6 +45,15 @@ see _run_selection / CONTEXT.md "Coordinate filter"::
     uv run python experiments/resume_sweep.py \\
         --sweep-dir results/sweeps/<sweep>_<ts>/ --epochs 6 \\
         --num-modes 2 3 --num-heads 5 10 --dry-run
+
+Top up on a different GPU / wall than the sweep's default (``--gres`` / ``--time``
+override run_sweep.sh's ``#SBATCH`` directives — e.g. the heavy stacked runs on
+the 141 GB H200s with their 3h cap)::
+
+    uv run python experiments/resume_sweep.py \\
+        --sweep-dir results/sweeps/qsvt_extended_<ts>/ --epochs 10 \\
+        --runs 'quantum_stacked__*nm3*' \\
+        --gres gpu:h200-141:1 --time 03:00:00 --launch slurm
 """
 
 from __future__ import annotations
@@ -194,6 +203,13 @@ def main() -> None:
                         help="fnmatch pattern(s) on run_name to select a "
                              "subset (default: all runs in the manifest)")
     add_filter_args(parser)
+    parser.add_argument("--gres", type=str, default=None, metavar="SPEC",
+                        help="(--launch slurm) override run_sweep.sh's --gres, "
+                             "e.g. 'gpu:h200-141:1' to top up on a different GPU "
+                             "than the sweep's default a100-40")
+    parser.add_argument("--time", type=str, default=None, metavar="HH:MM:SS",
+                        help="(--launch slurm) override run_sweep.sh's --time "
+                             "wall clock, e.g. '03:00:00' for the h200-141 cap")
     parser.add_argument("--launch", choices=["local", "slurm", "none"],
                         default="none",
                         help="local: run sequentially here; slurm: submit a "
@@ -238,7 +254,14 @@ def main() -> None:
         if failures:
             sys.exit(1)
     elif launch == "slurm":
-        submit_slurm_array(manifest, manifest_path, RUN_SWEEP_SH)
+        extra_sbatch_args: list[str] = []
+        if args.gres is not None:
+            extra_sbatch_args.append(f"--gres={args.gres}")
+        if args.time is not None:
+            extra_sbatch_args.append(f"--time={args.time}")
+        submit_slurm_array(
+            manifest, manifest_path, RUN_SWEEP_SH, extra_sbatch_args or None
+        )
     else:
         print("\n(manifest written; no runs launched — use --launch local|slurm)")
 

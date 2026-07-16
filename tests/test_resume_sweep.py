@@ -361,3 +361,45 @@ def test_slurm_command_uses_run_sweep_sh_unchanged(tmp_path):
     assert cmd == [
         "sbatch", "--array=0-2", "scripts/run_sweep.sh", str(manifest_path)
     ]
+
+
+def test_gres_and_time_are_threaded_to_submit(tmp_path, monkeypatch):
+    """--gres / --time reach submit_slurm_array as extra sbatch args, so a top-up
+    can retarget the GPU / wall (e.g. the h200-141 3h cap)."""
+    sweep_dir, _ = _three_run_sweep(tmp_path)
+
+    captured = {}
+
+    def fake_submit(manifest, manifest_path, array_script, extra_sbatch_args=None):
+        captured["extra"] = extra_sbatch_args
+        return None
+
+    monkeypatch.setattr(resume_sweep, "submit_slurm_array", fake_submit)
+    monkeypatch.setattr(sys, "argv", [
+        "resume_sweep.py", "--sweep-dir", str(sweep_dir), "--epochs", "6",
+        "--gres", "gpu:h200-141:1", "--time", "03:00:00", "--launch", "slurm",
+    ])
+    resume_sweep.main()
+
+    assert captured["extra"] == ["--gres=gpu:h200-141:1", "--time=03:00:00"]
+
+
+def test_slurm_without_gres_time_passes_no_extra_args(tmp_path, monkeypatch):
+    """Omitting --gres/--time threads None (no override) — the run_sweep.sh
+    #SBATCH defaults stand, preserving the prior behaviour."""
+    sweep_dir, _ = _three_run_sweep(tmp_path)
+
+    captured = {}
+
+    def fake_submit(manifest, manifest_path, array_script, extra_sbatch_args=None):
+        captured["extra"] = extra_sbatch_args
+        return None
+
+    monkeypatch.setattr(resume_sweep, "submit_slurm_array", fake_submit)
+    monkeypatch.setattr(sys, "argv", [
+        "resume_sweep.py", "--sweep-dir", str(sweep_dir), "--epochs", "6",
+        "--launch", "slurm",
+    ])
+    resume_sweep.main()
+
+    assert captured["extra"] is None

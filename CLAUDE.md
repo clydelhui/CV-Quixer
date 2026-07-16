@@ -291,7 +291,11 @@ runs already at ≥ N are skipped. Writes `resume_manifest_<ts>.json` (same
 `runs[]` schema, re-indexed 0..K−1) so `scripts/run_sweep.sh` consumes it
 unchanged; the original manifest is never modified. `--runs PATTERN…` (fnmatch
 on run_name) selects a subset; `--dry-run` / `--launch local|slurm` as with
-`sweep.py`. Caveat: resume restores model+optimizer but not RNG state, so a
+`sweep.py`. `--gres SPEC` / `--time HH:MM:SS` override `run_sweep.sh`'s `#SBATCH`
+directives at `--launch slurm` (threaded through `_orchestration.submit_slurm_array`'s
+`extra_sbatch_args`), e.g. topping up the heavy stacked runs on
+`--gres gpu:h200-141:1 --time 03:00:00` (the H200 3h cap) instead of the sweep's
+default a100-40/8h. Caveat: resume restores model+optimizer but not RNG state, so a
 topped-up run is statistically equivalent — not bit-identical — to an
 uninterrupted run of the same length.
 
