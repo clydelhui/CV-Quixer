@@ -217,7 +217,7 @@ runs, one process per grid point, in **two combinable modes**:
   `--cnn-channels-1`, `--cnn-channels-2`, `--cnn-kernel-size`,
   `--decoder-hidden-dim`, `--cnn-num-conv-layers`, `--hypernet-num-linear-layers`,
   `--decoder-num-layers`, `--decoder-hidden-mult`, `--positional-encoding`,
-  `--coeff-ablation`, plus the
+  `--coeff-ablation`, `--poly-mode`, plus the
   stacked-model axes `--num-seq2seq-blocks`, `--pooling`, `--block-residual`,
   `--query-trunc-lambda` (each `nargs='+'`; the same flags
   exist on `full_experiment.py` for single runs; `--decoder-hidden-mult` is
@@ -225,7 +225,7 @@ runs, one process per grid point, in **two combinable modes**:
   `manual__obs-{preset}__seed{seed}` plus a short marker per active axis
   (`__nh6`, `__nm3`, `__pd2`, `__ncl3`, `__hll2`, `__dnl3`, `__dhm1.0`, `__sb2`,
   `__pool-quixer`, `__nores`, `__qtl0.02`, `__pin0.05`,
-  `__penone`/`__pe1d`/`__pe2d`, `__calcu`/`__calcu_poly`, …).
+  `__penone`/`__pe1d`/`__pe2d`, `__calcu`/`__calcu_poly`, `__qsvt`, …).
 
 At least one of `--target-params` or a manual axis is required; they can coexist
 (fix some fields manually while auto-scaling one knob). It writes
@@ -743,6 +743,7 @@ hard-wired to `num_modes`. See `QuantumConfig.readout_observables` /
 | `poly_init_noise` | 0.0 | Std of symmetry-breaking noise seeded into the polynomial coeffs `c_{j≥1}` at init (per-head, seeded RNG). Mitigates **uniform-predictor collapse** (CONTEXT.md): the default `c=[1,0,…]` makes `P(M)=I` so the readout is input-independent at init and the loss pins at `ln(num_classes)`. `0.0` = off → no draw, `c=[1,0,…]` exactly, RNG untouched → state_dict byte-identical to a pre-feature model (absent key reloads silently as 0.0; no migration). Keep small (~0.01–0.1). A valid manual sweep / re-roll axis (`__pin{eps}` marker) |
 | `positional_encoding` | `"2d"` | Positional-encoding variant added to the **block-1 CNN hypernetwork's** conv features before the gate-param projection (CONTEXT.md "Positional encoding"). `"2d"` (default) = the historic row/col-split sinusoid (byte-identical to a pre-knob model; absent key reloads as `"2d"`, no migration); `"1d"` = a standard sinusoid over the flattened patch index spanning the full feature_dim (no grid awareness, no perfect-square requirement); `"none"` = an all-zeros buffer (the additive PE becomes a no-op). The `pos_enc` buffer key/shape is identical across all three. Enters only at the first stage consuming raw patches → in a stacked model, only block 1 carries it. Threads to all model variants. A valid manual sweep axis (`__pe{none,1d,2d}` markers) |
 | `coeff_ablation` | `"none"` | Freeze a head's learned combination coefficients to fixed uniform values to ablate the learned weighting structure (CONTEXT.md "Coefficient ablation", ADR-0008). `"none"` (default) trains `b_i` and `c_j` as normal (byte-identical to a pre-knob model; absent key reloads as `"none"`); `"lcu"` freezes the LCU `b_i = 1/N` (`requires_grad=False`, removing per-position weighting); `"lcu_poly"` additionally freezes the polynomial `c_j = 1` (all-ones, `P=Σ_j M^j` — **not** the `[1,0,…]` init, which would make `P=I` and discard the LCU). Frozen coeffs are excluded from the param count + optimiser; gradients still flow through them to the trainable `U_i`. Lives in the shared head base → applies to all model variants. A valid manual sweep axis (`__calcu`/`__calcu_poly` markers) |
+| `poly_mode` | `"standard"` | Polynomial construction mode (CONTEXT.md "Polynomial mode", ADR-0009): how each degree-`j` term of `P(M)=Σ_j c_j M^j` is built from the LCU `M`. `"standard"` (default) applies `M` `j` times — the literal power `M^j` (byte-identical to a pre-knob model; absent key reloads as `"standard"`). `"qsvt"` alternates `M` with its adjoint `M†` by application parity (`v_1=Mv_0`, `v_2=M†v_1`, …) so term `j` is `M†M M†…` (`j` factors, rightmost `M`): even terms `(M†M)^{j/2}=VΣ^jV†` stay in the input singular-vector space, odd terms `M(M†M)^{(j-1)/2}=WΣ^jV†` map input→output, and their `c_j`-weighted sum is the QSVT singular-value transform (parity branches superposed by plain vector addition). `M†` is the true adjoint of the *truncated* `M` (conjugate-transpose of the Fock gate matrices, NOT param-negation). Reuses the same `b_i`/`c_j`/`U_i` (structurally identical state_dict); only the forward computation changes. Coincides with `"standard"` at `poly_degree ≤ 1`. Lives in the shared head base → applies to all model variants. A valid manual sweep axis (`__qsvt` marker) |
 | `cvqnn_num_layers` | 1 | CVQNN block W depth L_W: a fixed, per-head, trainable Killoran circuit applied to the post-polynomial (post-selected) state before readout. Each layer is the canonical two-interferometer form `(BS→R)→S→(BS→R)→D→K` (the per-patch `U_i` drops the leading interferometer, trivial on its vacuum input). Owned `nn.Parameter`s, small-random init (W≈I). **`0` disables W** → state_dict byte-identical to a pre-W model (ablation / checkpoint-compat baseline). A valid `scaling_knob` but too coarse for budget targeting |
 | `cvqnn_trunc_lambda` | 0.01 | Weight of the **separate** W truncation penalty `1 − ‖W|ψ⟩‖²` added to the training loss (independent of `trunc_lambda`/`trunc_penalty` — W's single-block leakage compounds far less than the per-patch penalty does through the polynomial powers, hence a lighter default). Free to compute (it is the norm used for the post-W renorm). `0` → tracked but not penalised |
 | `target_params` | -1 | If > 0, binary-search the configured `scaling_knob` (build-and-count) to hit this count (warns if the closest achievable is >10% off — `tol=0.10` in `utils/params.py`) |
@@ -818,7 +819,7 @@ exact pre-W model). Trained on the full 60k/10k split. CLI-overridable:
 (re-enables auto-scaling on `--scaling-knob`, default `num_heads`),
 `--cvqnn-num-layers`, `--cvqnn-trunc-lambda`, `--coeff-ablation`
 (`none`/`lcu`/`lcu_poly`; ADR-0008), `--positional-encoding`
-(`none`/`1d`/`2d`).
+(`none`/`1d`/`2d`), `--poly-mode` (`standard`/`qsvt`; ADR-0009).
 
 | Constant | Value | Description |
 |---|---|---|

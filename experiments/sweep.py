@@ -115,6 +115,8 @@ def _run_name(point: dict) -> str:
         base += f"__pe{point['positional_encoding']}"
     if point.get("coeff_ablation") is not None:
         base += f"__ca{point['coeff_ablation']}"
+    if point.get("poly_mode") == "qsvt":
+        base += "__qsvt"
     if point.get("pooling") is not None:
         base += f"__pool-{point['pooling']}"
     if point.get("block_residual") == "off":
@@ -161,6 +163,7 @@ def build_manifest(args: argparse.Namespace) -> dict:
     poly_init_noises = args.poly_init_noise if args.poly_init_noise else [None]
     positional_encodings = args.positional_encoding if args.positional_encoding else [None]
     coeff_ablations = args.coeff_ablation if args.coeff_ablation else [None]
+    poly_modes = args.poly_mode if args.poly_mode else [None]
     poolings = args.pooling if args.pooling else [None]
     block_residuals = args.block_residual if args.block_residual else [None]
     arch_values = {dest: (getattr(args, dest) or [None]) for dest, *_ in ARCH_AXES}
@@ -170,14 +173,14 @@ def build_manifest(args: argparse.Namespace) -> dict:
         ["target_params", "observables", "seed", "num_layers", "scaling_knob",
          "trunc_lambda", "decoder_hidden_mult", "query_trunc_lambda",
          "poly_init_noise", "positional_encoding", "coeff_ablation",
-         "pooling", "block_residual"]
+         "poly_mode", "pooling", "block_residual"]
         + [dest for dest, *_ in ARCH_AXES]
     )
     axis_value_lists = (
         [target_params, args.observables, args.seeds, args.num_layers,
          scaling_knobs, trunc_lambdas, decoder_hidden_mults,
          query_trunc_lambdas, poly_init_noises, positional_encodings,
-         coeff_ablations, poolings, block_residuals]
+         coeff_ablations, poly_modes, poolings, block_residuals]
         + [arch_values[dest] for dest, *_ in ARCH_AXES]
     )
 
@@ -211,6 +214,8 @@ def build_manifest(args: argparse.Namespace) -> dict:
             run_args += ["--positional-encoding", point["positional_encoding"]]
         if point["coeff_ablation"] is not None:
             run_args += ["--coeff-ablation", point["coeff_ablation"]]
+        if point["poly_mode"] is not None:
+            run_args += ["--poly-mode", point["poly_mode"]]
         if point["pooling"] is not None:
             run_args += ["--pooling", point["pooling"]]
         if point["block_residual"] is not None:
@@ -233,6 +238,7 @@ def build_manifest(args: argparse.Namespace) -> dict:
         "poly_init_noise": list(args.poly_init_noise or []),
         "positional_encoding": list(args.positional_encoding or []),
         "coeff_ablation": list(args.coeff_ablation or []),
+        "poly_mode": list(args.poly_mode or []),
         "pooling": list(args.pooling or []),
         "block_residual": list(args.block_residual or []),
     }
@@ -330,6 +336,13 @@ def build_parser() -> argparse.ArgumentParser:
         "inherit full_experiment.py's default ('none', no marker).",
     )
     parser.add_argument(
+        "--poly-mode", type=str, nargs="+", default=None,
+        choices=["standard", "qsvt"],
+        help="manual grid axis: one or more polynomial-construction modes "
+        "('standard' | 'qsvt'; 'qsvt' marks the run dir __qsvt; ADR-0009). Omit "
+        "to inherit full_experiment.py's default ('standard', no marker).",
+    )
+    parser.add_argument(
         "--pooling", type=str, nargs="+", default=None,
         choices=["mean", "quixer"],
         help="grid axis (--model quantum_stacked): one or more pooling modes "
@@ -401,6 +414,7 @@ def main() -> None:
         or bool(args.poly_init_noise)
         or bool(args.positional_encoding)
         or bool(args.coeff_ablation)
+        or bool(args.poly_mode)
     )
     if not args.target_params and not any_arch_axis:
         parser.error(

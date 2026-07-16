@@ -1448,3 +1448,149 @@ class TestArchitectureDepth:
         """Default (None) leaves decoder_hidden_dim at its configured static value."""
         model = CVQuixer(small_quantum_config, tiny_data_config)
         assert model.config.decoder_hidden_dim == small_quantum_config.decoder_hidden_dim
+
+
+class TestQsvtPolynomialMode:
+    """The `qsvt` polynomial mode (ADR-0009): alternate M / M† to build the
+    singular-value transform, instead of the literal matrix powers M^j.
+    """
+
+    @staticmethod
+    def _head(poly_mode, poly_degree, cutoff_dim=3):
+        config = QuantumConfig(
+            num_modes=2,
+            cutoff_dim=cutoff_dim,
+            num_heads=1,
+            cnn_channels_1=4,
+            cnn_channels_2=8,
+            cnn_kernel_size=3,
+            decoder_hidden_dim=16,
+            poly_degree=poly_degree,
+            dtype="complex128",
+            bs_topology="linear",
+            poly_mode=poly_mode,
+        )
+        # Same seed → identical parameters, so any output difference is purely
+        # the M/M† alternation (the two heads share every b_i / c_j / U_i).
+        torch.manual_seed(0)
+        return HyperCVAttentionHead(patch_size=7, num_patches=16, config=config)
+
+    def test_invalid_poly_mode_rejected(self):
+        with pytest.raises(ValueError, match="poly_mode="):
+            QuantumConfig(num_modes=2, cutoff_dim=4, poly_mode="bogus")
+
+    def test_default_is_standard(self):
+        assert QuantumConfig(num_modes=2, cutoff_dim=4).poly_mode == "standard"
+
+    def test_qsvt_state_dict_structurally_identical_to_standard(self):
+        """qsvt adds no parameters — the state_dict keys/shapes are unchanged."""
+        std = self._head("standard", poly_degree=3)
+        qsvt = self._head("qsvt", poly_degree=3)
+        sd_std, sd_qsvt = std.state_dict(), qsvt.state_dict()
+        assert sd_std.keys() == sd_qsvt.keys()
+        for k in sd_std:
+            assert sd_std[k].shape == sd_qsvt[k].shape
+
+    @staticmethod
+    def _set_poly_coeffs(head, values):
+        """Force nonzero polynomial coefficients so P(M) ≠ I exercises the M/M†
+        terms (the default init c = [1, 0, …] would zero every j ≥ 1 term)."""
+        head.poly_coeffs.c.data = torch.tensor(values, dtype=head.poly_coeffs.c.dtype)
+
+    @pytest.mark.parametrize("poly_degree", [0, 1])
+    def test_qsvt_equals_standard_at_low_degree(self, poly_degree):
+        """At poly_degree ≤ 1 no M† application occurs, so the modes coincide."""
+        std = self._head("standard", poly_degree)
+        qsvt = self._head("qsvt", poly_degree)
+        coeffs = [0.5, 0.3][:poly_degree + 1]
+        self._set_poly_coeffs(std, coeffs)
+        self._set_poly_coeffs(qsvt, coeffs)
+        torch.manual_seed(1)
+        patches = torch.randn(16, 49)
+        v = FockState.vacuum(std.num_modes, std.cutoff_dim,
+                             torch.device("cpu"), torch.complex128).data.reshape(-1)
+        dev, dt = torch.device("cpu"), torch.complex128
+        out_std, _ = std._apply_polynomial_iterative(patches, v, dev, dt)
+        out_qsvt, _ = qsvt._apply_polynomial_iterative(patches, v, dev, dt)
+        assert torch.allclose(out_std, out_qsvt, atol=1e-10)
+
+    def test_qsvt_differs_from_standard_at_degree_2(self):
+        """At poly_degree ≥ 2 the M† pass makes qsvt a different operator."""
+        std = self._head("standard", poly_degree=2)
+        qsvt = self._head("qsvt", poly_degree=2)
+        # Nonzero c_2 so the degree-2 term (M² vs M†M) actually contributes.
+        self._set_poly_coeffs(std, [0.5, 0.3, 0.2])
+        self._set_poly_coeffs(qsvt, [0.5, 0.3, 0.2])
+        torch.manual_seed(2)
+        patches = torch.randn(16, 49)
+        v = FockState.vacuum(std.num_modes, std.cutoff_dim,
+                             torch.device("cpu"), torch.complex128).data.reshape(-1)
+        dev, dt = torch.device("cpu"), torch.complex128
+        out_std, _ = std._apply_polynomial_iterative(patches, v, dev, dt)
+        out_qsvt, _ = qsvt._apply_polynomial_iterative(patches, v, dev, dt)
+        assert not torch.allclose(out_std, out_qsvt, atol=1e-6)
+
+    def test_dagger_lcu_is_true_adjoint_of_forward_lcu(self):
+        """M†|v⟩ (the qsvt even-parity pass) equals the conjugate-transpose of
+        the forward LCU map M|v⟩ — the core ADR-0009 correctness claim.
+
+        Build M as a matrix by applying the forward LCU to each computational
+        basis vector (column k = M e_k), take its conjugate-transpose, and check
+        that `_apply_lcu_dagger_params_to_vector` reproduces M† @ v.
+        """
+        head = self._head("qsvt", poly_degree=2)
+        dev, dt = torch.device("cpu"), torch.complex128
+        torch.manual_seed(3)
+        patches = torch.randn(16, 49)
+        all_params = head._features_to_params(patches).to(dev)
+        dim = head.cutoff_dim ** head.num_modes
+
+        # Materialise M column-by-column from the forward LCU path.
+        cols = []
+        for k in range(dim):
+            e_k = torch.zeros(dim, dtype=dt)
+            e_k[k] = 1.0
+            cols.append(head._apply_lcu_params_to_vector(all_params, e_k, dev, dt))
+        M = torch.stack(cols, dim=1)              # (dim, dim); column k = M e_k
+        M_dag = M.conj().transpose(-2, -1)
+
+        torch.manual_seed(4)
+        v = torch.randn(dim, dtype=torch.float64) + 1j * torch.randn(dim, dtype=torch.float64)
+        v = v.to(dt)
+        got = head._apply_lcu_dagger_params_to_vector(all_params, v, dev, dt)
+        assert torch.allclose(got, M_dag @ v, atol=1e-9)
+
+    def test_qsvt_full_model_forward_finite(self, tiny_data_config):
+        """A full CVQuixer with poly_mode='qsvt' runs and produces finite logits."""
+        config = QuantumConfig(
+            num_modes=2, cutoff_dim=4, num_heads=2,
+            cnn_channels_1=4, cnn_channels_2=8, cnn_kernel_size=3,
+            decoder_hidden_dim=16, poly_degree=3, dtype="complex64",
+            poly_mode="qsvt",
+        )
+        torch.manual_seed(0)
+        model = CVQuixer(config, tiny_data_config)
+        patch_dim = tiny_data_config.patch_size ** 2
+        num_patches = (tiny_data_config.image_size // tiny_data_config.patch_size) ** 2
+        x = torch.randn(2, num_patches, patch_dim)
+        logits = model(x)
+        assert logits.shape == (2, tiny_data_config.num_classes)
+        assert torch.isfinite(logits).all()
+
+    def test_qsvt_backward_finite(self, tiny_data_config):
+        """Gradients flow through the M† pass without NaNs."""
+        config = QuantumConfig(
+            num_modes=2, cutoff_dim=4, num_heads=1,
+            cnn_channels_1=4, cnn_channels_2=8, cnn_kernel_size=3,
+            decoder_hidden_dim=16, poly_degree=3, dtype="complex64",
+            poly_mode="qsvt",
+        )
+        torch.manual_seed(0)
+        model = CVQuixer(config, tiny_data_config)
+        patch_dim = tiny_data_config.patch_size ** 2
+        num_patches = (tiny_data_config.image_size // tiny_data_config.patch_size) ** 2
+        x = torch.randn(2, num_patches, patch_dim)
+        model(x).sum().backward()
+        for name, p in model.named_parameters():
+            if p.grad is not None:
+                assert torch.isfinite(p.grad).all(), f"non-finite grad in {name}"

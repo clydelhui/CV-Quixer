@@ -215,6 +215,26 @@ class QuantumConfig:
     # axis (__calcu / __calcu_poly markers).
     coeff_ablation: str = "none"
 
+    # Polynomial construction mode (CONTEXT.md "Polynomial mode", ADR-0009): how
+    # each degree-j term of P(M) = Σ_j c_j M^j is built from the LCU M.
+    #   "standard" (default) — apply M j times: the literal matrix power M^j.
+    #     Byte-identical to a pre-knob model; an absent key reloads silently as
+    #     "standard" (no migration).
+    #   "qsvt"     — alternate M with its adjoint M† by application parity
+    #     (v_1 = M v_0, v_2 = M† v_1, v_3 = M v_2, …), so term j is the ordered
+    #     product of j factors with M rightmost. Even terms (M†M)^{j/2} = VΣ^jV†
+    #     stay in M's input singular-vector space, odd terms M(M†M)^{(j-1)/2} =
+    #     WΣ^jV† map input→output, and their c_j-weighted sum is the QSVT
+    #     singular-value transform of Σ_j c_j σ^j (the parity branches superposed
+    #     by plain vector addition). M† is the true adjoint of the *truncated*
+    #     simulated M (conjugate-transpose of the Fock gate matrices, NOT
+    #     param-negation, which differs at finite cutoff). Reuses the same
+    #     b_i/c_j/U_i — only the forward computation changes.
+    # Lives in the shared head base, so it applies to all model variants. At
+    # poly_degree ≤ 1 the two modes coincide (no M† application). A valid manual
+    # sweep axis (__qsvt marker).
+    poly_mode: str = "standard"
+
     # CVQNN block W applied to the post-polynomial (post-selected) state before
     # observable readout — a fixed, per-image, trainable Killoran-style circuit
     # with owned nn.Parameters (input-independent), distinct from the
@@ -323,6 +343,12 @@ class QuantumConfig:
             raise ValueError(
                 f"coeff_ablation={self.coeff_ablation!r} must be one of "
                 "{'none', 'lcu', 'lcu_poly'}"
+            )
+
+        if self.poly_mode not in ("standard", "qsvt"):
+            raise ValueError(
+                f"poly_mode={self.poly_mode!r} must be one of "
+                "{'standard', 'qsvt'}"
             )
 
         if self.decoder_hidden_mult is not None and self.decoder_hidden_mult <= 0:

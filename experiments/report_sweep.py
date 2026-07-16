@@ -126,6 +126,10 @@ ARCH_META_FIELDS = [
     # distinct configurations, never seed-averaged together. Defaulted to "none"
     # on pre-knob runs just below.
     "coeff_ablation",
+    # Polynomial-mode variant (__qsvt marker; ADR-0009); standard/qsvt are distinct
+    # configurations, never seed-averaged together. Defaulted to "standard" on
+    # pre-knob runs just below.
+    "poly_mode",
 ]
 
 # A run's *configuration identity*: every sweep coordinate except the training
@@ -242,7 +246,8 @@ def _load_run(run_dir: Path, max_epoch: int | None = None) -> dict | None:
     # full_experiment.py; None for older runs — kept as None in the identity key).
     # poly_init_noise is defaulted separately just below, so skip it here.
     for field in ARCH_META_FIELDS:
-        if field in ("poly_init_noise", "positional_encoding", "coeff_ablation"):
+        if field in ("poly_init_noise", "positional_encoding", "coeff_ablation",
+                     "poly_mode"):
             continue
         row[field] = meta.get(field)
     # poly_init_noise: a pre-feature run has no key — default to 0.0 (off), like
@@ -258,6 +263,10 @@ def _load_run(run_dir: Path, max_epoch: int | None = None) -> dict | None:
     # fully-trained behaviour), so it groups as the none arm rather than None.
     _ca = meta.get("coeff_ablation")
     row["coeff_ablation"] = "none" if _ca is None else str(_ca)
+    # poly_mode: a pre-knob run has no key — default to "standard" (the historic
+    # literal-power behaviour), so it groups as the standard arm rather than None.
+    _pm = meta.get("poly_mode")
+    row["poly_mode"] = "standard" if _pm is None else str(_pm)
     # Re-roll provenance (CONTEXT.md "Re-roll"): the original this run re-rolls,
     # or None for an ordinary run. Used by --rerolls to pair re-rolls to originals.
     row["reroll_of"] = meta.get("reroll_of")

@@ -104,12 +104,20 @@ class GateOp:
                      — gate acts on each beamsplitter pair.
         apply:       (circuit, state, slc, site, D, device, dtype) -> FockState
                      where slc is a dict {param_name: scalar_tensor}.
+        apply_dagger: Same signature as ``apply`` but applies the gate's adjoint
+                     (conjugate-transpose of the truncated Fock matrix, or the
+                     conjugated phase vector for diagonal gates). Used only by the
+                     ``qsvt`` polynomial mode's ``M†`` pass (ADR-0009); the
+                     ``standard`` path never calls it. The true adjoint of the
+                     *simulated* (truncated) gate — NOT the gate with negated
+                     parameters, which differs at finite cutoff.
     """
 
     name: str
     param_names: tuple[str, ...]
     site_kind: str
     apply: Callable
+    apply_dagger: Callable
 
 
 def _apply_squeeze(circuit, state, slc, k, D, device, dtype):
@@ -139,12 +147,51 @@ def _apply_kerr(circuit, state, slc, k, D, device, dtype):
     return circuit.apply_single_mode_phases(phases, k, state)
 
 
+# Adjoint (daggered) gate builders — the conjugate-transpose of the *truncated*
+# Fock matrix each forward builder produces (ADR-0009). Matrix gates conjugate-
+# transpose the (D, D) / (D², D²) matrix; diagonal phase gates conjugate their
+# phase vector (negating the phase). Used only by the `qsvt` polynomial mode's
+# M† pass. Deliberately not param-negation: at finite cutoff the analytic Fock
+# matrices are sub-isometries, so the truncated S(-r) ≠ (truncated S(r))†, and
+# only the conjugate-transpose is the true adjoint of the operator we apply.
+def _apply_squeeze_dagger(circuit, state, slc, k, D, device, dtype):
+    S = squeezing_matrix(slc["r"], slc["phi"], D).to(device=device, dtype=dtype)
+    return circuit.apply_single_mode_gate(S.conj().transpose(-2, -1), k, state)
+
+
+def _apply_bs_dagger(circuit, state, slc, pair, D, device, dtype):
+    a, b = pair
+    BS = beamsplitter_matrix(slc["theta"], slc["phi"], D).to(device=device, dtype=dtype)
+    # The two-mode gate is a rank-4 tensor indexed [out_i, out_j, in_i, in_j]
+    # (a matrix on the composite (out_i,out_j)×(in_i,in_j) index). Its adjoint
+    # swaps the out/in *pairs* and conjugates: T[oi,oj,ii,ij] = conj(BS[ii,ij,oi,oj]).
+    # NOT transpose(-2,-1), which only swaps in_i↔in_j.
+    BS_dag = BS.conj().permute(2, 3, 0, 1)
+    return circuit.apply_two_mode_gate(BS_dag, a, b, state)
+
+
+def _apply_rot_dagger(circuit, state, slc, k, D, device, dtype):
+    phases = rotation_phases(slc["phi"], D).to(device=device, dtype=dtype)
+    return circuit.apply_single_mode_phases(phases.conj(), k, state)
+
+
+def _apply_disp_dagger(circuit, state, slc, k, D, device, dtype):
+    alpha = torch.complex(slc["re"], slc["im"])
+    Dk = displacement_matrix(alpha, D).to(device=device, dtype=dtype)
+    return circuit.apply_single_mode_gate(Dk.conj().transpose(-2, -1), k, state)
+
+
+def _apply_kerr_dagger(circuit, state, slc, k, D, device, dtype):
+    phases = kerr_phases(slc["kappa"], D).to(device=device, dtype=dtype)
+    return circuit.apply_single_mode_phases(phases.conj(), k, state)
+
+
 _GATE_SEQUENCE: tuple[GateOp, ...] = (
-    GateOp("squeeze", ("r", "phi"),     "mode", _apply_squeeze),
-    GateOp("bs",      ("theta", "phi"), "pair", _apply_bs),
-    GateOp("rot",     ("phi",),         "mode", _apply_rot),
-    GateOp("disp",    ("re", "im"),     "mode", _apply_disp),
-    GateOp("kerr",    ("kappa",),       "mode", _apply_kerr),
+    GateOp("squeeze", ("r", "phi"),     "mode", _apply_squeeze, _apply_squeeze_dagger),
+    GateOp("bs",      ("theta", "phi"), "pair", _apply_bs,      _apply_bs_dagger),
+    GateOp("rot",     ("phi",),         "mode", _apply_rot,     _apply_rot_dagger),
+    GateOp("disp",    ("re", "im"),     "mode", _apply_disp,    _apply_disp_dagger),
+    GateOp("kerr",    ("kappa",),       "mode", _apply_kerr,    _apply_kerr_dagger),
 )
 
 # Gate params whose MAGNITUDE can overflow the analytic Fock matrices in
@@ -710,6 +757,11 @@ class _CVHeadBase(nn.Module):
         self._real_dtype = (
             torch.float64 if config.dtype == "complex128" else torch.float32
         )
+        # Polynomial construction mode (ADR-0009). Trace-time constant, so the
+        # branch in _apply_polynomial_iterative_params resolves once under vmap.
+        # "standard": each M^j is a literal power. "qsvt": alternate M/M† by
+        # application parity to form the singular-value transform.
+        self._poly_mode: str = config.poly_mode
 
         m = config.num_modes
         if m <= 1:
@@ -879,6 +931,75 @@ class _CVHeadBase(nn.Module):
 
         return state
 
+    def _apply_gate_plan_dagger(
+        self,
+        op_plan: tuple[GateOp, ...],
+        params: torch.Tensor,
+        state: FockState,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> FockState:
+        """Apply the adjoint U† of the gate-op plan U directly to a FockState.
+
+        For a plan applying ``U = G_k … G_2 G_1`` to the state (``G_1`` first),
+        the adjoint is ``U† = G_1† G_2† … G_k†`` — the same gates daggered and
+        applied in **reverse order**, *and* with reversed **site order within each
+        op** (the beamsplitter mesh does not commute, so its adjoint reverses the
+        pair order too). Parameter slicing uses the identical forward,
+        parameter-name-major layout (so the same ``params`` vector drives U and
+        U†), including the ``gate_param_bound`` soft-clip; only the application
+        order and the per-gate ``apply_dagger`` builder differ.
+
+        Used by the ``qsvt`` polynomial mode's M† pass (ADR-0009). The
+        ``standard`` path never calls this, so its behaviour and checkpoints are
+        untouched.
+
+        Args:
+            op_plan: Ordered tuple of GateOps whose adjoint to apply.
+            params:  Real tensor of shape
+                     (_op_plan_param_count(op_plan, num_modes, topology),).
+            state:   Input FockState. Not mutated.
+            device:  Target device.
+            dtype:   Complex dtype.
+
+        Returns:
+            New FockState after U† applied.
+        """
+        m = self.num_modes
+        D = self.cutoff_dim
+        bs_pairs = self._bs_pairs
+        idx = 0
+
+        # Forward pass: parse each op's per-site parameter slices in the same
+        # parameter-name-major layout the forward plan uses. Collect (op, sites,
+        # param_vectors) so the application can then run in reverse.
+        parsed: list[tuple[GateOp, list, dict[str, torch.Tensor]]] = []
+        for op in op_plan:
+            sites = list(range(m)) if op.site_kind == "mode" else bs_pairs
+            n_sites = len(sites)
+            param_vectors: dict[str, torch.Tensor] = {}
+            for p in op.param_names:
+                param_vectors[p] = params[idx:idx + n_sites]
+                idx += n_sites
+            parsed.append((op, sites, param_vectors))
+
+        # Reverse application: reverse the op order, and reverse the site order
+        # within each op — (G_k … G_1)† = G_1† … G_k†.
+        for op, sites, param_vectors in reversed(parsed):
+            for site_idx in reversed(range(len(sites))):
+                site = sites[site_idx]
+                slc = {p: param_vectors[p][site_idx] for p in op.param_names}
+                if self._gate_bound is not None:
+                    b = self._gate_bound
+                    for p in op.param_names:
+                        if p in _BOUNDED_GATE_PARAMS:
+                            slc[p] = b * torch.tanh(slc[p] / b)
+                state = op.apply_dagger(
+                    self.circuit, state, slc, site, D, device, dtype
+                )
+
+        return state
+
     def _apply_patch_gates_to_state(
         self,
         params: torch.Tensor,
@@ -931,6 +1052,32 @@ class _CVHeadBase(nn.Module):
         """
         state = FockState(state_data, self.num_modes, self.cutoff_dim)
         out = self._apply_patch_gates_to_state(params, state, device, dtype)
+        return out.data
+
+    def _apply_patch_gates_dagger_to_data(
+        self,
+        params: torch.Tensor,
+        state_data: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Tensor-in / tensor-out wrapper applying the adjoint U_i† to a state.
+
+        The daggered counterpart of ``_apply_patch_gates_to_data`` — used by the
+        ``qsvt`` polynomial mode's M† pass (ADR-0009). Same vmap-safety contract
+        (wraps/unwraps the FockState with static num_modes/cutoff_dim).
+
+        Args:
+            params:     Real tensor of shape (_gate_param_count(num_modes, topology),).
+            state_data: Complex tensor of shape (D,)*num_modes.
+            device:     Target device.
+            dtype:      Complex dtype.
+
+        Returns:
+            Complex tensor of shape (D,)*num_modes after U_i† applied.
+        """
+        state = FockState(state_data, self.num_modes, self.cutoff_dim)
+        out = self._apply_gate_plan_dagger(self._op_plan, params, state, device, dtype)
         return out.data
 
     def _apply_lcu_to_vector(
@@ -1008,6 +1155,45 @@ class _CVHeadBase(nn.Module):
             norm_sq_sum = (out_flat_N.abs() ** 2).sum()
             return result, norm_sq_sum
         return result
+
+    def _apply_lcu_dagger_params_to_vector(
+        self,
+        all_params: torch.Tensor,
+        v: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Compute M†|v⟩ = Σ_i b_i* (U_i†|v⟩) without building M explicitly.
+
+        The adjoint of ``_apply_lcu_params_to_vector``: conjugate the LCU
+        coefficients b_i and apply each per-patch unitary's adjoint U_i†. Used by
+        the ``qsvt`` polynomial mode's even-parity applications (ADR-0009). No
+        ``accumulate_norm_sq`` branch — the truncation summary is fused into the
+        *first* application, which is always the forward M pass on the input
+        state, never M†.
+
+        Args:
+            all_params: Real tensor of shape (N, gate_param_width).
+            v:          Complex flat tensor of shape (D^num_modes,).
+            device:     Target device.
+            dtype:      Complex dtype.
+
+        Returns:
+            Complex flat tensor of shape (D^num_modes,) — M†|v⟩.
+        """
+        D, m = self.cutoff_dim, self.num_modes
+        N = all_params.shape[0]
+        # M† = Σ_i b_i* U_i† — conjugate the LCU coefficients.
+        b = self.lcu_coeffs().conj().to(device)                # (N,) complex
+
+        v_data = v.reshape((D,) * m)
+        apply_one = lambda p: self._apply_patch_gates_dagger_to_data(
+            p, v_data, device, dtype
+        )
+        out_data_N = vmap(apply_one)(all_params)               # (N, D, ..., D)
+
+        out_flat_N = out_data_N.reshape(N, -1)                 # (N, D^m)
+        return (b.to(dtype).unsqueeze(-1) * out_flat_N).sum(dim=0)  # (D^m,)
 
     def _compute_patch_trunc_loss(
         self,
@@ -1113,6 +1299,15 @@ class _CVHeadBase(nn.Module):
         measures the LCU terms' leakage on the *actual input state*
         ``state_flat`` (the vacuum for the canonical/aggregator heads, a query
         state in a seq-to-seq block — ADR-0003).
+
+        Polynomial mode (``self._poly_mode``, a trace-time constant; ADR-0009):
+        ``standard`` builds each M^j by applying the forward LCU M j times;
+        ``qsvt`` alternates M and its adjoint M† by application parity — the
+        application producing v_{j+1} (application #(j+1)) uses M when j is even
+        (odd application → forward) and M† when j is odd (even application →
+        adjoint). At ``poly_degree ≤ 1`` no next-state application runs, so the
+        two modes coincide. The fused trunc summary is only taken at j == 0, an
+        M application on the input state, so it is identical across modes.
         """
         c = self.poly_coeffs().to(device)   # (d+1,) real — move to quantum device
         result = torch.zeros_like(state_flat)
@@ -1121,9 +1316,17 @@ class _CVHeadBase(nn.Module):
         for j in range(len(c)):
             result = result + c[j].to(dtype) * v
             if j < len(c) - 1:
-                if want_trunc and j == 0:
+                # qsvt: even applications (j odd) apply the adjoint M†; odd
+                # applications (j even) apply the forward M. standard: always M.
+                use_dagger = self._poly_mode == "qsvt" and (j % 2 == 1)
+                if use_dagger:
+                    v = self._apply_lcu_dagger_params_to_vector(
+                        all_params, v, device, dtype
+                    )
+                elif want_trunc and j == 0:
                     # First pass: v is the polynomial's input state. Fuse the
                     # trunc summary here so U_i|v⟩ is computed once, not twice.
+                    # (j == 0 is always a forward M pass in both modes.)
                     v, input_norm_sq = self._apply_lcu_params_to_vector(
                         all_params, v, device, dtype, accumulate_norm_sq=True
                     )

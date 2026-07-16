@@ -25,8 +25,32 @@ _Avoid_: mixing, attention matrix.
 
 **Polynomial** (`P(M)`):
 The real-coefficient matrix polynomial `P(M) = Σ_j c_j Mʲ` applied to the input state,
-modelling post-selected QSVT. Followed by post-selection renormalisation.
-_Avoid_: QSVT (that is the technique `P(M)` models, not the object).
+modelling post-selected QSVT. Followed by post-selection renormalisation. Two
+[[polynomial mode]]s build it: `standard` forms each `Mʲ` as a literal power;
+`qsvt` alternates `M` with its adjoint `M†` to form the faithful singular-value
+transform.
+_Avoid_: QSVT (that is the technique `P(M)` models — and the name of the faithful
+[[polynomial mode]] — not the object `P(M)` itself).
+
+**Polynomial mode** (`standard` / `qsvt`):
+How each degree-`j` term of the [[polynomial]] is built from the [[LCU]] `M`.
+`standard` (the default) applies `M` `j` times — the literal matrix power `Mʲ`,
+which is a faithful singular-value transform only when `M` is Hermitian. `qsvt`
+alternates `M` and its adjoint `M†` by application parity
+(`v₁=Mv₀`, `v₂=M†v₁`, `v₃=Mv₂`, …), so term `j` is the ordered product of `j`
+factors with `M` rightmost: even terms `(M†M)^{j/2} = VΣʲV†` stay in `M`'s input
+singular-vector space, odd terms `M(M†M)^{(j-1)/2} = WΣʲV†` map input→output, and
+their coefficient-weighted sum is the QSVT singular-value transform of the
+mixed-parity polynomial `Σⱼ cⱼ σʲ` — the even and odd parity branches superposed
+by plain vector addition, with no extra herald machinery in the simulation. `M†`
+is the true adjoint of the *truncated* simulated `M` (conjugate-transpose of the
+Fock gate matrices; **not** parameter negation, which differs from the adjoint at
+finite cutoff and would break the singular-value identities). It reuses the same
+`bᵢ`/`cⱼ`/`Uᵢ` — only the forward computation changes — and lives in the shared
+head base, so it applies uniformly across all model variants. A valid manual
+sweep axis (`__qsvt` marker).
+_Avoid_: daggered polynomial (names the mechanism, not the mode), power
+polynomial (the `standard` mode is not merely a power series once post-selected).
 
 **CVQNN block** (`W`):
 A fixed, per-image, trainable Killoran-style variational circuit applied to the

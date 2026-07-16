@@ -134,6 +134,7 @@ POLY_DEGREE = 3
 POLY_INIT_NOISE = 0.0   # >0 seeds c_{j>=1} to break uniform-predictor collapse (off by default)
 POSITIONAL_ENCODING = "2d"   # PE variant on the block-1 hypernetwork: 2d (default) | 1d | none
 COEFF_ABLATION = "none"      # freeze learned combination coeffs: none (default) | lcu | lcu_poly
+POLY_MODE = "standard"       # polynomial construction: standard (default) | qsvt (ADR-0009)
 CNN_NUM_CONV_LAYERS = 2          # total conv layers in the CNN stack
 HYPERNET_NUM_LINEAR_LAYERS = 1   # total Linear layers in the hypernet DNN
 DECODER_NUM_LAYERS = 2           # total Linear layers in the decoder MLP
@@ -259,6 +260,13 @@ parser.add_argument("--coeff-ablation", type=str, default=None,
                     f"fixed uniform values (default {COEFF_ABLATION!r}; ADR-0008): "
                     f"'lcu' freezes the LCU b_i=1/N, 'lcu_poly' additionally "
                     f"freezes the polynomial c_j=1, 'none' trains both")
+parser.add_argument("--poly-mode", type=str, default=None,
+                    choices=["standard", "qsvt"],
+                    help=f"polynomial construction mode (default {POLY_MODE!r}; "
+                    f"ADR-0009): 'standard' builds each M^j as a literal power; "
+                    f"'qsvt' alternates M with its adjoint M† to form the "
+                    f"singular-value transform (byte-identical params; differs "
+                    f"only for poly_degree ≥ 2)")
 parser.add_argument("--reroll-of", type=str, default=None, metavar="RUN_NAME",
                     help="provenance: the original run_name this run re-rolls "
                     "(stamped into history meta so report_sweep can pair a "
@@ -450,6 +458,8 @@ if args.positional_encoding is not None:
     POSITIONAL_ENCODING = args.positional_encoding
 if args.coeff_ablation is not None:
     COEFF_ABLATION = args.coeff_ablation
+if args.poly_mode is not None:
+    POLY_MODE = args.poly_mode
 if args.cnn_num_conv_layers is not None:
     CNN_NUM_CONV_LAYERS = args.cnn_num_conv_layers
 if args.hypernet_num_linear_layers is not None:
@@ -523,6 +533,7 @@ quantum_cfg = QuantumConfig(
     poly_init_noise=POLY_INIT_NOISE,
     positional_encoding=POSITIONAL_ENCODING,
     coeff_ablation=COEFF_ABLATION,
+    poly_mode=POLY_MODE,
     cnn_num_conv_layers=CNN_NUM_CONV_LAYERS,
     hypernet_num_linear_layers=HYPERNET_NUM_LINEAR_LAYERS,
     decoder_num_layers=DECODER_NUM_LAYERS,
@@ -879,6 +890,10 @@ history["meta"]["positional_encoding"] = str(
 # Coefficient-ablation variant (a string coordinate); absent on pre-knob runs → "none".
 history["meta"]["coeff_ablation"] = str(
     getattr(_resolved_q, "coeff_ablation", "none")
+)
+# Polynomial-mode variant (a string coordinate); absent on pre-knob runs → "standard".
+history["meta"]["poly_mode"] = str(
+    getattr(_resolved_q, "poly_mode", "standard")
 )
 # Re-roll provenance (CONTEXT.md "Re-roll"): the original run_name this run
 # re-rolls, or None for an ordinary run. report_sweep pairs by this reference.
