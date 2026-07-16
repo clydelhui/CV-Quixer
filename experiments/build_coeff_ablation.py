@@ -81,7 +81,10 @@ DEFAULT_SOURCE_RUNS_FILE = "results/extended_runs_25ep.txt"
 GPU_CONFIG: dict[str, dict[str, str]] = {
     "a100-40": {"gres": "gpu:a100-40:1", "time": "12:00:00"},
     "h100-96": {"gres": "gpu:h100-96:1", "time": "08:00:00"},
-    "h200-141": {"gres": "gpu:h200-141:1", "time": "08:00:00"},
+    # h200-141's partition max wall is 3h on the SoC cluster (shorter than the
+    # others); a fresh 10-epoch run of even the heaviest stacked config fits well
+    # inside it (~7-10 min/epoch), so no top-up is needed at 10 epochs.
+    "h200-141": {"gres": "gpu:h200-141:1", "time": "03:00:00"},
 }
 GPU_ORDER = ("a100-40", "h100-96", "h200-141")
 

@@ -1,41 +1,54 @@
-#!/usr/bin/env python3
-"""Clone a curated run-list into a fresh qsvt-mode sweep (ADR-0009).
+"""Build (and launch) the qsvt polynomial-mode sweep.
 
-The extended-run configs (``results/extended_runs_25ep.txt``) are a heterogeneous
-mix of ``quantum`` / ``quantum_shared`` / ``quantum_stacked`` runs with different
-knob combinations, so they cannot be expressed as one Cartesian ``sweep.py`` grid.
-This builder instead **replays each run's original argv** from its source
-``sweep_manifest.json``, appends ``--poly-mode qsvt``, and starts the run **fresh
-from scratch** at a chosen epoch count — *not* a resume: a qsvt run resumed from a
-standard checkpoint would measure "switch to qsvt mid-training", not a clean qsvt
-run (their state_dicts are byte-compatible, which would make that mistake silent).
+A CV-Quixer head applies a matrix polynomial ``P(M)`` to the post-LCU state. The
+``poly_mode`` knob (CONTEXT.md "Polynomial mode", ADR-0009) chooses how each
+degree-``j`` term is built from the LCU ``M``: ``standard`` uses the literal power
+``M^j``; ``qsvt`` alternates ``M`` with its adjoint ``M†`` to form the faithful
+singular-value transform. The two coincide at ``poly_degree <= 1`` and differ at
+degree >= 2 — every curated config here is degree 2 or 3, so ``qsvt`` is
+meaningful throughout.
 
-Because the ``qsvt`` polynomial mode only differs from ``standard`` at
-``poly_degree >= 2``, verify the run-list configs satisfy that (the extended runs
-all do).
+This builder fans the **16 curated epoch-extension configs** (the ones in
+``results/extended_runs_25ep.txt``, spanning all three quantum models) over the
+``{qsvt}`` arm into one fresh-from-scratch **16-run** sweep.
 
-The run-list format is one run per non-comment line, whitespace-separated, with
-at least three columns: ``run_name  source_sweep_dir  gpu`` (further columns are
-ignored). Runs are grouped by their ``gpu`` column and written to one manifest per
-GPU type inside a single new sweep dir, so each group can be submitted to
-``scripts/run_sweep.sh`` with the matching ``--gres`` override. The new run names
-are prefixed with the source model tag (``quantum`` / ``shared`` / ``stacked``)
-because the original names do not encode the model — two different-model runs can
-share a name and would otherwise collide in one sweep dir.
+The ``standard`` baseline is deliberately NOT generated — it is reused from the
+existing ``high_epoch_*`` runs (the same configs in the default ``standard`` mode)
+and compared via ``report_sweep_compare.py``, so this builder only emits the
+``qsvt`` arm.
 
-Example (run from the repo root on the cluster login node):
+For each of the 16 source argv (read verbatim from the source sweep's
+``sweep_manifest.json`` ``runs[].args``) × ``{qsvt}`` it:
 
-    uv run python experiments/build_qsvt_extended.py --gpu-remap h100-96=h200-141
-    # → writes results/sweeps/qsvt_extended_<ts>/manifest_<gpu>.json and prints
-    #   the exact `sbatch --gres=... --array=... scripts/run_sweep.sh <manifest>`
-    #   lines to submit. --gpu-remap redirects a run-list GPU label (here the
-    #   96 GB H100s, which are sometimes MIG-split into 2×46 GB slices too small
-    #   for the heaviest configs) to another type without editing the run-list.
+  * injects ``--poly-mode <mode>``,
+  * rewrites ``--run-name`` to append ``__<mode>`` (sweep.py's ``__qsvt`` marker),
+  * repoints ``--runs-root`` at the new ``results/sweeps/qsvt_extended_<ts>`` dir,
+  * normalises ``--epochs`` to 10 (quantum/shared sources are already 10; the
+    stacked sources carry ``--epochs 3`` and must be rewritten),
+  * drops any ``--resume`` (every run starts from scratch),
+  * keeps everything else verbatim (``--model``, ``--gate-param-bound auto``,
+    ``--subset-seed 42``, fractions, all arch flags).
 
-This writes manifests only; it never launches anything (submit the printed
-`sbatch` lines yourself). Reporting afterwards is the usual
-`scripts/submit_report.sh <new_sweep_dir>` plus a `report_sweep_compare.py`
-overlay against the source (standard-mode) sweeps.
+``qsvt`` applies the same number of block-encoding steps as ``standard`` (some
+are ``M†`` rather than ``M``), so the Fock-sim memory/wall is unchanged from each
+source. The GPU/wall map from ``results/extended_runs_25ep.txt`` therefore carries
+over, **except** the heavy stacked-nm3 runs are remapped off ``h100-96`` onto
+``h200-141``: the 96 GB H100s are sometimes MIG-split into 2×46 GB slices too
+small for those ~86-89 GB configs (``DEFAULT_GPU_REMAP``; override with
+``--gpu-remap``). At 10 epochs every run fits its wall in one window (a100 <= 12h,
+h200 <= 3h), so no top-up is needed. Runs are ordered so each target-GPU group is
+a contiguous index range, so the SLURM array slices can be submitted separately
+over the one manifest (the schema ``scripts/run_sweep.sh`` consumes unchanged).
+
+Examples
+--------
+Inspect the 16-run plan only::
+
+    uv run python experiments/build_qsvt_extended.py --dry-run
+
+Submit both GPU groups as SLURM array slices::
+
+    uv run python experiments/build_qsvt_extended.py --launch slurm
 """
 
 from __future__ import annotations
@@ -46,209 +59,289 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# Make ``cv_quixer`` importable when run as a script from the repo root.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _orchestration import launch_local
+
+# The curated-config selection, GPU map, verbatim-argv loaders, and the per-GPU
+# SLURM-slice submitter are shared with the sibling ablation builders (same 16
+# configs, same source-manifest read, same one-manifest / contiguous-group layout).
+from build_coeff_ablation import (
+    GPU_CONFIG,
+    GPU_ORDER,
+    _model_from_args,
+    _submit_slurm_groups,
+    parse_source_runs_file,
+    resolve_source_runs,
+    sbatch_commands,
+)
 
 from cv_quixer.provenance import invocation_record
 
-# Source-sweep-dir basename prefixes → the short model tag used in the new run
-# name. The tag disambiguates otherwise-identical run names across model variants.
-_MODEL_TAGS = ("quantum", "shared", "stacked")
+FULL_EXPERIMENT = "experiments/full_experiment.py"
 
-# argv flags that take a value and must be dropped from the replayed argv (the
-# builder re-adds --epochs; --resume must never survive — a qsvt run starts fresh).
-_DROP_WITH_VALUE = ("--epochs", "--resume")
+# The polynomial mode(s) this sweep trains from scratch. The 'standard' baseline
+# is reused (not regenerated; ADR-0009).
+DEFAULT_POLY_MODES = ("qsvt",)
 
-# GPU types whose partition max wall-clock is SHORTER than run_sweep.sh's 8h
-# #SBATCH default, so the printed sbatch line must override --time or the job is
-# rejected. The h200-141 cap is 3h on the SoC cluster. run_sweep.sh's own 8h
-# stands for any GPU not listed here (a100-40 etc.). Extend/override per run with
-# --gpu-time GPU=HH:MM:SS. Runs that can't reach the target epoch count within
-# their wall are topped up (resume_sweep.py) — full_experiment checkpoints every
-# epoch, so a wall-time kill is always resumable.
-_GPU_TIME_LIMITS = {"h200-141": "03:00:00"}
+# Every run is normalised to this many epochs (stacked sources carry 3). At 10
+# epochs every run fits its GPU wall in a single window — no top-ups.
+DEFAULT_EPOCHS = 10
 
+# The curated-config selection list (run_name / source sweep / target GPU).
+DEFAULT_SOURCE_RUNS_FILE = "results/extended_runs_25ep.txt"
 
-def _model_tag(sweep_dir: str) -> str:
-    """Short model tag inferred from the source sweep-dir name (``high_epoch_<tag>_…``)."""
-    base = Path(sweep_dir).name
-    for tag in _MODEL_TAGS:
-        if base.startswith(f"high_epoch_{tag}"):
-            return tag
-    # Fall back to any tag appearing as a token, else a generic marker.
-    for tag in _MODEL_TAGS:
-        if f"_{tag}_" in base:
-            return tag
-    return "run"
+# Source-GPU relabelling applied before grouping: the heavy stacked-nm3 configs
+# are listed as h100-96, but the 96 GB H100s are sometimes MIG-split into 2×46 GB
+# slices too small for them, so redirect to the un-split 141 GB H200s. Override or
+# extend with --gpu-remap OLD=NEW; the run-list file itself is never edited.
+DEFAULT_GPU_REMAP = {"h100-96": "h200-141"}
 
 
-def _parse_runlist(path: Path) -> list[tuple[str, str, str]]:
-    """Parse ``(run_name, source_sweep_dir, gpu)`` triples from the run-list file."""
-    entries: list[tuple[str, str, str]] = []
-    for lineno, raw in enumerate(path.read_text().splitlines(), start=1):
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        cols = line.split()
-        if len(cols) < 3:
-            raise ValueError(
-                f"{path}:{lineno}: expected at least 3 whitespace columns "
-                f"(run_name source_sweep_dir gpu), got {len(cols)}: {line!r}"
-            )
-        entries.append((cols[0], cols[1], cols[2]))
-    if not entries:
-        raise ValueError(f"{path}: no run entries found (all lines blank/comments).")
-    return entries
+def arm_run_name(original_run_name: str, mode: str, model: str = "quantum") -> str:
+    """The variant dir name: ``<model>__<original>__<mode>``.
+
+    The ``<model>__`` prefix is **load-bearing**, not cosmetic: manual-mode run
+    names do not encode the model (it lives in ``--model``, not a name marker), so
+    a ``quantum`` and a ``quantum_shared`` run with identical architecture knobs
+    share the same source run-name string. Merging all three source sweeps into
+    one sweep dir would collide (and silently clobber) those two runs' directories
+    without the prefix. ``__<mode>`` is sweep.py's marker spelling (``__qsvt``).
+    """
+    return f"{model}__{original_run_name}__{mode}"
 
 
-def _transform_args(
-    args: list[str], new_run_name: str, runs_root: str, poly_mode: str, epochs: int
+def rewrite_run_args(
+    args: list[str], mode: str, *, model: str, runs_root: str, target_epochs: int,
 ) -> list[str]:
-    """Replay one run's argv into a fresh qsvt run: drop epochs/resume, rewrite
-    the run-name + runs-root, and append the poly-mode + epoch overrides."""
-    out: list[str] = []
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a in _DROP_WITH_VALUE:
-            i += 2  # skip the flag and its value
-            continue
-        if a == "--run-name":
-            out += ["--run-name", new_run_name]
-            i += 2
-            continue
-        if a == "--runs-root":
-            out += ["--runs-root", runs_root]
-            i += 2
-            continue
-        out.append(a)
-        i += 1
-    out += ["--poly-mode", poly_mode, "--epochs", str(epochs)]
+    """Original argv rewritten for one fresh qsvt-mode run (never resumed).
+
+    Injects ``--poly-mode``, rewrites ``--run-name`` to the ``<model>__…__<mode>``
+    form (``arm_run_name``), repoints ``--runs-root``, normalises ``--epochs``, and
+    strips any ``--resume`` (with its value). ``--model`` itself and everything
+    else are replayed verbatim.
+    """
+    out = list(args)
+
+    def _set(flag: str, value: str) -> None:
+        if flag in out:
+            out[out.index(flag) + 1] = value
+        else:
+            out.extend([flag, value])
+
+    if "--run-name" in out:
+        i = out.index("--run-name") + 1
+        out[i] = arm_run_name(out[i], mode, model)
+    else:  # pragma: no cover - source argv always carries --run-name
+        out.extend(["--run-name", arm_run_name("run", mode, model)])
+    _set("--poly-mode", mode)
+    _set("--runs-root", runs_root)
+    _set("--epochs", str(target_epochs))
+
+    if "--resume" in out:
+        i = out.index("--resume")
+        del out[i:i + 2]
     return out
 
 
-def build(args: argparse.Namespace) -> None:
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    new_dir = Path(args.sweeps_root) / f"{args.out_name}_{timestamp}"
-    new_dir.mkdir(parents=True, exist_ok=True)
+def apply_gpu_remap(source_runs: list[dict], remap: dict[str, str]) -> list[dict]:
+    """Return ``source_runs`` with each ``gpu`` field relabelled via ``remap``.
 
-    entries = _parse_runlist(Path(args.runlist))
+    A shallow copy per run (the run-list file / source manifests are untouched);
+    a GPU not in ``remap`` is left as-is.
+    """
+    return [{**src, "gpu": remap.get(src["gpu"], src["gpu"])} for src in source_runs]
 
-    # Optional GPU remap (e.g. h100-96=h200-141 when the 96 GB H100s are being
-    # MIG-split into 2×46 GB slices too small for the heaviest configs). Applied
-    # to the grouping key + printed --gres only; the run-list file is untouched.
-    remap: dict[str, str] = {}
-    for spec in args.gpu_remap or []:
-        if "=" not in spec:
-            raise ValueError(f"--gpu-remap expects OLD=NEW, got {spec!r}")
-        old, new = spec.split("=", 1)
-        remap[old] = new
 
-    # effective gpu → list[(new_run_name, new_args)]
-    groups: dict[str, list[tuple[str, list[str]]]] = {}
-    for orig_name, sweep_dir, gpu in entries:
-        gpu = remap.get(gpu, gpu)
-        manifest_path = Path(sweep_dir) / "sweep_manifest.json"
-        if not manifest_path.is_file():
-            raise FileNotFoundError(
-                f"source manifest not found: {manifest_path} (needed to replay "
-                f"argv for run {orig_name!r})"
-            )
-        src_manifest = json.loads(manifest_path.read_text())
-        try:
-            src = next(r for r in src_manifest["runs"] if r["run_name"] == orig_name)
-        except StopIteration:
-            raise KeyError(
-                f"run {orig_name!r} not found in {manifest_path} — check the "
-                "run-list against the source sweep."
-            )
-        tag = _model_tag(sweep_dir)
-        new_name = f"{tag}__{orig_name}__{args.poly_mode}"
-        new_args = _transform_args(
-            src["args"], new_name, str(new_dir), args.poly_mode, args.epochs
+def build_manifest(
+    source_runs: list[dict],
+    *,
+    sweep_dir: Path,
+    modes: tuple[str, ...] = DEFAULT_POLY_MODES,
+    target_epochs: int = DEFAULT_EPOCHS,
+) -> dict:
+    """Fan the resolved source runs over ``modes`` into a sweep manifest.
+
+    ``source_runs`` are ``{run_name, gpu, model, args}`` (from
+    ``resolve_source_runs``, after ``apply_gpu_remap``). Runs are grouped by target
+    GPU in ``GPU_ORDER`` so each group is a contiguous ``index`` range; within a
+    group, source order is preserved and the modes are emitted in ``modes`` order.
+    The returned ``slurm_groups`` maps each present GPU to its ``[lo, hi]``
+    inclusive index range.
+    """
+    runs_root = str(sweep_dir)
+    entries: list[dict] = []
+    slurm_groups: dict[str, list[int]] = {}
+
+    by_gpu: dict[str, list[dict]] = {}
+    for src in source_runs:
+        by_gpu.setdefault(src["gpu"], []).append(src)
+    unknown = set(by_gpu) - set(GPU_CONFIG)
+    if unknown:
+        raise ValueError(f"unknown / unusable GPU(s) in selection: {sorted(unknown)}")
+
+    for gpu in GPU_ORDER:
+        group = by_gpu.get(gpu)
+        if not group:
+            continue
+        lo = len(entries)
+        for src in group:
+            model = src.get("model") or _model_from_args(src["args"])
+            for mode in modes:
+                entries.append({
+                    "index": len(entries),
+                    "run_name": arm_run_name(src["run_name"], mode, model),
+                    "source_run_name": src["run_name"],
+                    "model": model,
+                    "poly_mode": mode,
+                    "gpu": gpu,
+                    "args": rewrite_run_args(
+                        src["args"], mode, model=model, runs_root=runs_root,
+                        target_epochs=target_epochs,
+                    ),
+                })
+        slurm_groups[gpu] = [lo, len(entries) - 1]
+
+    # Uniqueness guard: two entries with the same run_name would write into one
+    # run dir and silently clobber each other's checkpoints/history. The model
+    # prefix already separates same-arch quantum vs shared configs; this catches
+    # what it can't — a selection list that names the same (model, config) twice,
+    # or a modes list with a repeat.
+    names = [e["run_name"] for e in entries]
+    dups = sorted({n for n in names if names.count(n) > 1})
+    if dups:
+        raise ValueError(
+            f"duplicate run name(s) in the qsvt plan: {dups} — the selection list "
+            "names the same (model, config) more than once (or --poly-modes repeats "
+            "a value); de-duplicate before building."
         )
-        groups.setdefault(gpu, []).append((new_name, new_args))
 
-    # Per-GPU wall-clock overrides: baked-in cluster caps, extended/overridden
-    # by --gpu-time GPU=HH:MM:SS.
-    time_limits = dict(_GPU_TIME_LIMITS)
-    for spec in args.gpu_time or []:
-        if "=" not in spec:
-            raise ValueError(f"--gpu-time expects GPU=HH:MM:SS, got {spec!r}")
-        gpu_key, limit = spec.split("=", 1)
-        time_limits[gpu_key] = limit
-
-    invocation = invocation_record()
-    print(f"qsvt sweep dir: {new_dir}  ({len(entries)} runs)")
-    for gpu, runs in sorted(groups.items()):
-        manifest = {
-            "sweep_name": new_dir.name,
-            "sweep_dir": str(new_dir),
-            "gpu": gpu,
-            "n_runs": len(runs),
-            "runs": [
-                {"index": i, "run_name": name, "args": run_args}
-                for i, (name, run_args) in enumerate(runs)
-            ],
-            "invocations": [invocation],
-        }
-        manifest_path = new_dir / f"manifest_{gpu.replace('-', '')}.json"
-        manifest_path.write_text(json.dumps(manifest, indent=2))
-        gres = "gpu:a100-40:1" if gpu.startswith("a100") else f"gpu:{gpu}:1"
-        # --time override only when the GPU's cap is shorter than run_sweep.sh's
-        # 8h default (else omit and inherit the script's directive).
-        time_flag = f"--time={time_limits[gpu]} " if gpu in time_limits else ""
-        print(f"\n# {gpu}: {len(runs)} run(s) → {manifest_path}")
-        print(
-            f"sbatch {time_flag}--gres={gres} --array=0-{len(runs) - 1} "
-            f"scripts/run_sweep.sh {manifest_path}"
-        )
-    print(
-        "\n(manifests written; no runs launched — submit the sbatch lines above."
-        "\n Runs that hit their wall before the target epoch count are resumable"
-        "\n via resume_sweep.py — full_experiment checkpoints latest.pt every epoch.)"
-    )
+    return {
+        "sweep_name": sweep_dir.name,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        # Launch provenance (CONTEXT.md: Invocation).
+        "invocations": [invocation_record()],
+        "sweep_dir": runs_root,
+        "poly_modes": list(modes),
+        "target_epochs": target_epochs,
+        "slurm_groups": slurm_groups,
+        "n_runs": len(entries),
+        "runs": entries,
+    }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Clone a curated run-list into a fresh qsvt-mode sweep (ADR-0009)."
+        description="Build the qsvt polynomial-mode sweep: 16 curated configs × "
+        "{qsvt}, fresh from scratch (the 'standard' baseline is reused, not "
+        "regenerated; ADR-0009).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--runlist", type=str, default="results/extended_runs_25ep.txt",
-        help="run-list file: 'run_name source_sweep_dir gpu' per non-comment line "
-        "(default: results/extended_runs_25ep.txt).",
+        "--source-runs-file", type=Path, default=Path(DEFAULT_SOURCE_RUNS_FILE),
+        help="curated-config selection list (run_name / source sweep dir / GPU)",
     )
     parser.add_argument(
-        "--epochs", type=int, default=25,
-        help="total epochs for each fresh qsvt run (default: 25).",
-    )
-    parser.add_argument(
-        "--poly-mode", type=str, default="qsvt", choices=["standard", "qsvt"],
-        help="polynomial construction mode to run these configs in (default: qsvt).",
-    )
-    parser.add_argument(
-        "--sweeps-root", type=str, default="results/sweeps",
-        help="parent dir for the new sweep dir (default: results/sweeps).",
-    )
-    parser.add_argument(
-        "--out-name", type=str, default="qsvt_extended",
-        help="new sweep-dir name stem, timestamp appended (default: qsvt_extended).",
+        "--poly-modes", type=str, nargs="+", default=list(DEFAULT_POLY_MODES),
+        choices=["standard", "qsvt"],
+        help="polynomial mode(s) to train from scratch (default: qsvt)",
     )
     parser.add_argument(
         "--gpu-remap", type=str, action="append", metavar="OLD=NEW", default=None,
-        help="remap a run-list GPU label to another for the printed --gres / "
-        "manifest grouping (repeatable), e.g. 'h100-96=h200-141' when the 96 GB "
-        "H100s are MIG-split too small. The run-list file itself is unchanged.",
+        help="relabel a source GPU before grouping (repeatable). Defaults to "
+        f"{DEFAULT_GPU_REMAP} (H100-96 MIG-split too small → H200-141); a spec "
+        "here overrides the default for that GPU.",
     )
     parser.add_argument(
-        "--gpu-time", type=str, action="append", metavar="GPU=HH:MM:SS", default=None,
-        help="override the printed sbatch --time for a GPU type (repeatable). "
-        "Defaults bake in the cluster caps shorter than run_sweep.sh's 8h "
-        f"(currently {_GPU_TIME_LIMITS}); anything else inherits the 8h directive. "
-        "Runs exceeding their wall are topped up with resume_sweep.py.",
+        "--sweeps-root", type=Path, default=Path("results/sweeps"),
+        help="parent dir for the new qsvt_extended_<ts> sweep dir",
     )
-    build(parser.parse_args())
+    parser.add_argument(
+        "--sweep-name", type=str, default="qsvt_extended",
+        help="sweep dir is named <sweep-name>_<ts>",
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=DEFAULT_EPOCHS,
+        help="target TOTAL epoch count per run (stacked sources are rewritten)",
+    )
+    parser.add_argument(
+        "--launch", choices=["local", "slurm", "none"], default="none",
+        help="local: run sequentially here; slurm: submit one array slice per "
+             "GPU group; none: just write the manifest",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="alias for --launch none (write manifest + plan only)",
+    )
+    args = parser.parse_args()
+
+    if not args.source_runs_file.is_file():
+        parser.error(f"--source-runs-file does not exist: {args.source_runs_file}")
+
+    # GPU remap: the baked-in default, overridden/extended by any --gpu-remap spec.
+    remap = dict(DEFAULT_GPU_REMAP)
+    for spec in args.gpu_remap or []:
+        if "=" not in spec:
+            parser.error(f"--gpu-remap expects OLD=NEW, got {spec!r}")
+        old, new = spec.split("=", 1)
+        remap[old] = new
+
+    rows = parse_source_runs_file(args.source_runs_file)
+    source_runs = apply_gpu_remap(resolve_source_runs(rows), remap)
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    sweep_dir = args.sweeps_root / f"{args.sweep_name}_{timestamp}"
+    manifest = build_manifest(
+        source_runs, sweep_dir=sweep_dir,
+        modes=tuple(args.poly_modes), target_epochs=args.epochs,
+    )
+
+    sweep_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = sweep_dir / "sweep_manifest.json"
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    # Include list for the restricted comparison: exactly the qsvt runs + their
+    # 16 source (standard-mode) configs, so report_sweep_compare --include-file
+    # keeps only these (and drops the other archs/seeds that live in the
+    # high_epoch_* baseline sweeps).
+    include_names = [e["run_name"] for e in manifest["runs"]]
+    include_names += [src["run_name"] for src in source_runs]
+    include_path = sweep_dir / "compare_include.txt"
+    with open(include_path, "w") as f:
+        f.write(
+            "# Restricted-comparison include list: qsvt runs + their 16 source\n"
+            "# (standard-mode) configs. Pass to report_sweep_compare --include-file.\n"
+        )
+        f.write("\n".join(include_names) + "\n")
+
+    print(f"qsvt sweep: {manifest['sweep_name']}  ({manifest['n_runs']} runs)")
+    print(f"  source runs:   {args.source_runs_file}  ({len(source_runs)} configs)")
+    print(f"  poly modes:    {manifest['poly_modes']}")
+    print(f"  gpu remap:     {remap}")
+    print(f"  epochs:        {manifest['target_epochs']}")
+    print(f"  manifest:      {manifest_path}")
+    print(f"  include list:  {include_path}  ({len(include_names)} names)")
+    for gpu, (lo, hi) in manifest["slurm_groups"].items():
+        print(f"  GPU {gpu}: indices {lo}-{hi}")
+    for run in manifest["runs"]:
+        print(f"    [{run['index']}] ({run['gpu']}) {run['run_name']}")
+
+    print("\nSLURM array slices (one per GPU group):")
+    for cmd in sbatch_commands(manifest, manifest_path):
+        print("  " + cmd)
+
+    launch = "none" if args.dry_run else args.launch
+    if launch == "local":
+        failures = launch_local(manifest, FULL_EXPERIMENT)
+        print(f"\nSweep finished: "
+              f"{manifest['n_runs'] - failures}/{manifest['n_runs']} succeeded.")
+        if failures:
+            sys.exit(1)
+    elif launch == "slurm":
+        _submit_slurm_groups(manifest, manifest_path)
+        print(f"\nAfter the arrays finish, aggregate with:")
+        print(f"  bash scripts/submit_report.sh {sweep_dir}")
+    else:
+        print("\n(manifest written; no runs launched — use --launch local|slurm)")
 
 
 if __name__ == "__main__":
