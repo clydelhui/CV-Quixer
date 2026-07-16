@@ -59,6 +59,15 @@ _MODEL_TAGS = ("quantum", "shared", "stacked")
 # builder re-adds --epochs; --resume must never survive — a qsvt run starts fresh).
 _DROP_WITH_VALUE = ("--epochs", "--resume")
 
+# GPU types whose partition max wall-clock is SHORTER than run_sweep.sh's 8h
+# #SBATCH default, so the printed sbatch line must override --time or the job is
+# rejected. The h200-141 cap is 3h on the SoC cluster. run_sweep.sh's own 8h
+# stands for any GPU not listed here (a100-40 etc.). Extend/override per run with
+# --gpu-time GPU=HH:MM:SS. Runs that can't reach the target epoch count within
+# their wall are topped up (resume_sweep.py) — full_experiment checkpoints every
+# epoch, so a wall-time kill is always resumable.
+_GPU_TIME_LIMITS = {"h200-141": "03:00:00"}
+
 
 def _model_tag(sweep_dir: str) -> str:
     """Short model tag inferred from the source sweep-dir name (``high_epoch_<tag>_…``)."""
@@ -160,6 +169,15 @@ def build(args: argparse.Namespace) -> None:
         )
         groups.setdefault(gpu, []).append((new_name, new_args))
 
+    # Per-GPU wall-clock overrides: baked-in cluster caps, extended/overridden
+    # by --gpu-time GPU=HH:MM:SS.
+    time_limits = dict(_GPU_TIME_LIMITS)
+    for spec in args.gpu_time or []:
+        if "=" not in spec:
+            raise ValueError(f"--gpu-time expects GPU=HH:MM:SS, got {spec!r}")
+        gpu_key, limit = spec.split("=", 1)
+        time_limits[gpu_key] = limit
+
     invocation = invocation_record()
     print(f"qsvt sweep dir: {new_dir}  ({len(entries)} runs)")
     for gpu, runs in sorted(groups.items()):
@@ -177,12 +195,19 @@ def build(args: argparse.Namespace) -> None:
         manifest_path = new_dir / f"manifest_{gpu.replace('-', '')}.json"
         manifest_path.write_text(json.dumps(manifest, indent=2))
         gres = "gpu:a100-40:1" if gpu.startswith("a100") else f"gpu:{gpu}:1"
+        # --time override only when the GPU's cap is shorter than run_sweep.sh's
+        # 8h default (else omit and inherit the script's directive).
+        time_flag = f"--time={time_limits[gpu]} " if gpu in time_limits else ""
         print(f"\n# {gpu}: {len(runs)} run(s) → {manifest_path}")
         print(
-            f"sbatch --gres={gres} --array=0-{len(runs) - 1} "
+            f"sbatch {time_flag}--gres={gres} --array=0-{len(runs) - 1} "
             f"scripts/run_sweep.sh {manifest_path}"
         )
-    print("\n(manifests written; no runs launched — submit the sbatch lines above.)")
+    print(
+        "\n(manifests written; no runs launched — submit the sbatch lines above."
+        "\n Runs that hit their wall before the target epoch count are resumable"
+        "\n via resume_sweep.py — full_experiment checkpoints latest.pt every epoch.)"
+    )
 
 
 def main() -> None:
@@ -215,6 +240,13 @@ def main() -> None:
         help="remap a run-list GPU label to another for the printed --gres / "
         "manifest grouping (repeatable), e.g. 'h100-96=h200-141' when the 96 GB "
         "H100s are MIG-split too small. The run-list file itself is unchanged.",
+    )
+    parser.add_argument(
+        "--gpu-time", type=str, action="append", metavar="GPU=HH:MM:SS", default=None,
+        help="override the printed sbatch --time for a GPU type (repeatable). "
+        "Defaults bake in the cluster caps shorter than run_sweep.sh's 8h "
+        f"(currently {_GPU_TIME_LIMITS}); anything else inherits the 8h directive. "
+        "Runs exceeding their wall are topped up with resume_sweep.py.",
     )
     build(parser.parse_args())
 
