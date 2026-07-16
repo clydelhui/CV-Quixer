@@ -25,10 +25,12 @@ share a name and would otherwise collide in one sweep dir.
 
 Example (run from the repo root on the cluster login node):
 
-    uv run python experiments/build_qsvt_extended.py
+    uv run python experiments/build_qsvt_extended.py --gpu-remap h100-96=h200-141
     # → writes results/sweeps/qsvt_extended_<ts>/manifest_<gpu>.json and prints
     #   the exact `sbatch --gres=... --array=... scripts/run_sweep.sh <manifest>`
-    #   lines to submit.
+    #   lines to submit. --gpu-remap redirects a run-list GPU label (here the
+    #   96 GB H100s, which are sometimes MIG-split into 2×46 GB slices too small
+    #   for the heaviest configs) to another type without editing the run-list.
 
 This writes manifests only; it never launches anything (submit the printed
 `sbatch` lines yourself). Reporting afterwards is the usual
@@ -123,9 +125,20 @@ def build(args: argparse.Namespace) -> None:
 
     entries = _parse_runlist(Path(args.runlist))
 
-    # gpu → list[(new_run_name, new_args)]
+    # Optional GPU remap (e.g. h100-96=h200-141 when the 96 GB H100s are being
+    # MIG-split into 2×46 GB slices too small for the heaviest configs). Applied
+    # to the grouping key + printed --gres only; the run-list file is untouched.
+    remap: dict[str, str] = {}
+    for spec in args.gpu_remap or []:
+        if "=" not in spec:
+            raise ValueError(f"--gpu-remap expects OLD=NEW, got {spec!r}")
+        old, new = spec.split("=", 1)
+        remap[old] = new
+
+    # effective gpu → list[(new_run_name, new_args)]
     groups: dict[str, list[tuple[str, list[str]]]] = {}
     for orig_name, sweep_dir, gpu in entries:
+        gpu = remap.get(gpu, gpu)
         manifest_path = Path(sweep_dir) / "sweep_manifest.json"
         if not manifest_path.is_file():
             raise FileNotFoundError(
@@ -196,6 +209,12 @@ def main() -> None:
     parser.add_argument(
         "--out-name", type=str, default="qsvt_extended",
         help="new sweep-dir name stem, timestamp appended (default: qsvt_extended).",
+    )
+    parser.add_argument(
+        "--gpu-remap", type=str, action="append", metavar="OLD=NEW", default=None,
+        help="remap a run-list GPU label to another for the printed --gres / "
+        "manifest grouping (repeatable), e.g. 'h100-96=h200-141' when the 96 GB "
+        "H100s are MIG-split too small. The run-list file itself is unchanged.",
     )
     build(parser.parse_args())
 
