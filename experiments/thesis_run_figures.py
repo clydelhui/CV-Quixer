@@ -81,7 +81,6 @@ from report_diagnostics import (
     _per_class_acc_from,
     load_run,
 )
-from report_diagnostics import _require_predictions as _load_predictions_npz
 
 from cv_quixer.evaluation import artefact_schema as schema
 from cv_quixer.evaluation.labels import class_names
@@ -164,23 +163,59 @@ def _n_blocks(run: dict) -> int:
 # ---------------------------------------------------------------------------
 
 
+# The only npz members the per-epoch curve metrics touch. Everything else in a
+# predictions file — above all `readouts` — is never read by these figures.
+_CURVE_KEYS = (schema.Y_TRUE, schema.Y_PRED, schema.Y_PROBS)
+
+
 def _stream_epochs(run_dir: Path, side: str, n_epochs: int, reduce_fns: dict):
     """Apply scalar reductions to each epoch's predictions npz, one at a time.
 
-    Deliberately not `_load_all_per_epoch_predictions`: that returns every
-    epoch's arrays at once, and the *train*-side files are the ~94 MB/epoch
-    ones, so a 25-epoch run would hold ~2.4 GB live purely to compute a handful
-    of scalars. Reading and discarding epoch by epoch keeps the peak at one
-    file. Raises MissingArtefactError from the first absent epoch, exactly as
-    the batch loader would.
+    Deliberately not `_load_all_per_epoch_predictions` / `_require_predictions`.
+    Those do `dict(np.load(path))`, which materialises *every* array in the
+    file, and a train-side predictions npz is dominated by `readouts` —
+    (60000, num_heads x readout_width) float32, ~96 MB per epoch — that none of
+    these metrics use. `np.savez_compressed` members are independently
+    inflatable, so naming the three keys we need turns a ~2.4 GB per-run read
+    into ~60 MB, and holds one epoch at a time rather than all 25.
+
+    Raises MissingArtefactError on the first absent epoch, as the batch loader
+    would.
     """
     out = {name: [] for name in reduce_fns}
     for e in range(1, n_epochs + 1):
-        preds = _load_predictions_npz(run_dir, e, side)
+        path = (run_dir / "predictions"
+                / schema.prediction_filename(e, train=(side != "test")))
+        if not path.is_file():
+            raise MissingArtefactError(
+                f"required artefact missing: {path.name} — run `uv run python "
+                f"experiments/backfill_artefacts.py --run-dir {run_dir}` "
+                "to produce it."
+            )
+        with np.load(path) as npz:
+            slim = {k: npz[k] for k in _CURVE_KEYS if k in npz}
         for name, fn in reduce_fns.items():
-            out[name].append(fn(preds))
-        del preds
+            out[name].append(fn(slim))
+        del slim
     return out
+
+
+def _side_scalars(run: dict, side: str) -> dict:
+    """All per-epoch scalar reductions for one side, computed in a single pass.
+
+    Cached on the run: several figures want per-epoch metrics off the same
+    files, and without this each would re-read every epoch.
+    """
+    cache = run.setdefault("_scalars", {})
+    if side in cache:
+        return cache[side]
+    n_epochs = len(run["history"]["epoch"].get("test_acc") or [])
+    fns = {"loss": _cross_entropy_from, "acc": _accuracy_from}
+    if side == "test":
+        n_classes = len(class_names(run["config"]))
+        fns["per_class"] = lambda p: _per_class_acc_from(p, n_classes)
+    cache[side] = _stream_epochs(run["run_dir"], side, n_epochs, fns)
+    return cache[side]
 
 
 def _epoch_series(run: dict) -> dict:
@@ -194,10 +229,9 @@ def _epoch_series(run: dict) -> dict:
     """
     eh = run["history"]["epoch"]
     n_epochs = len(eh.get("test_acc") or [])
-    reductions = {"loss": _cross_entropy_from, "acc": _accuracy_from}
     try:
-        test = _stream_epochs(run["run_dir"], "test", n_epochs, reductions)
-        train = _stream_epochs(run["run_dir"], "train", n_epochs, reductions)
+        test = _side_scalars(run, "test")
+        train = _side_scalars(run, "train")
     except MissingArtefactError:
         return {
             "epochs": list(range(1, n_epochs + 1)),
@@ -373,16 +407,12 @@ def fig_confusion_matrix(run: dict) -> None:
 
 def fig_per_class_accuracy_curve(run: dict) -> None:
     classes = class_names(run["config"])
-    n_epochs = len(run["history"]["epoch"].get("test_acc") or [])
     try:
-        streamed = _stream_epochs(
-            run["run_dir"], "test", n_epochs,
-            {"per_class": lambda p: _per_class_acc_from(p, len(classes))},
-        )
+        streamed = _side_scalars(run, "test")
     except MissingArtefactError as exc:
         raise SkipFigure(str(exc).split(" — ")[0]) from exc
-    epochs = list(range(1, n_epochs + 1))
     acc = np.stack(streamed["per_class"])
+    epochs = list(range(1, len(acc) + 1))
     fig, ax = plt.subplots(figsize=(8.4, 5.0))
     cmap = plt.get_cmap("tab10")
     for c, name in enumerate(classes):

@@ -13,12 +13,15 @@
 # CPU-ONLY (no --gres): no model rebuild, so it counts against MaxSubmitJobs
 # (32) and never against the 8-GPU limit.
 #
-# A JOB ARRAY. The work is I/O-bound, not compute-bound: deriving the
-# accuracy/loss curves streams every epoch's train-side predictions npz, and
-# those are the ~94 MB/epoch files — roughly 2.4 GB per 25-epoch run off network
-# storage. Runs are split across the array by a round-robin stripe (the script's
-# own --shard/--num-shards, so the run filters stay in one place), so wall time
-# falls almost linearly with the array width.
+# A JOB ARRAY, split by a round-robin stripe (the script's own
+# --shard/--num-shards, so the run filters stay in one place).
+#
+# Measured cost: ~3 s for one run's full 12-figure suite, ~260 MB peak RSS,
+# against a 25-epoch run holding 2.6 GB of npz. It is that cheap only because
+# the reader names the three npz members it needs instead of materialising
+# every array — the train-side `readouts` alone is ~96 MB/epoch and no figure
+# reads it. So the array is for latency, not throughput: even one task would
+# finish the 16 extended-25 runs in a couple of minutes.
 #
 # Submit — one or more sweep dirs, extra args after a literal `--`:
 #     sbatch --array=0-9 scripts/run_thesis_figures.sh \
@@ -36,9 +39,9 @@
 #SBATCH --job-name=cv_quixer_thesis_figs
 #SBATCH --output=slurm_logs/slurm-%x-%A_%a.out
 #SBATCH --error=slurm_logs/slurm-%x-%A_%a.err
-#SBATCH --time=02:00:00
+#SBATCH --time=00:30:00
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=16G
+#SBATCH --mem=8G
 
 set -euo pipefail
 
