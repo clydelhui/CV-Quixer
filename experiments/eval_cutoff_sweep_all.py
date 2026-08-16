@@ -34,15 +34,32 @@ Submit one SLURM array task per run::
     uv run python experiments/eval_cutoff_sweep_all.py \\
         --sweep-dir results/sweeps/<sweep>_<ts>/ --launch slurm
 
+Evaluate only part of a sweep — a cutoff sweep is expensive per run, so a large
+sweep is rarely worth fanning over in full. `--min-epochs` selects by training
+length (the fully-trained runs of a mixed sweep), `--runs` takes fnmatch
+patterns, `--runs-file` a list of names::
+
+    uv run python experiments/eval_cutoff_sweep_all.py \\
+        --sweep-dir results/sweeps/high_epoch_quantum_<ts>/ \\
+        --cutoffs 6 8 --min-epochs 25 \\
+        --gres gpu:h200-141:1 --time 03:00:00 --launch slurm
+
 Cost note: cutoff-sweep cost scales with `num_heads` (the quantum width), not the
 parameter budget. The default cutoffs are `6 8 10`; adding `12` ~doubles per-run
 cost and can bust the array wall time on high-head-count runs — pair it with
 `--test-fraction 0.2` there (the recovery trend is unaffected by the smaller set).
+
+Memory note: the Fock state is `cutoff ** num_modes`, so raising the cutoff is
+far more expensive at high `num_modes` (D 6->8 at 4 modes is 1,296 -> 4,096, a
+3.2x state). When the array script's default `gpu:a100-40:1` is too small, use
+`--gres gpu:h200-141:1 --time 03:00:00` — NOT `h100-96`, which the cluster
+partitions into 47 GB MIG slices that silently under-provision the job.
 """
 
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import sys
 import warnings
@@ -50,6 +67,7 @@ from datetime import datetime
 from pathlib import Path
 
 from _orchestration import launch_local, submit_slurm_array
+from _run_selection import read_run_names_file
 
 from cv_quixer.provenance import invocation_record
 
@@ -58,15 +76,46 @@ EVAL_SCRIPT = "experiments/eval_cutoff_sweep.py"
 RUN_ARRAY_SH = "scripts/run_eval_cutoff_sweep_array.sh"
 
 
-def discover_runs(sweep_dir: Path, checkpoint_name: str) -> list[dict]:
+def _completed_epochs(run_dir: Path) -> int:
+    """Epochs a run actually finished, from history.json (0 if unreadable)."""
+    history = run_dir / "history.json"
+    if not history.is_file():
+        return 0
+    try:
+        with open(history) as f:
+            return len(json.load(f).get("epoch", {}).get("test_acc") or [])
+    except (json.JSONDecodeError, OSError):
+        return 0
+
+
+def discover_runs(
+    sweep_dir: Path,
+    checkpoint_name: str,
+    *,
+    min_epochs: int = 0,
+    patterns: list[str] | None = None,
+    names: set[str] | None = None,
+) -> list[dict]:
     """Find sweep sub-dirs that `eval_cutoff_sweep.py` can evaluate.
 
     A run is usable iff it has `checkpoints/<checkpoint_name>`, `config.json`,
     and `subset_indices.npz` (the three things the eval script requires). Others
     are skipped with a warning rather than aborting the whole sweep.
+
+    The selection filters (`min_epochs`, `patterns`, `names`) narrow a sweep to
+    a subset of interest — a cutoff sweep is expensive enough that fanning it
+    over every run of a large sweep is rarely what you want. They are applied
+    *before* the artefact check, so filtered-out runs never warn.
     """
     runs: list[dict] = []
     for run_dir in sorted(p for p in sweep_dir.iterdir() if p.is_dir()):
+        if names is not None and run_dir.name not in names:
+            continue
+        if patterns and not any(
+                fnmatch.fnmatch(run_dir.name, pat) for pat in patterns):
+            continue
+        if min_epochs and _completed_epochs(run_dir) < min_epochs:
+            continue
         ckpt = run_dir / "checkpoints" / checkpoint_name
         missing = [
             name for name, path in (
@@ -146,6 +195,18 @@ def main() -> None:
                         help="sweep directory written by experiments/sweep.py")
     parser.add_argument("--checkpoint-name", type=str, default="final_model.pt",
                         help="checkpoint file under each run's checkpoints/ to eval")
+    # --- run selection ----------------------------------------------------
+    # A cutoff sweep is expensive per run, so narrowing a large sweep to the
+    # runs of interest matters more here than in the reporting tools.
+    parser.add_argument("--min-epochs", type=int, default=0, metavar="N",
+                        help="only evaluate runs that completed >= N epochs "
+                             "(0 = no epoch filter)")
+    parser.add_argument("--runs", type=str, nargs="+", default=None,
+                        metavar="PATTERN",
+                        help="fnmatch pattern(s) on run name; a run matching any "
+                             "of them is kept")
+    parser.add_argument("--runs-file", type=Path, default=None,
+                        help="file of run names (one per line) to restrict to")
     # --- forwarded eval flags --------------------------------------------
     parser.add_argument("--cutoffs", type=int, nargs="+", default=[6, 8, 10],
                         help="cutoff_dim values (default 6 8 10; D=12 ~doubles "
@@ -174,6 +235,13 @@ def main() -> None:
                              "array; none: just write the manifest")
     parser.add_argument("--dry-run", action="store_true",
                         help="alias for --launch none (write manifest + plan only)")
+    parser.add_argument("--gres", type=str, default=None, metavar="SPEC",
+                        help="(--launch slurm) override "
+                             "run_eval_cutoff_sweep_array.sh's --gres, e.g. "
+                             "gpu:h200-141:1 for the memory-heavy corners")
+    parser.add_argument("--time", type=str, default=None, metavar="HH:MM:SS",
+                        help="(--launch slurm) override the array script's "
+                             "--time (h200-141 caps at 03:00:00)")
     args = parser.parse_args()
 
     if args.test_fraction is not None and args.test_limit is not None:
@@ -185,11 +253,24 @@ def main() -> None:
 
     launch = "none" if args.dry_run else args.launch
 
-    runs = discover_runs(args.sweep_dir, args.checkpoint_name)
+    names = read_run_names_file(args.runs_file) if args.runs_file else None
+    runs = discover_runs(
+        args.sweep_dir, args.checkpoint_name,
+        min_epochs=args.min_epochs, patterns=args.runs, names=names,
+    )
     if not runs:
+        selectors = []
+        if args.min_epochs:
+            selectors.append(f"--min-epochs {args.min_epochs}")
+        if args.runs:
+            selectors.append(f"--runs {' '.join(args.runs)}")
+        if names is not None:
+            selectors.append(f"--runs-file {args.runs_file}")
         print(f"No usable runs under {args.sweep_dir} "
               f"(need checkpoints/{args.checkpoint_name} + config.json + "
-              "subset_indices.npz per run).")
+              "subset_indices.npz per run"
+              + (f"; selection: {', '.join(selectors)}" if selectors else "")
+              + ").")
         sys.exit(1)
 
     manifest = build_manifest(args, runs)
@@ -214,7 +295,14 @@ def main() -> None:
         if failures:
             sys.exit(1)
     elif launch == "slurm":
-        submit_slurm_array(manifest, manifest_path, RUN_ARRAY_SH)
+        extra_sbatch_args: list[str] = []
+        if args.gres is not None:
+            extra_sbatch_args.append(f"--gres={args.gres}")
+        if args.time is not None:
+            extra_sbatch_args.append(f"--time={args.time}")
+        submit_slurm_array(
+            manifest, manifest_path, RUN_ARRAY_SH, extra_sbatch_args or None
+        )
         print(f"\nAfter the array finishes, aggregate with:")
         print(f"  uv run python experiments/report_cutoff_sweep.py "
               f"--sweep-dir {args.sweep_dir}")
