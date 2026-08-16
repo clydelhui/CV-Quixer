@@ -10,23 +10,33 @@
 #
 #     bash scripts/pull_results.sh <sweep_dir>... --tier figures
 #
-# CPU-ONLY (no --gres): JSON + npz work with no model rebuild, so it counts
-# against MaxSubmitJobs (32) and never against the 8-GPU limit.
+# CPU-ONLY (no --gres): no model rebuild, so it counts against MaxSubmitJobs
+# (32) and never against the 8-GPU limit.
 #
-# Submit — one or more sweep dirs, extra args forwarded verbatim:
-#     sbatch scripts/run_thesis_figures.sh results/sweeps/<sweep>_<ts>/
-#     sbatch scripts/run_thesis_figures.sh \
+# A JOB ARRAY. The work is I/O-bound, not compute-bound: deriving the
+# accuracy/loss curves streams every epoch's train-side predictions npz, and
+# those are the ~94 MB/epoch files — roughly 2.4 GB per 25-epoch run off network
+# storage. Runs are split across the array by a round-robin stripe (the script's
+# own --shard/--num-shards, so the run filters stay in one place), so wall time
+# falls almost linearly with the array width.
+#
+# Submit — one or more sweep dirs, extra args after a literal `--`:
+#     sbatch --array=0-9 scripts/run_thesis_figures.sh \
 #         results/sweeps/high_epoch_quantum_<ts>/ \
 #         results/sweeps/high_epoch_shared_<ts>/ \
 #         results/sweeps/high_epoch_stacked_<ts>/ -- --min-epochs 25
 #
-# Everything after a literal `--` goes to thesis_run_figures.py (e.g.
-# --min-epochs, --epoch final, --only <figure>, --runs <pattern>).
+# Without --array it runs as a single task (shard 0 of 1) and does everything.
+# Tasks beyond the run count simply find an empty stripe and exit cleanly, so
+# over-sizing the array is harmless.
+#
+# Everything after `--` goes to thesis_run_figures.py (e.g. --min-epochs,
+# --epoch final, --only <figure>, --runs <pattern>).
 # -----------------------------------------------------------------------
 #SBATCH --job-name=cv_quixer_thesis_figs
-#SBATCH --output=slurm_logs/slurm-%x-%j.out
-#SBATCH --error=slurm_logs/slurm-%x-%j.err
-#SBATCH --time=01:00:00
+#SBATCH --output=slurm_logs/slurm-%x-%A_%a.out
+#SBATCH --error=slurm_logs/slurm-%x-%A_%a.err
+#SBATCH --time=02:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 
@@ -50,7 +60,14 @@ if [ "${#SWEEP_DIRS[@]}" -eq 0 ]; then
     exit 2
 fi
 
-echo "Job ID:     ${SLURM_JOB_ID:-?}"
+# Array coordinates -> shard index. TASK_MIN makes this correct for an array
+# that does not start at 0 (e.g. --array=5-9), matching run_report_array.sh.
+TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
+TASK_MIN="${SLURM_ARRAY_TASK_MIN:-0}"
+NUM_SHARDS="${SLURM_ARRAY_TASK_COUNT:-1}"
+SHARD=$(( TASK_ID - TASK_MIN ))
+
+echo "Job ID:     ${SLURM_JOB_ID:-?}  (array task ${TASK_ID}, shard ${SHARD}/${NUM_SHARDS})"
 echo "Node:       ${SLURMD_NODENAME:-?}"
 echo "Sweep dirs: ${SWEEP_DIRS[*]}"
 echo "Extra args: ${EXTRA_ARGS[*]-<none>}"
@@ -68,7 +85,9 @@ for d in "${SWEEP_DIRS[@]}"; do SWEEP_FLAGS+=(--sweep-dir "$d"); done
 echo ""
 PYTHONPATH="$HOME/CV-Quixer${PYTHONPATH:+:$PYTHONPATH}" \
     uv run --no-sync python -u experiments/thesis_run_figures.py \
-        "${SWEEP_FLAGS[@]}" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
+        "${SWEEP_FLAGS[@]}" \
+        --shard "$SHARD" --num-shards "$NUM_SHARDS" \
+        ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 
 echo ""
 echo "Finished thesis figures: $(date)"

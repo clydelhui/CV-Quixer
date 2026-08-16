@@ -78,10 +78,10 @@ from report_diagnostics import (
     _derive_lcu_lambda,
     _diag_stages,
     _load_all_diagnostics,
-    _load_all_per_epoch_predictions,
     _per_class_acc_from,
     load_run,
 )
+from report_diagnostics import _require_predictions as _load_predictions_npz
 
 from cv_quixer.evaluation import artefact_schema as schema
 from cv_quixer.evaluation.labels import class_names
@@ -164,6 +164,25 @@ def _n_blocks(run: dict) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _stream_epochs(run_dir: Path, side: str, n_epochs: int, reduce_fns: dict):
+    """Apply scalar reductions to each epoch's predictions npz, one at a time.
+
+    Deliberately not `_load_all_per_epoch_predictions`: that returns every
+    epoch's arrays at once, and the *train*-side files are the ~94 MB/epoch
+    ones, so a 25-epoch run would hold ~2.4 GB live purely to compute a handful
+    of scalars. Reading and discarding epoch by epoch keeps the peak at one
+    file. Raises MissingArtefactError from the first absent epoch, exactly as
+    the batch loader would.
+    """
+    out = {name: [] for name in reduce_fns}
+    for e in range(1, n_epochs + 1):
+        preds = _load_predictions_npz(run_dir, e, side)
+        for name, fn in reduce_fns.items():
+            out[name].append(fn(preds))
+        del preds
+    return out
+
+
 def _epoch_series(run: dict) -> dict:
     """Per-epoch loss/accuracy, derived from the predictions npz when present.
 
@@ -175,11 +194,10 @@ def _epoch_series(run: dict) -> dict:
     """
     eh = run["history"]["epoch"]
     n_epochs = len(eh.get("test_acc") or [])
+    reductions = {"loss": _cross_entropy_from, "acc": _accuracy_from}
     try:
-        test = _load_all_per_epoch_predictions(
-            run["run_dir"], side="test", n_epochs=n_epochs)
-        train = _load_all_per_epoch_predictions(
-            run["run_dir"], side="train", n_epochs=n_epochs)
+        test = _stream_epochs(run["run_dir"], "test", n_epochs, reductions)
+        train = _stream_epochs(run["run_dir"], "train", n_epochs, reductions)
     except MissingArtefactError:
         return {
             "epochs": list(range(1, n_epochs + 1)),
@@ -189,13 +207,12 @@ def _epoch_series(run: dict) -> dict:
             "test_acc": list(eh.get("test_acc") or []),
             "derived": False,
         }
-    epochs = sorted(test)
     return {
-        "epochs": epochs,
-        "train_loss": [_cross_entropy_from(train[e]) for e in epochs],
-        "test_loss": [_cross_entropy_from(test[e]) for e in epochs],
-        "train_acc": [_accuracy_from(train[e]) for e in epochs],
-        "test_acc": [_accuracy_from(test[e]) for e in epochs],
+        "epochs": list(range(1, n_epochs + 1)),
+        "train_loss": train["loss"],
+        "test_loss": test["loss"],
+        "train_acc": train["acc"],
+        "test_acc": test["acc"],
         "derived": True,
     }
 
@@ -358,13 +375,14 @@ def fig_per_class_accuracy_curve(run: dict) -> None:
     classes = class_names(run["config"])
     n_epochs = len(run["history"]["epoch"].get("test_acc") or [])
     try:
-        preds = _load_all_per_epoch_predictions(
-            run["run_dir"], side="test", n_epochs=n_epochs)
+        streamed = _stream_epochs(
+            run["run_dir"], "test", n_epochs,
+            {"per_class": lambda p: _per_class_acc_from(p, len(classes))},
+        )
     except MissingArtefactError as exc:
         raise SkipFigure(str(exc).split(" — ")[0]) from exc
-    epochs = sorted(preds)
-    acc = np.stack([_per_class_acc_from(preds[e], len(classes))
-                    for e in epochs])
+    epochs = list(range(1, n_epochs + 1))
+    acc = np.stack(streamed["per_class"])
     fig, ax = plt.subplots(figsize=(8.4, 5.0))
     cmap = plt.get_cmap("tab10")
     for c, name in enumerate(classes):
@@ -534,34 +552,48 @@ def fig_success_prob_histogram(run: dict) -> None:
 
 
 def fig_success_prob_trajectory(run: dict) -> None:
-    preds = _load_all_per_epoch_predictions(run["run_dir"], side="test")
-    epochs = sorted(e for e, d in preds.items()
-                    if schema.SUCCESS_PROBS in d)
-    if len(epochs) < 2:
+    # Diagnostics first: they are small (written over the diagnostic subset),
+    # and without per-epoch λ there is nothing to plot — no point streaming the
+    # much larger predictions files to find that out.
+    diag_all = _load_all_diagnostics(run["run_dir"])
+    n_epochs = len(run["history"]["epoch"].get("test_acc") or [])
+    have_lambda = [
+        e for e in range(1, n_epochs + 1)
+        if diag_all.get(e) is not None
+        and schema.LCU_COEFFS in diag_all[e]
+        and schema.POLY_COEFFS in diag_all[e]
+    ]
+    if len(have_lambda) < 2:
+        raise SkipFigure("fewer than 2 epochs have coeffs to derive λ")
+
+    # One predictions file live at a time (see _stream_epochs).
+    usable, stats = [], []
+    for e in have_lambda:
+        path = (run["run_dir"] / "predictions"
+                / schema.prediction_filename(e, train=False))
+        if not path.is_file():
+            continue
+        with np.load(path) as npz:
+            if schema.SUCCESS_PROBS not in npz:
+                continue
+            raw = np.asarray(npz[schema.SUCCESS_PROBS], dtype=np.float64)
+        lam = _derive_lcu_lambda(diag_all[e][schema.LCU_COEFFS],
+                                 diag_all[e][schema.POLY_COEFFS])
+        ratio = raw / lam[None, :] ** 2
+        stats.append((ratio.mean(axis=0),
+                      np.percentile(ratio, 10, axis=0),
+                      np.percentile(ratio, 90, axis=0)))
+        usable.append(e)
+    if len(usable) < 2:
         raise SkipFigure(
             "fewer than 2 epochs carry success_probs "
             "(not recorded for this model variant, or predictions/ absent)"
         )
-    diag_all = _load_all_diagnostics(run["run_dir"])
-    usable = [e for e in epochs
-              if diag_all.get(e) is not None
-              and schema.LCU_COEFFS in diag_all[e]
-              and schema.POLY_COEFFS in diag_all[e]]
-    if len(usable) < 2:
-        raise SkipFigure("fewer than 2 epochs have coeffs to derive λ")
 
-    num_heads = np.asarray(preds[usable[0]][schema.SUCCESS_PROBS]).shape[1]
-    mean = np.zeros((len(usable), num_heads))
-    p10, p90 = np.zeros_like(mean), np.zeros_like(mean)
-    for i, e in enumerate(usable):
-        raw = np.asarray(preds[e][schema.SUCCESS_PROBS], dtype=np.float64)
-        lam = _derive_lcu_lambda(diag_all[e][schema.LCU_COEFFS],
-                                 diag_all[e][schema.POLY_COEFFS])
-        ratio = raw / lam[None, :] ** 2
-        mean[i] = ratio.mean(axis=0)
-        p10[i] = np.percentile(ratio, 10, axis=0)
-        p90[i] = np.percentile(ratio, 90, axis=0)
-
+    mean = np.stack([s[0] for s in stats])
+    p10 = np.stack([s[1] for s in stats])
+    p90 = np.stack([s[2] for s in stats])
+    num_heads = mean.shape[1]
     colors = head_colors(num_heads)
     fig, ax = plt.subplots(figsize=(8.4, 4.8))
     for h in range(num_heads):
@@ -734,6 +766,13 @@ def discover_runs(args: argparse.Namespace) -> list[Path]:
         if args.min_epochs and _epochs_of(r) < args.min_epochs:
             continue
         selected.append(r)
+
+    # Round-robin stripe, not contiguous blocks: runs differ several-fold in
+    # cost (heads, modes, blocks all vary), and a sweep dir lists them in an
+    # order that groups similar architectures together — so contiguous slicing
+    # would hand one task all the expensive ones.
+    if args.num_shards > 1:
+        selected = selected[args.shard::args.num_shards]
     return selected
 
 
@@ -754,16 +793,31 @@ def main() -> None:
                         help="best | final | <N> — which epoch's artefacts to use")
     parser.add_argument("--only", action="append", choices=list(FIGURES),
                         help="render just this figure (repeatable)")
+    parser.add_argument("--num-shards", type=int, default=1,
+                        help="split the selected runs across this many jobs")
+    parser.add_argument("--shard", type=int, default=0,
+                        help="0-based index of this shard (see --num-shards)")
     args = parser.parse_args()
 
     if not args.run_dir and not args.sweep_dir:
         parser.error("need at least one --run-dir or --sweep-dir")
+    if args.num_shards < 1:
+        parser.error("--num-shards must be >= 1")
+    if not (0 <= args.shard < args.num_shards):
+        parser.error(f"--shard must be in [0, {args.num_shards - 1}]")
 
     runs = discover_runs(args)
     if not runs:
+        # An empty shard is normal when tasks outnumber runs, not an error.
+        if args.num_shards > 1:
+            print(f"shard {args.shard}/{args.num_shards}: no runs — nothing to do")
+            return
         raise SystemExit("no runs matched the selection")
 
-    print(f"Rendering thesis figures for {len(runs)} run(s), epoch={args.epoch}\n")
+    shard_note = (f" [shard {args.shard + 1}/{args.num_shards}]"
+                  if args.num_shards > 1 else "")
+    print(f"Rendering thesis figures for {len(runs)} run(s), "
+          f"epoch={args.epoch}{shard_note}\n")
     total_w = total_s = 0
     failed: list[str] = []
     for i, run_dir in enumerate(runs, 1):
