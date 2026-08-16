@@ -64,8 +64,21 @@ fi
 # that does not start at 0 (e.g. --array=5-9), matching run_report_array.sh.
 TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 TASK_MIN="${SLURM_ARRAY_TASK_MIN:-0}"
+TASK_MAX="${SLURM_ARRAY_TASK_MAX:-0}"
 NUM_SHARDS="${SLURM_ARRAY_TASK_COUNT:-1}"
 SHARD=$(( TASK_ID - TASK_MIN ))
+
+# The shard index is a position within the array (TASK_ID - TASK_MIN), so the
+# array must be contiguous for the indices to cover 0..NUM_SHARDS-1 exactly. A
+# gappy spec (--array=0,3,7) would leave some runs assigned to a shard no task
+# ever claims — silently dropping them. Refuse instead. A throttle
+# (--array=0-9%3) is contiguous and fine.
+if [ "$NUM_SHARDS" -ne $(( TASK_MAX - TASK_MIN + 1 )) ]; then
+    echo "error: non-contiguous --array (min=$TASK_MIN max=$TASK_MAX count=$NUM_SHARDS)." >&2
+    echo "       Use a contiguous range such as --array=0-$(( NUM_SHARDS - 1 ))" >&2
+    echo "       (a throttle like --array=0-9%3 is contiguous and supported)." >&2
+    exit 2
+fi
 
 echo "Job ID:     ${SLURM_JOB_ID:-?}  (array task ${TASK_ID}, shard ${SHARD}/${NUM_SHARDS})"
 echo "Node:       ${SLURMD_NODENAME:-?}"
