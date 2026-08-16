@@ -224,7 +224,7 @@ def plot_slope(rows: list[dict], out_dir: Path, metric: str,
     pos = {c: i for i, c in enumerate(cutoffs)}
     training_cutoff = _training_cutoff(rows)
 
-    fig, ax = plt.subplots(figsize=(6.4, 4.4))
+    fig, ax = plt.subplots(figsize=(5.8, 4.2))
     models_seen: set[str] = set()
     for model, _key, values in sorted(pairs, key=lambda p: (p[0], str(p[1]))):
         models_seen.add(model)
@@ -239,17 +239,24 @@ def plot_slope(rows: list[dict], out_dir: Path, metric: str,
 
     ax.set_xticks(range(len(cutoffs)))
     ax.set_xticklabels([f"$D = {c}$" for c in cutoffs])
-    ax.set_xlim(-0.3, len(cutoffs) - 0.7)
+    # Just enough margin to clear the markers. A slope chart carries its
+    # signal in the segment angle, so wide side margins both waste canvas and
+    # flatten every slope.
+    ax.set_xlim(-0.12, len(cutoffs) - 1 + 0.12)
     ax.set_xlabel("Fock cutoff dimension")
     ax.set_ylabel(spec["ylabel"])
     if spec["log"]:
         ax.set_yscale("log")
 
     style_axes(ax)
-    # Outside the axes: a slope chart's segments span the full width, so every
-    # in-axes position sits on data.
-    variant_legend(ax, sorted(models_seen), loc="center left",
-                   bbox_to_anchor=(1.02, 0.5))
+    # Above the axes, laid out horizontally. A slope chart's segments span the
+    # full width, so no in-axes position is free; but parking the legend in a
+    # side column costs ~25% of the width to display three entries, most of that
+    # column empty. One flat row across the top costs a thin strip instead, and
+    # the plot keeps the whole canvas width.
+    variant_legend(ax, sorted(models_seen), loc="lower center",
+                   bbox_to_anchor=(0.5, 1.0), ncol=len(models_seen),
+                   borderaxespad=0.0)
     save(fig, out_dir, spec["stem"])
     book.add(
         stem=spec["stem"],
