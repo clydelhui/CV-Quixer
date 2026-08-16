@@ -57,15 +57,14 @@ import numpy as np
 
 from _run_selection import read_run_names_file
 from _thesis_style import (
-    FIGSIZE,
-    MODEL_COLORS,
+    SINGLE_SEED,
+    CaptionBook,
     grid_axes,
     head_colors,
     outside_legend,
     save,
     show_path,
     style_axes,
-    titles,
 )
 
 # Reuse the run loader, the per-epoch artefact readers, the stage detection and
@@ -94,11 +93,12 @@ class SkipFigure(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
-def _run_subtitle(run: dict) -> str:
-    """One grey line identifying the run a figure belongs to.
+def _run_identity(run: dict) -> str:
+    """The architecture a figure belongs to, as caption prose.
 
-    Sixteen runs' figures end up in one document, so each must say which
-    architecture it came from without relying on the surrounding caption.
+    Sixteen runs contribute a near-identical figure suite to one document, and
+    with no in-figure subtitle this string is the only thing distinguishing
+    them — so every caption carries it.
     """
     q = run["config"].quantum
     meta = run["history"].get("meta", {})
@@ -108,15 +108,37 @@ def _run_subtitle(run: dict) -> str:
         model,
         f"{q.num_heads} heads",
         f"{q.num_modes} modes",
-        f"cutoff {q.cutoff_dim}",
-        f"degree {q.poly_degree}",
+        f"cutoff $D = {q.cutoff_dim}$",
+        f"polynomial degree {q.poly_degree}",
     ]
-    if getattr(q, "num_seq2seq_blocks", 1) and model == "quantum_stacked":
-        bits.append(f"{q.num_seq2seq_blocks} blocks")
+    if model == "quantum_stacked" and getattr(q, "num_seq2seq_blocks", 1):
+        bits.append(f"{q.num_seq2seq_blocks} seq-to-seq blocks")
     if params:
-        bits.append(f"{int(params) / 1e6:.2f}M parameters")
-    bits.append(f"epoch {run['epoch']}")
-    return " · ".join(bits)
+        bits.append(f"{int(params):,} parameters")
+    return ", ".join(bits)
+
+
+def _facts(run: dict, extra: str | None = None, stage: str | None = None,
+           result: str | None = None) -> dict[str, str]:
+    """The standing caption tail for a per-run figure."""
+    facts = {"Configuration": _run_identity(run)}
+    if stage:
+        facts["Stage"] = stage
+    facts["Evaluated at"] = f"epoch {run['epoch']}"
+    if result:
+        facts["Result"] = result
+    if extra:
+        facts["Note"] = extra
+    facts["Caveat"] = SINGLE_SEED
+    return facts
+
+
+def _source_fact(series: dict) -> str | None:
+    """Flag curves derived from the training log rather than the saved npz."""
+    return None if series["derived"] else (
+        "values read from the training log; the per-epoch prediction artefacts "
+        "were not available"
+    )
 
 
 def _stage_display(prefix: str, n_blocks: int) -> str:
@@ -250,10 +272,6 @@ def _epoch_series(run: dict) -> dict:
     }
 
 
-def _source_note(series: dict) -> str:
-    return "" if series["derived"] else " · values from the training log"
-
-
 def _best_epoch(run: dict) -> int | None:
     return run["history"].get("meta", {}).get("best_epoch")
 
@@ -263,47 +281,54 @@ def _best_epoch(run: dict) -> int | None:
 # ---------------------------------------------------------------------------
 
 
-def fig_loss_curve(run: dict) -> None:
+def fig_loss_curve(run: dict, book: CaptionBook) -> None:
     s = _epoch_series(run)
     if not s["epochs"]:
         raise SkipFigure("history.json has no epochs")
-    fig, ax = plt.subplots(figsize=FIGSIZE)
+    fig, ax = plt.subplots(figsize=(6.6, 4.2))
     ax.plot(s["epochs"], s["train_loss"], marker="o", markersize=3.5,
             color="#0072B2", label="Training")
     ax.plot(s["epochs"], s["test_loss"], marker="s", markersize=3.5,
             color="#D55E00", label="Test")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Cross-entropy loss")
-    titles(fig, ax, "Training and test loss",
-           _run_subtitle(run) + _source_note(s))
     style_axes(ax)
     ax.legend(frameon=False)
     save(fig, run["fig_dir"], "loss_curve")
+    book.add("loss_curve", "Training and test cross-entropy loss",
+             "Cross-entropy loss per epoch on the training and test splits.",
+             _facts(run, extra=_source_fact(s)))
 
 
-def fig_accuracy_curve(run: dict) -> None:
+def fig_accuracy_curve(run: dict, book: CaptionBook) -> None:
     s = _epoch_series(run)
     if not s["epochs"]:
         raise SkipFigure("history.json has no epochs")
-    fig, ax = plt.subplots(figsize=FIGSIZE)
+    fig, ax = plt.subplots(figsize=(6.6, 4.2))
     ax.plot(s["epochs"], s["train_acc"], marker="o", markersize=3.5,
             color="#0072B2", label="Training")
     ax.plot(s["epochs"], s["test_acc"], marker="s", markersize=3.5,
             color="#D55E00", label="Test")
     best = _best_epoch(run)
-    if best and best in s["epochs"]:
-        acc = s["test_acc"][s["epochs"].index(best)]
+    best_acc = (s["test_acc"][s["epochs"].index(best)]
+                if best and best in s["epochs"] else None)
+    if best_acc is not None:
+        acc = best_acc
         ax.axvline(best, color="#888888", ls="--", lw=0.9)
         ax.annotate(f"best: {acc:.4f} (epoch {best})", (best, acc),
                     textcoords="offset points", xytext=(-8, 10),
                     ha="right", fontsize=8, color="#444444")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Accuracy")
-    titles(fig, ax, "Training and test accuracy",
-           _run_subtitle(run) + _source_note(s))
     style_axes(ax)
     ax.legend(frameon=False, loc="lower right")
     save(fig, run["fig_dir"], "accuracy_curve")
+    best_note = (f"best test accuracy {best_acc:.4f} at epoch {best}"
+                 if best_acc is not None else None)
+    book.add("accuracy_curve", "Training and test accuracy",
+             "Classification accuracy per epoch on both splits; the dashed "
+             "vertical line marks the best test epoch.",
+             _facts(run, extra=_source_fact(s), result=best_note))
 
 
 # The three truncation streams, as (train key, test key, panel title). Each
@@ -319,7 +344,7 @@ _TRUNC_STREAMS = [
 ]
 
 
-def fig_truncation_losses(run: dict) -> None:
+def fig_truncation_losses(run: dict, book: CaptionBook) -> None:
     """All truncation-leakage streams that this run actually exercises.
 
     A stream that is identically zero means the stage is absent (no CVQNN block
@@ -338,7 +363,7 @@ def fig_truncation_losses(run: dict) -> None:
         raise SkipFigure("no non-zero truncation streams in history.json")
 
     fig, axes = plt.subplots(
-        len(active), 1, figsize=(7.5, 2.4 * len(active) + 1.2),
+        len(active), 1, figsize=(6.8, 2.2 * len(active) + 0.9),
         sharex=True, squeeze=False,
     )
     for ax, (tr, te, label) in zip(axes[:, 0], active):
@@ -354,8 +379,13 @@ def fig_truncation_losses(run: dict) -> None:
         style_axes(ax)
     axes[-1, 0].set_xlabel("Epoch")
     axes[0, 0].legend(frameon=False, fontsize=8)
-    titles(fig, None, "Fock-space truncation loss by stage", _run_subtitle(run))
-    save(fig, run["fig_dir"], "truncation_losses", rect=(0, 0, 1, 0.9))
+    stage_names = ", ".join(label for _tr, _te, label in active)
+    save(fig, run["fig_dir"], "truncation_losses")
+    book.add("truncation_losses", "Fock-space truncation loss by stage",
+             "Probability leaking outside the truncated Fock space, one panel "
+             "per circuit stage that leaks. Stages this model does not have are "
+             "omitted rather than drawn as a flat zero.",
+             _facts(run, extra=f"stages shown: {stage_names}"))
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +402,7 @@ def _require_predictions(run: dict) -> dict:
     return run["predictions"]
 
 
-def fig_confusion_matrix(run: dict) -> None:
+def fig_confusion_matrix(run: dict, book: CaptionBook) -> None:
     preds = _require_predictions(run)
     classes = class_names(run["config"])
     cm = np.zeros((len(classes), len(classes)))
@@ -383,8 +413,11 @@ def fig_confusion_matrix(run: dict) -> None:
     row = cm.sum(axis=1, keepdims=True)
     norm = cm / np.maximum(row, 1)
 
-    fig, ax = plt.subplots(figsize=(7.2, 6.0))
-    im = ax.imshow(norm, cmap="Blues", vmin=0, vmax=1)
+    # Square canvas and an equal aspect so the 10x10 grid stays square, and no
+    # colourbar: every cell is annotated with its value, so the bar would cost
+    # ~12% of the width to encode what the reader can already read.
+    fig, ax = plt.subplots(figsize=(6.2, 6.2))
+    im = ax.imshow(norm, cmap="Blues", vmin=0, vmax=1, aspect="equal")
     ax.set_xticks(range(len(classes)))
     ax.set_yticks(range(len(classes)))
     ax.set_xticklabels(classes, rotation=45, ha="right", fontsize=8)
@@ -397,14 +430,16 @@ def fig_confusion_matrix(run: dict) -> None:
                 ax.text(j, i, f"{norm[i, j]:.2f}", ha="center", va="center",
                         fontsize=7,
                         color="white" if norm[i, j] > 0.6 else "black")
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label("Fraction of true class", fontsize=9)
-    titles(fig, ax, "Test confusion matrix (row-normalised)", _run_subtitle(run))
     ax.grid(False)
-    save(fig, run["fig_dir"], "confusion_matrix", rect=(0, 0, 1, 0.93))
+    save(fig, run["fig_dir"], "confusion_matrix")
+    book.add("confusion_matrix", "Test confusion matrix",
+             "Row-normalised: each row is the distribution of predictions for "
+             "one true class, so the diagonal entries are per-class recall. "
+             "Cells below 0.005 are left blank.",
+             _facts(run))
 
 
-def fig_per_class_accuracy_curve(run: dict) -> None:
+def fig_per_class_accuracy_curve(run: dict, book: CaptionBook) -> None:
     classes = class_names(run["config"])
     try:
         streamed = _side_scalars(run, "test")
@@ -412,20 +447,22 @@ def fig_per_class_accuracy_curve(run: dict) -> None:
         raise SkipFigure(str(exc).split(" — ")[0]) from exc
     acc = np.stack(streamed["per_class"])
     epochs = list(range(1, len(acc) + 1))
-    fig, ax = plt.subplots(figsize=(8.4, 5.0))
+    fig, ax = plt.subplots(figsize=(7.6, 4.4))
     cmap = plt.get_cmap("tab10")
     for c, name in enumerate(classes):
         ax.plot(epochs, acc[:, c], marker="o", markersize=3,
                 color=cmap(c % 10), label=name)
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Test accuracy (recall)")
-    titles(fig, ax, "Per-class test accuracy", _run_subtitle(run))
     style_axes(ax)
     outside_legend(ax, title="Class")
     save(fig, run["fig_dir"], "per_class_accuracy_curve")
+    book.add("per_class_accuracy_curve", "Per-class test accuracy",
+             "Test recall for each FashionMNIST class across epochs.",
+             _facts(run))
 
 
-def fig_calibration_reliability(run: dict) -> None:
+def fig_calibration_reliability(run: dict, book: CaptionBook) -> None:
     preds = _require_predictions(run)
     y_true = preds["y_true"]
     y_probs = preds["y_probs"]
@@ -441,7 +478,7 @@ def fig_calibration_reliability(run: dict) -> None:
         ys.append(correct[mask].mean() if mask.any() else np.nan)
         ns.append(int(mask.sum()))
 
-    fig, ax = plt.subplots(figsize=(6.2, 5.6))
+    fig, ax = plt.subplots(figsize=(5.6, 5.0))
     ax.plot([0, 1], [0, 1], ls="--", color="#888888", lw=1,
             label="Perfect calibration")
     ax.plot(xs, ys, marker="o", markersize=4, color="#0072B2",
@@ -454,11 +491,14 @@ def fig_calibration_reliability(run: dict) -> None:
     ax.set_ylabel("Observed accuracy")
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1.02)
-    titles(fig, ax, "Calibration reliability",
-           _run_subtitle(run) + " · annotations = samples per bin")
     style_axes(ax)
     ax.legend(frameon=False, loc="upper left")
     save(fig, run["fig_dir"], "calibration_reliability")
+    book.add("calibration_reliability", "Calibration reliability",
+             "Observed accuracy against predicted confidence in 15 equal-width "
+             "bins; the dashed diagonal is perfect calibration. Each point is "
+             "annotated with the number of test samples in its bin.",
+             _facts(run))
 
 
 # ---------------------------------------------------------------------------
@@ -475,7 +515,7 @@ def _require_diagnostics(run: dict) -> dict:
     return run["diagnostics"]
 
 
-def fig_photon_number_per_mode(run: dict) -> None:
+def fig_photon_number_per_mode(run: dict, book: CaptionBook) -> None:
     diag = _require_diagnostics(run)
     if "mean_photon_number" not in diag:
         raise SkipFigure("diagnostics npz has no mean_photon_number")
@@ -484,7 +524,7 @@ def fig_photon_number_per_mode(run: dict) -> None:
     cutoff = run["config"].quantum.cutoff_dim
     colors = head_colors(num_heads)
 
-    fig, ax = plt.subplots(figsize=(8.4, 4.6))
+    fig, ax = plt.subplots(figsize=(7.6, 4.2))
     x = np.arange(num_modes)
     width = 0.8 / num_heads
     for h in range(num_heads):
@@ -495,13 +535,17 @@ def fig_photon_number_per_mode(run: dict) -> None:
     ax.set_ylabel(r"Mean photon number $\langle \hat n_k \rangle$")
     ax.axhline(cutoff - 1, color="#C1272D", ls="--", lw=1,
                label=f"Truncation limit ({cutoff - 1})")
-    titles(fig, ax, "Mean photon number per mode", _run_subtitle(run))
     style_axes(ax)
     outside_legend(ax)
     save(fig, run["fig_dir"], "photon_number_per_mode")
+    book.add("photon_number_per_mode", "Mean photon number per mode",
+             "One bar group per bosonic mode, one bar per attention head. The "
+             "dashed line marks the highest representable Fock level, so bars "
+             "approaching it indicate states pressing against the truncation.",
+             _facts(run, extra=f"truncation limit {cutoff - 1}"))
 
 
-def fig_state_norm_histogram(run: dict) -> None:
+def fig_state_norm_histogram(run: dict, book: CaptionBook) -> None:
     diag = _require_diagnostics(run)
     keys = sorted(k for k in diag if k.endswith("_state_norms"))
     if not keys:
@@ -513,7 +557,7 @@ def fig_state_norm_histogram(run: dict) -> None:
     edges = np.linspace(0.999, 1.001, 21) if spread < 1e-4 else 40
     colors = head_colors(len(keys))
 
-    fig, ax = plt.subplots(figsize=(8.4, 4.6))
+    fig, ax = plt.subplots(figsize=(7.6, 4.2))
     for k, color in zip(keys, colors):
         # Step outlines, not filled bars: up to ten overlapping filled
         # histograms hide each other regardless of alpha.
@@ -522,14 +566,17 @@ def fig_state_norm_histogram(run: dict) -> None:
     ax.axvline(1.0, color="#C1272D", ls="--", lw=1, label="Unit norm")
     ax.set_xlabel(r"Output state norm $\|\psi\|^2$")
     ax.set_ylabel("Count")
-    titles(fig, ax, "Output state norm across the diagnostic subset",
-           _run_subtitle(run))
     style_axes(ax)
     outside_legend(ax)
     save(fig, run["fig_dir"], "state_norm_histogram")
+    book.add("state_norm_histogram",
+             "Output state norm across the diagnostic subset",
+             "Distribution of the squared output state norm per head, as step "
+             "outlines. Mass below one is Fock-truncation leakage.",
+             _facts(run))
 
 
-def fig_success_prob_histogram(run: dict) -> None:
+def fig_success_prob_histogram(run: dict, book: CaptionBook) -> None:
     preds = _require_predictions(run)
     if schema.SUCCESS_PROBS not in preds:
         raise SkipFigure(
@@ -550,7 +597,7 @@ def fig_success_prob_histogram(run: dict) -> None:
     log_x = pos.size > 0 and float(pos.max()) / float(pos.min()) > 100.0
     colors = head_colors(ratio.shape[1])
 
-    fig, ax = plt.subplots(figsize=(8.4, 4.8))
+    fig, ax = plt.subplots(figsize=(7.6, 4.4))
     if log_x:
         bins = np.logspace(np.log10(pos.min()), np.log10(pos.max()), 41)
         ax.set_xscale("log")
@@ -567,20 +614,18 @@ def fig_success_prob_histogram(run: dict) -> None:
         r"$\|P(M)|\psi\rangle\|^2 / \beta^2$"
     )
     ax.set_ylabel("Count")
-    # Per-head β would make a ten-entry legend unreadable; its range goes in a
-    # compact note instead.
-    note = f"Block-encoding scale β: {beta.min():.3g}–{beta.max():.3g}"
-    titles(fig, ax, "Post-selection success probability",
-           _run_subtitle(run) + " · test set")
-    ax.annotate(note, xy=(0.5, -0.27), xycoords="axes fraction",
-                ha="center", fontsize=8, color="#555555")
+
     style_axes(ax)
     outside_legend(ax)
-    save(fig, run["fig_dir"], "success_prob_histogram",
-         rect=(0, 0.05, 1, 0.945))
+    save(fig, run["fig_dir"], "success_prob_histogram")
+    book.add("success_prob_histogram", "Post-selection success probability",
+             "Distribution across the test set of the heralded post-selection "
+             "probability, one step histogram per attention head.",
+             _facts(run, extra=(f"block-encoding scale $\\beta$ ranges "
+                                f"{beta.min():.3g} to {beta.max():.3g}")))
 
 
-def fig_success_prob_trajectory(run: dict) -> None:
+def fig_success_prob_trajectory(run: dict, book: CaptionBook) -> None:
     # Diagnostics first: they are small (written over the diagnostic subset),
     # and without a per-epoch β there is nothing to plot — no point streaming
     # the much larger predictions files to find that out.
@@ -624,7 +669,7 @@ def fig_success_prob_trajectory(run: dict) -> None:
     p90 = np.stack([s[2] for s in stats])
     num_heads = mean.shape[1]
     colors = head_colors(num_heads)
-    fig, ax = plt.subplots(figsize=(8.4, 4.8))
+    fig, ax = plt.subplots(figsize=(7.6, 4.4))
     for h in range(num_heads):
         ax.plot(usable, mean[:, h], marker="o", markersize=3,
                 color=colors[h], label=f"Head {h}")
@@ -632,14 +677,17 @@ def fig_success_prob_trajectory(run: dict) -> None:
                         color=colors[h], alpha=0.15, linewidth=0)
     ax.set_xlabel("Epoch")
     ax.set_ylabel(r"$\|P(M)|\psi\rangle\|^2 / \beta^2$")
-    titles(fig, ax, "Post-selection success probability across training",
-           _run_subtitle(run) + " · mean with 10th–90th percentile band")
     style_axes(ax)
     outside_legend(ax)
     save(fig, run["fig_dir"], "success_prob_trajectory")
+    book.add("success_prob_trajectory",
+             "Post-selection success probability across training",
+             "Mean heralded post-selection probability per head against epoch, "
+             "with a shaded 10th-90th percentile band over the test set.",
+             _facts(run))
 
 
-def fig_lcu_coefficients_heatmap(run: dict) -> None:
+def fig_lcu_coefficients_heatmap(run: dict, book: CaptionBook) -> None:
     diag = _require_diagnostics(run)
     stages = _diag_stages(diag)
     n_blocks = _n_blocks(run)
@@ -650,24 +698,26 @@ def fig_lcu_coefficients_heatmap(run: dict) -> None:
             continue
         arr = np.asarray(diag[key])                       # (heads, patches, 2)
         magnitude = np.sqrt((arr ** 2).sum(axis=-1))
-        fig, ax = plt.subplots(figsize=(9.0, 4.2))
+        fig, ax = plt.subplots(figsize=(8.0, 3.8))
         im = ax.imshow(magnitude, aspect="auto", cmap="viridis")
         ax.set_xlabel("Patch index $i$")
         ax.set_ylabel("Attention head")
         ax.set_yticks(range(magnitude.shape[0]))
         cbar = fig.colorbar(im, ax=ax)
         cbar.set_label(r"Coefficient magnitude $|b_i|$", fontsize=9)
-        titles(fig, ax,
-               "Learned LCU coefficient magnitudes",
-               _run_subtitle(run) + _stage_suffix_title(prefix, n_blocks))
         ax.grid(False)
         save(fig, run["fig_dir"], f"lcu_coefficients_heatmap{suffix}")
+        book.add(f"lcu_coefficients_heatmap{suffix}",
+                 "Learned LCU coefficient magnitudes",
+                 "Magnitude of the learned combination coefficient for each "
+                 "patch position (columns) and attention head (rows).",
+                 _facts(run, stage=_stage_display(prefix, n_blocks)))
         drawn += 1
     if not drawn:
         raise SkipFigure("diagnostics npz has no lcu_coeffs")
 
 
-def fig_polynomial_coefficients_trajectory(run: dict) -> None:
+def fig_polynomial_coefficients_trajectory(run: dict, book: CaptionBook) -> None:
     n_epochs = len(run["history"]["epoch"].get("test_acc") or [])
     try:
         diag_all = _load_all_diagnostics(run["run_dir"], n_epochs=n_epochs)
@@ -704,11 +754,14 @@ def fig_polynomial_coefficients_trajectory(run: dict) -> None:
         fig.legend(handles, labels, loc="lower center", ncol=degree_plus_1,
                    frameon=False, fontsize=9,
                    title="Polynomial coefficient", title_fontsize=9)
-        titles(fig, None, "Polynomial coefficients across training",
-               _run_subtitle(run) + _stage_suffix_title(prefix, n_blocks))
         save(fig, run["fig_dir"],
              f"polynomial_coefficients_trajectory{suffix}",
-             rect=(0, 0.09, 1, 0.90))
+             rect=(0, 0.06, 1, 1))
+        book.add(f"polynomial_coefficients_trajectory{suffix}",
+                 "Polynomial coefficients across training",
+                 "One panel per attention head; each line follows one "
+                 "polynomial coefficient across epochs.",
+                 _facts(run, stage=_stage_display(prefix, n_blocks)))
         drawn += 1
     if not drawn:
         raise SkipFigure("diagnostics npz has no poly_coeffs for every epoch")
@@ -741,10 +794,11 @@ def render_run(run_dir: Path, epoch_arg: str, only: list[str]) -> tuple[int, int
     run["fig_dir"] = run_dir.resolve() / "figures" / "thesis"
     run["fig_dir"].mkdir(parents=True, exist_ok=True)
 
+    book = CaptionBook(run["fig_dir"], label_prefix=f"{run_dir.name}-")
     written = skipped = 0
     for name in (only or list(FIGURES)):
         try:
-            FIGURES[name](run)
+            FIGURES[name](run, book)
             written += 1
         except (SkipFigure, MissingArtefactError) as exc:
             first = str(exc).split(" — ")[0]
@@ -757,6 +811,7 @@ def render_run(run_dir: Path, epoch_arg: str, only: list[str]) -> tuple[int, int
             )
             traceback.print_exc(limit=3)
             skipped += 1
+    book.write()
     return written, skipped
 
 

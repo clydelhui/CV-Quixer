@@ -62,10 +62,10 @@ from _thesis_style import (
     OPACITY_MODES,
     REPO_ROOT,
 )
+from _thesis_style import CaptionBook, SINGLE_SEED
 from _thesis_style import save as _save
 from _thesis_style import show_path as _show
 from _thesis_style import style_axes as _style_axes
-from _thesis_style import titles as _titles
 from _thesis_style import variant_legend as _variant_legend
 
 # Reuse the single-sweep loader + configuration-identity grouping (JSON only).
@@ -139,7 +139,7 @@ def _check_epochs(rows: list[dict], required: int, problems: list[str]) -> None:
 
 def figure_params(
     sweep_dirs: list[Path], out_dir: Path, max_epoch: int | None,
-    required_epochs: int, allow_incomplete: bool,
+    required_epochs: int, allow_incomplete: bool, book: CaptionBook,
 ) -> None:
     """Best test accuracy vs trainable parameter count, one point per config.
 
@@ -164,7 +164,7 @@ def figure_params(
     for key, g in groups.items():
         by_model[str(key[mi])].append((g["x"] / 1e6, g["acc"][0]))
 
-    fig, ax = plt.subplots(figsize=FIGSIZE)
+    fig, ax = plt.subplots(figsize=(6.6, 4.4))
     for model in MODEL_ORDER:
         pts = sorted(by_model.get(model, []))
         if not pts:
@@ -177,15 +177,22 @@ def figure_params(
         )
     ax.set_xlabel("Trainable parameters (millions)")
     ax.set_ylabel("Best test accuracy")
-    _titles(
-        fig, ax,
-        "Best test accuracy versus parameter count",
-        f"FashionMNIST · {required_epochs} epochs · one run per configuration "
-        "(single seed)",
-    )
     _style_axes(ax)
     _variant_legend(ax, list(by_model))
     _save(fig, out_dir, "acc_vs_params_compare")
+    book.add(
+        stem="acc_vs_params_compare",
+        short="Best test accuracy versus parameter count",
+        body=("One marker per configuration, coloured and shaped by model "
+              "variant. Deliberately unconnected: the configurations differ "
+              "along several architecture axes at once, so a line would imply "
+              "a one-dimensional trend that does not exist."),
+        facts={
+            "Data": (f"FashionMNIST test set, {len(groups)} configurations "
+                     f"trained for {required_epochs} epochs"),
+            "Caveat": SINGLE_SEED,
+        },
+    )
     print(f"    {len(groups)} configuration(s) across {len(rows)} run(s)")
 
 
@@ -198,7 +205,7 @@ def figure_ablation(
     sweep_dir: Path, out_dir: Path, field: str, order: list[str],
     labels: dict[str, str], title: str, xlabel: str, stem: str,
     max_epoch: int | None, required_epochs: int, allow_incomplete: bool,
-    opacity: str = "translucent",
+    book: CaptionBook, opacity: str = "translucent",
 ) -> None:
     """Best test accuracy against a categorical ablation axis.
 
@@ -251,7 +258,7 @@ def figure_ablation(
 
     line_a, marker_a, _suffix = OPACITY_MODES[opacity]
     pos = {v: i for i, v in enumerate(order)}
-    fig, ax = plt.subplots(figsize=FIGSIZE)
+    fig, ax = plt.subplots(figsize=(6.6, 4.4))
     models_seen: set[str] = set()
     for chain_key in sorted(by_chain, key=str):
         chain = by_chain[chain_key]
@@ -272,14 +279,22 @@ def figure_ablation(
     ax.set_xlim(-0.35, len(order) - 0.65)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(f"Best test accuracy ({required_epochs} epochs)")
-    _titles(
-        fig, ax, title,
-        f"FashionMNIST · {len(by_chain)} configurations · one line per "
-        "configuration, one run each (single seed)",
-    )
     _style_axes(ax)
     _variant_legend(ax, sorted(models_seen))
     _save(fig, out_dir, f"{stem}{_suffix}")
+    book.add(
+        stem=f"{stem}{_suffix}",
+        short=title,
+        body=("Each line connects the configurations that differ only in this "
+              "setting, holding every other architecture coordinate fixed; "
+              "colour gives the model variant."),
+        facts={
+            "Data": (f"FashionMNIST test set, {len(by_chain)} configurations, "
+                     f"best accuracy over {required_epochs} epochs"),
+            "Settings": ", ".join(labels[v] for v in order),
+            "Caveat": SINGLE_SEED,
+        },
+    )
     print(f"    {len(by_chain)} configuration(s) across {len(rows)} run(s)")
 
 
@@ -325,7 +340,8 @@ FIGURES = {
 }
 
 
-def render(name: str, args: argparse.Namespace) -> None:
+def render(name: str, args: argparse.Namespace,
+           books: dict[Path, CaptionBook]) -> None:
     spec = dict(FIGURES[name])
     if args.sweep_dir:
         spec["sweep_dirs"] = [Path(d) for d in args.sweep_dir]
@@ -340,10 +356,11 @@ def render(name: str, args: argparse.Namespace) -> None:
         if not Path(d).is_dir():
             raise IncompleteData(f"sweep dir not found: {d}")
 
+    book = books.setdefault(spec["out_dir"], CaptionBook(spec["out_dir"]))
     if name == "params":
         figure_params(
             spec["sweep_dirs"], spec["out_dir"], spec["max_epoch"],
-            spec["required_epochs"], args.allow_incomplete,
+            spec["required_epochs"], args.allow_incomplete, book,
         )
     else:
         modes = (
@@ -354,7 +371,7 @@ def render(name: str, args: argparse.Namespace) -> None:
                 spec["sweep_dirs"][0], spec["out_dir"], spec["field"],
                 spec["order"], spec["labels"], spec["title"], spec["xlabel"],
                 spec["stem"], spec["max_epoch"], spec["required_epochs"],
-                args.allow_incomplete, opacity=mode,
+                args.allow_incomplete, book, opacity=mode,
             )
 
 
@@ -393,13 +410,16 @@ def main() -> None:
     if (args.sweep_dir or args.out_dir) and len(names) > 1:
         parser.error("--sweep-dir / --out-dir require a single --figure")
 
+    books: dict[Path, CaptionBook] = {}
     failures: list[str] = []
     for name in names:
         try:
-            render(name, args)
+            render(name, args, books)
         except IncompleteData as exc:
             failures.append(f"[{name}] {exc}")
             print(f"  ✗ skipped: {exc}")
+    for book in books.values():
+        book.write()
     if failures:
         print(f"\n{len(failures)} figure(s) not rendered.")
         sys.exit(1)

@@ -47,14 +47,14 @@ import numpy as np
 from matplotlib.colors import to_rgba
 
 from _thesis_style import (
+    SINGLE_SEED,
+    CaptionBook,
     MODEL_COLORS,
     MODEL_MARKERS,
-    MODEL_ORDER,
     REPO_ROOT,
     save,
     show_path,
     style_axes,
-    titles,
     variant_legend,
 )
 
@@ -189,7 +189,7 @@ def pair_by_run(rows: list[dict], metric: str, split: str = "test") -> tuple:
 METRICS = {
     "accuracy": {
         "column": "acc",
-        "title": "Test accuracy under an increased Fock cutoff",
+        "short": "Test accuracy under an increased Fock cutoff",
         "ylabel": "Test accuracy",
         "stem": "cutoff_accuracy",
         "log": False,
@@ -197,7 +197,7 @@ METRICS = {
     },
     "truncation_loss": {
         "column": "trunc_loss",
-        "title": "Fock-space truncation loss under an increased cutoff",
+        "short": "Fock-space truncation loss under an increased cutoff",
         "ylabel": "Truncation loss (leaked probability)",
         "stem": "cutoff_truncation_loss",
         # Leakage spans more than a decade across configurations and falls by a
@@ -207,7 +207,7 @@ METRICS = {
     },
     "photon_number": {
         "column": "mean_photon",
-        "title": "Mean photon number under an increased Fock cutoff",
+        "short": "Mean photon number under an increased Fock cutoff",
         "ylabel": r"Mean photon number $\langle \hat n \rangle$",
         "stem": "cutoff_photon_number",
         "log": False,
@@ -216,14 +216,15 @@ METRICS = {
 }
 
 
-def plot_slope(rows: list[dict], out_dir: Path, metric: str) -> None:
+def plot_slope(rows: list[dict], out_dir: Path, metric: str,
+               book: CaptionBook) -> None:
     """One segment per run between the evaluated cutoffs, coloured by variant."""
     spec = METRICS[metric]
     pairs, cutoffs = pair_by_run(rows, spec["column"])
     pos = {c: i for i, c in enumerate(cutoffs)}
     training_cutoff = _training_cutoff(rows)
 
-    fig, ax = plt.subplots(figsize=(7.0, 4.9))
+    fig, ax = plt.subplots(figsize=(6.4, 4.4))
     models_seen: set[str] = set()
     for model, _key, values in sorted(pairs, key=lambda p: (p[0], str(p[1]))):
         models_seen.add(model)
@@ -237,23 +238,29 @@ def plot_slope(rows: list[dict], out_dir: Path, metric: str) -> None:
         )
 
     ax.set_xticks(range(len(cutoffs)))
-    ax.set_xticklabels([
-        f"$D = {c}$" + ("\n(training cutoff)" if c == training_cutoff else "")
-        for c in cutoffs
-    ])
+    ax.set_xticklabels([f"$D = {c}$" for c in cutoffs])
     ax.set_xlim(-0.3, len(cutoffs) - 0.7)
     ax.set_xlabel("Fock cutoff dimension")
     ax.set_ylabel(spec["ylabel"])
     if spec["log"]:
         ax.set_yscale("log")
 
-    titles(fig, ax, spec["title"], _subtitle(pairs, training_cutoff))
     style_axes(ax)
-    # The span between the two tick positions is empty by construction — the
-    # only place a legend does not sit on data.
-    variant_legend(ax, sorted(models_seen), loc="center")
-    _annotate_deltas(ax, pairs, cutoffs, spec["delta_fmt"], ratio=spec["log"])
-    save(fig, out_dir, spec["stem"], rect=(0, 0.015, 1, 0.945))
+    # Outside the axes: a slope chart's segments span the full width, so every
+    # in-axes position sits on data.
+    variant_legend(ax, sorted(models_seen), loc="center left",
+                   bbox_to_anchor=(1.02, 0.5))
+    save(fig, out_dir, spec["stem"])
+    book.add(
+        stem=spec["stem"],
+        short=spec["short"],
+        body=(
+            f"Each line segment is one configuration, drawn between the two "
+            f"evaluated Fock cutoffs and coloured by model variant. "
+            f"{_change_sentence(pairs, cutoffs, spec['delta_fmt'], spec['log'])}"
+        ),
+        facts=_facts(pairs, cutoffs, training_cutoff),
+    )
     print(f"    {len(pairs)} run(s) at cutoffs {cutoffs}")
 
 
@@ -263,48 +270,42 @@ def _training_cutoff(rows: list[dict]) -> int | None:
     return values.pop() if len(values) == 1 else None
 
 
-def _subtitle(pairs: list, training_cutoff: int | None) -> str:
-    trained = (f" trained at $D = {training_cutoff}$"
-               if training_cutoff is not None else "")
-    return (f"FashionMNIST · {len(pairs)} configurations · "
-            f"same checkpoints{trained}, re-evaluated · single seed")
+def _facts(pairs: list, cutoffs: list[int],
+           training_cutoff: int | None) -> dict[str, str]:
+    trained = (f", trained at $D = {training_cutoff}$ and re-evaluated without "
+               "further training" if training_cutoff is not None else "")
+    return {
+        "Data": f"FashionMNIST test set, {len(pairs)} configurations{trained}",
+        "Cutoffs": ", ".join(f"$D = {c}$" for c in cutoffs),
+        "Caveat": SINGLE_SEED,
+    }
 
 
-def _annotate_deltas(ax, pairs: list, cutoffs: list[int], fmt: str,
-                     ratio: bool = False) -> None:
-    """Compact note giving the change from the first cutoff to the last.
+def _change_sentence(pairs: list, cutoffs: list[int], fmt: str,
+                     ratio: bool) -> str:
+    """Summary of the change across the cutoffs, for the caption.
 
-    A slope chart shows direction well but not magnitude; with 16 near-parallel
-    segments the reader cannot recover the numbers, so state the range.
-
-    ``ratio`` states the change as a multiplicative factor instead of a
-    difference — the honest summary for a log-scaled axis, where the slope a
-    reader sees *is* the ratio and an absolute delta would describe something
-    the figure does not show.
+    On a log axis the slope a reader sees is a *ratio*, so the summary is stated
+    multiplicatively there; quoting an absolute difference would describe
+    something the figure does not show.
     """
     lo, hi = cutoffs[0], cutoffs[-1]
     both = [v for _m, _k, v in pairs if lo in v and hi in v]
     if not both:
-        return
+        return ""
     if ratio:
         factors = [v[lo] / v[hi] for v in both if v[hi] > 0]
         if not factors:
-            return
-        note = (f"Falls by {min(factors):.1f}× to {max(factors):.1f}× "
-                f"from $D={lo}$ to $D={hi}$  ·  all {len(factors)} decrease")
-        ax.annotate(note, xy=(0.5, -0.26), xycoords="axes fraction",
-                    ha="center", fontsize=8, color="#555555")
-        return
+            return ""
+        return (f"Every configuration decreases, by a factor of "
+                f"${min(factors):.1f}$ to ${max(factors):.1f}$.")
     deltas = [v[hi] - v[lo] for v in both]
-    worsened = sum(1 for d in deltas if d < 0)
-    direction = (f"{worsened} of {len(deltas)} decrease"
-                 if worsened else f"all {len(deltas)} increase")
-    note = (f"Change from $D={lo}$ to $D={hi}$: "
-            f"{fmt.format(min(deltas))} to {fmt.format(max(deltas))}  ·  {direction}")
-    # Below the x-axis label, which sits low here because the tick labels carry
-    # a second line marking the training cutoff.
-    ax.annotate(note, xy=(0.5, -0.26), xycoords="axes fraction",
-                ha="center", fontsize=8, color="#555555")
+    down = sum(1 for d in deltas if d < 0)
+    direction = (f"{down} of {len(deltas)} decrease" if 0 < down < len(deltas)
+                 else ("every configuration decreases" if down
+                       else "every configuration increases"))
+    return (f"From $D = {lo}$ to $D = {hi}$, {direction}, by "
+            f"${fmt.format(min(deltas))}$ to ${fmt.format(max(deltas))}$.")
 
 
 # ---------------------------------------------------------------------------
@@ -340,14 +341,16 @@ def main() -> None:
         raise SystemExit(f"error: {exc}") from exc
 
     print(f"Cutoff figures -> {show_path(out_dir)}\n")
+    book = CaptionBook(out_dir, filename="captions_cutoff.tex")
     failures = []
     for metric in metrics:
         print(f"[{metric}]")
         try:
-            plot_slope(rows, out_dir, metric)
+            plot_slope(rows, out_dir, metric, book)
         except MissingCutoffData as exc:
             print(f"  ✗ {exc}")
             failures.append(metric)
+    book.write()
     if failures:
         print(f"\n{len(failures)} figure(s) not rendered.")
         sys.exit(1)
