@@ -117,6 +117,21 @@ def variant_legend(ax, models: list[str], **kw) -> None:
               fontsize=9, title_fontsize=9, **kw)
 
 
+def top_variant_legend(ax, models: list[str]) -> None:
+    """Variant legend as one flat row above the axes.
+
+    The default placement for every cross-run figure. Three entries in a side
+    column would spend ~25% of the canvas width and leave most of that column
+    empty; in-axes placement crowds the data on these dense figures. A single
+    row across the top costs a thin strip that is fully used, and keeps the
+    legend in the same place throughout the chapter.
+    """
+    variant_legend(
+        ax, models, loc="lower center", bbox_to_anchor=(0.5, 1.0),
+        ncol=max(len(models), 1), borderaxespad=0.0,
+    )
+
+
 def outside_legend(ax, title: str | None = None, **kw):
     """Legend parked to the right of the axes.
 

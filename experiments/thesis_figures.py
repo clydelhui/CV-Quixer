@@ -66,7 +66,7 @@ from _thesis_style import CaptionBook, SINGLE_SEED
 from _thesis_style import save as _save
 from _thesis_style import show_path as _show
 from _thesis_style import style_axes as _style_axes
-from _thesis_style import variant_legend as _variant_legend
+from _thesis_style import top_variant_legend as _variant_legend
 
 # Reuse the single-sweep loader + configuration-identity grouping (JSON only).
 # NB: read from the run dirs, never from summary.csv — those go stale whenever a
@@ -276,7 +276,9 @@ def figure_ablation(
 
     ax.set_xticks(range(len(order)))
     ax.set_xticklabels([labels[v] for v in order])
-    ax.set_xlim(-0.35, len(order) - 0.65)
+    # Enough margin to clear the markers and no more: the categorical
+    # positions carry the comparison, so wide gutters only shrink the plot.
+    ax.set_xlim(-0.18, len(order) - 1 + 0.18)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(f"Best test accuracy ({required_epochs} epochs)")
     _style_axes(ax)

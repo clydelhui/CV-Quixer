@@ -55,7 +55,7 @@ from _thesis_style import (
     save,
     show_path,
     style_axes,
-    variant_legend,
+    top_variant_legend,
 )
 
 SWEEPS = REPO_ROOT / "results" / "sweeps"
@@ -249,14 +249,7 @@ def plot_slope(rows: list[dict], out_dir: Path, metric: str,
         ax.set_yscale("log")
 
     style_axes(ax)
-    # Above the axes, laid out horizontally. A slope chart's segments span the
-    # full width, so no in-axes position is free; but parking the legend in a
-    # side column costs ~25% of the width to display three entries, most of that
-    # column empty. One flat row across the top costs a thin strip instead, and
-    # the plot keeps the whole canvas width.
-    variant_legend(ax, sorted(models_seen), loc="lower center",
-                   bbox_to_anchor=(0.5, 1.0), ncol=len(models_seen),
-                   borderaxespad=0.0)
+    top_variant_legend(ax, sorted(models_seen))
     save(fig, out_dir, spec["stem"])
     book.add(
         stem=spec["stem"],
