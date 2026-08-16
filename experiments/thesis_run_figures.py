@@ -336,20 +336,20 @@ def fig_accuracy_curve(run: dict, book: CaptionBook) -> None:
 # stage, so they belong in one figure rather than three near-identical ones.
 _TRUNC_STREAMS = [
     ("trunc_loss", "test_trunc_loss",
-     "Per-patch unitaries $U_i$"),
+     "Token unitaries $U_j$"),
     ("cvqnn_trunc_loss", "test_cvqnn_trunc_loss",
-     "Fixed CV quantum circuit $W$"),
+     "Feed-forward unitary $U_{FF}$"),
     ("query_trunc_loss", "test_query_trunc_loss",
-     "Query unitaries $U_{q,i}$"),
+     "Query unitaries $U_{q,j}$"),
 ]
 
 
 def fig_truncation_losses(run: dict, book: CaptionBook) -> None:
     """All truncation-leakage streams that this run actually exercises.
 
-    A stream that is identically zero means the stage is absent (no CVQNN block
-    when `cvqnn_num_layers=0`; no query unitaries outside the stacked model), so
-    it is dropped rather than drawn as a flat zero line.
+    A stream that is identically zero means the stage is absent (no
+    feed-forward unitary when `cvqnn_num_layers=0`; no query unitaries outside
+    the stacked model), so it is dropped rather than drawn as a flat zero line.
     """
     eh = run["history"]["epoch"]
     active = []
