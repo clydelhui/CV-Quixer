@@ -71,7 +71,6 @@ from _thesis_style import (
 # Reuse the run loader, the per-epoch artefact readers, the stage detection and
 # every metric derivation. This script adds no data handling of its own.
 from report_diagnostics import (
-    _SUCCESS_PROB_FLOOR,
     MissingArtefactError,
     _accuracy_from,
     _cross_entropy_from,
@@ -539,13 +538,14 @@ def fig_success_prob_histogram(run: dict) -> None:
         )
     diag = _require_diagnostics(run)
     if schema.LCU_COEFFS not in diag or schema.POLY_COEFFS not in diag:
-        raise SkipFigure("diagnostics npz lacks lcu/poly coeffs (needed for λ)")
+        raise SkipFigure("diagnostics npz lacks lcu/poly coeffs (needed for β)")
 
     raw = np.asarray(preds[schema.SUCCESS_PROBS], dtype=np.float64)   # (N, H)
-    lam = _derive_lcu_lambda(diag[schema.LCU_COEFFS],
-                             diag[schema.POLY_COEFFS])                # (H,)
-    ratio = raw / lam[None, :] ** 2
-    fail = (raw < _SUCCESS_PROB_FLOOR).mean(axis=0)
+    # The block-encoding scale, written β in the thesis. The upstream helper is
+    # named for λ (report_diagnostics / ADR-0002 notation) — same quantity.
+    beta = _derive_lcu_lambda(diag[schema.LCU_COEFFS],
+                              diag[schema.POLY_COEFFS])               # (H,)
+    ratio = raw / beta[None, :] ** 2
     pos = ratio[ratio > 0]
     log_x = pos.size > 0 and float(pos.max()) / float(pos.min()) > 100.0
     colors = head_colors(ratio.shape[1])
@@ -564,16 +564,15 @@ def fig_success_prob_histogram(run: dict) -> None:
                 color=colors[h], label=f"Head {h}")
     ax.set_xlabel(
         r"Post-selection success probability "
-        r"$\|P(M)|\psi\rangle\|^2 / \lambda^2$"
+        r"$\|P(M)|\psi\rangle\|^2 / \beta^2$"
     )
     ax.set_ylabel("Count")
-    # The per-head λ and failure rate would make a ten-entry legend unreadable;
-    # they belong in a compact note instead.
-    note = (f"Subnormalisation λ: {lam.min():.3g}–{lam.max():.3g}   ·   "
-            f"post-selection failures: {fail.min():.2%}–{fail.max():.2%}")
-    titles(fig, ax, "LCU/QSVT post-selection success probability",
+    # Per-head β would make a ten-entry legend unreadable; its range goes in a
+    # compact note instead.
+    note = f"Block-encoding scale β: {beta.min():.3g}–{beta.max():.3g}"
+    titles(fig, ax, "Post-selection success probability",
            _run_subtitle(run) + " · test set")
-    ax.annotate(note, xy=(0.5, -0.22), xycoords="axes fraction",
+    ax.annotate(note, xy=(0.5, -0.27), xycoords="axes fraction",
                 ha="center", fontsize=8, color="#555555")
     style_axes(ax)
     outside_legend(ax)
@@ -583,22 +582,22 @@ def fig_success_prob_histogram(run: dict) -> None:
 
 def fig_success_prob_trajectory(run: dict) -> None:
     # Diagnostics first: they are small (written over the diagnostic subset),
-    # and without per-epoch λ there is nothing to plot — no point streaming the
-    # much larger predictions files to find that out.
+    # and without a per-epoch β there is nothing to plot — no point streaming
+    # the much larger predictions files to find that out.
     diag_all = _load_all_diagnostics(run["run_dir"])
     n_epochs = len(run["history"]["epoch"].get("test_acc") or [])
-    have_lambda = [
+    have_beta = [
         e for e in range(1, n_epochs + 1)
         if diag_all.get(e) is not None
         and schema.LCU_COEFFS in diag_all[e]
         and schema.POLY_COEFFS in diag_all[e]
     ]
-    if len(have_lambda) < 2:
-        raise SkipFigure("fewer than 2 epochs have coeffs to derive λ")
+    if len(have_beta) < 2:
+        raise SkipFigure("fewer than 2 epochs have coeffs to derive β")
 
     # One predictions file live at a time (see _stream_epochs).
     usable, stats = [], []
-    for e in have_lambda:
+    for e in have_beta:
         path = (run["run_dir"] / "predictions"
                 / schema.prediction_filename(e, train=False))
         if not path.is_file():
@@ -607,9 +606,9 @@ def fig_success_prob_trajectory(run: dict) -> None:
             if schema.SUCCESS_PROBS not in npz:
                 continue
             raw = np.asarray(npz[schema.SUCCESS_PROBS], dtype=np.float64)
-        lam = _derive_lcu_lambda(diag_all[e][schema.LCU_COEFFS],
-                                 diag_all[e][schema.POLY_COEFFS])
-        ratio = raw / lam[None, :] ** 2
+        beta = _derive_lcu_lambda(diag_all[e][schema.LCU_COEFFS],
+                                  diag_all[e][schema.POLY_COEFFS])
+        ratio = raw / beta[None, :] ** 2
         stats.append((ratio.mean(axis=0),
                       np.percentile(ratio, 10, axis=0),
                       np.percentile(ratio, 90, axis=0)))
@@ -632,7 +631,7 @@ def fig_success_prob_trajectory(run: dict) -> None:
         ax.fill_between(usable, p10[:, h], p90[:, h],
                         color=colors[h], alpha=0.15, linewidth=0)
     ax.set_xlabel("Epoch")
-    ax.set_ylabel(r"$\|P(M)|\psi\rangle\|^2 / \lambda^2$")
+    ax.set_ylabel(r"$\|P(M)|\psi\rangle\|^2 / \beta^2$")
     titles(fig, ax, "Post-selection success probability across training",
            _run_subtitle(run) + " · mean with 10th–90th percentile band")
     style_axes(ax)
