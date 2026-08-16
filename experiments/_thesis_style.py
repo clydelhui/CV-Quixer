@@ -102,15 +102,22 @@ def titles(fig, ax, title: str, subtitle: str) -> None:
         ax.set_title(wrapped, fontsize=9, color="#555555", pad=6)
 
 
-def variant_legend(ax, models: list[str]) -> None:
-    """Three-entry legend keyed by model variant, in MODEL_ORDER."""
+def variant_legend(ax, models: list[str], loc: str | None = None) -> None:
+    """Three-entry legend keyed by model variant, in MODEL_ORDER.
+
+    `loc` overrides matplotlib's "best" placement, which has no notion of which
+    empty region is *meaningfully* empty — on a slope chart the gap between the
+    two tick positions is the obvious home, but "best" picks a corner and lands
+    on the data.
+    """
     handles = [
         Line2D([], [], color=MODEL_COLORS[m], marker=MODEL_MARKERS[m],
                markersize=5, linewidth=1.6, label=m)
         for m in MODEL_ORDER if m in models
     ]
     ax.legend(handles=handles, title="Model variant", frameon=True,
-              framealpha=0.9, fontsize=9, title_fontsize=9)
+              framealpha=0.9, fontsize=9, title_fontsize=9,
+              **({"loc": loc} if loc else {}))
 
 
 def outside_legend(ax, title: str | None = None, **kw):
