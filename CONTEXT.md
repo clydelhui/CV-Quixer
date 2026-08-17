@@ -66,7 +66,9 @@ The probability that the heralded LCU/QSVT implementation of `P(M)` post-selects
 successfully: `‖P(M)|ψ⟩‖² / λ²`, measured in the truncated simulation (so a small part
 of the norm deficit is Fock truncation, not heralding failure). Applies only to the
 Polynomial step — the CVQNN block `W` is unitary and has no success probability; its
-norm deficit is truncation leakage.
+norm deficit is truncation leakage. A model of [[seq-to-seq block]]s post-selects once per stage
+but records only the decoder-input stage, so its figures are an *upper bound* on the
+end-to-end value, never an estimate of it (ADR-0002).
 _Avoid_: state norm (that is the unnormalised numerator), post-selection rate.
 
 **Subnormalisation** (`λ`):

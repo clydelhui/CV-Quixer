@@ -73,10 +73,12 @@ from report_diagnostics import (
     MissingArtefactError,
     _accuracy_from,
     _cross_entropy_from,
+    _decoder_input_stage,
     _derive_lcu_lambda,
     _diag_stages,
     _load_all_diagnostics,
     _per_class_acc_from,
+    _success_prob_matrix,
     load_run,
 )
 
@@ -177,6 +179,45 @@ def _head_label(key: str) -> str:
 
 def _n_blocks(run: dict) -> int:
     return int(getattr(run["config"].quantum, "num_seq2seq_blocks", 1) or 1)
+
+
+def _n_heralded_stages(run: dict) -> int:
+    """How many post-selected stages one forward pass applies.
+
+    One per seq-to-seq block, plus the aggregator under pooling="quixer".
+    Canonical models have exactly one (the config defaults give 1 block and
+    mean pooling), so callers need no model-variant branch.
+    """
+    q = run["config"].quantum
+    agg = 1 if getattr(q, "pooling", "mean") == "quixer" else 0
+    return _n_blocks(run) + agg
+
+
+def _herald_bound_note(run: dict) -> str | None:
+    """Caption note for a run whose figure covers one of several heralded
+    stages: what is shown bounds, rather than measures, the end-to-end
+    post-selection probability.
+
+    Only the decoder-input stage's success probabilities reach the artefacts
+    (`StackedCVQuixer.forward` discards the earlier blocks'), and each omitted
+    stage contributes an independent factor in [0, 1] — `‖P(M)|ψ⟩‖ ≤ β` holds
+    for the unit-norm input every stage receives. Returns None when there is
+    only one stage and the figure is therefore exact.
+    """
+    stages = _n_heralded_stages(run)
+    if stages < 2:
+        return None
+    omitted = (
+        "the one omitted stage contributes a further factor"
+        if stages == 2 else
+        f"each of the {stages - 1} omitted stages contributes a further factor"
+    )
+    return (
+        f"the model applies {stages} heralded stages in sequence and the "
+        f"artefacts record only the decoder-input stage shown here, so "
+        f"{omitted} in " + r"$[0, 1]$ and this is an upper bound on the "
+        "end-to-end post-selection probability"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -584,14 +625,20 @@ def fig_success_prob_histogram(run: dict, book: CaptionBook) -> None:
             "(not recorded for this model variant)"
         )
     diag = _require_diagnostics(run)
-    if schema.LCU_COEFFS not in diag or schema.POLY_COEFFS not in diag:
-        raise SkipFigure("diagnostics npz lacks lcu/poly coeffs (needed for β)")
+    # Stacked runs record success probabilities for the decoder-input stage
+    # only, so β comes from that stage's coefficients (ADR-0003); for a
+    # canonical run the prefix is empty and these are the flat keys.
+    prefix, _suffix, _label = _decoder_input_stage(diag)
+    lcu_key, poly_key = f"{prefix}{schema.LCU_COEFFS}", f"{prefix}{schema.POLY_COEFFS}"
+    if lcu_key not in diag or poly_key not in diag:
+        raise SkipFigure(
+            f"diagnostics npz lacks {lcu_key}/{poly_key} (needed for β)"
+        )
 
-    raw = np.asarray(preds[schema.SUCCESS_PROBS], dtype=np.float64)   # (N, H)
+    raw = _success_prob_matrix(preds[schema.SUCCESS_PROBS])           # (S, H)
     # The block-encoding scale, written β in the thesis. The upstream helper is
     # named for λ (report_diagnostics / ADR-0002 notation) — same quantity.
-    beta = _derive_lcu_lambda(diag[schema.LCU_COEFFS],
-                              diag[schema.POLY_COEFFS])               # (H,)
+    beta = _derive_lcu_lambda(diag[lcu_key], diag[poly_key])          # (H,)
     ratio = raw / beta[None, :] ** 2
     pos = ratio[ratio > 0]
     log_x = pos.size > 0 and float(pos.max()) / float(pos.min()) > 100.0
@@ -618,11 +665,21 @@ def fig_success_prob_histogram(run: dict, book: CaptionBook) -> None:
     style_axes(ax)
     outside_legend(ax)
     save(fig, run["fig_dir"], "success_prob_histogram")
+    per_position = (
+        " Each sequence position contributes one count per head."
+        if np.asarray(preds[schema.SUCCESS_PROBS]).ndim == 3 else ""
+    )
+    notes = [f"block-encoding scale $\\beta$ ranges "
+             f"{beta.min():.3g} to {beta.max():.3g}"]
+    bound = _herald_bound_note(run)
+    if bound:
+        notes.append(bound)
     book.add("success_prob_histogram", "Post-selection success probability",
              "Distribution across the test set of the heralded post-selection "
-             "probability, one step histogram per attention head.",
-             _facts(run, extra=(f"block-encoding scale $\\beta$ ranges "
-                                f"{beta.min():.3g} to {beta.max():.3g}")))
+             "probability, one step histogram per attention head."
+             + per_position,
+             _facts(run, extra="; ".join(notes),
+                    stage=_stage_display(prefix, _n_blocks(run))))
 
 
 def fig_success_prob_trajectory(run: dict, book: CaptionBook) -> None:
@@ -630,12 +687,18 @@ def fig_success_prob_trajectory(run: dict, book: CaptionBook) -> None:
     # and without a per-epoch β there is nothing to plot — no point streaming
     # the much larger predictions files to find that out.
     diag_all = _load_all_diagnostics(run["run_dir"])
+    if not diag_all:
+        raise SkipFigure("no diagnostics npz found")
+    # Stacked runs record success probabilities for the decoder-input stage
+    # only (ADR-0003); an empty prefix recovers the canonical flat keys.
+    prefix, _suffix, _label = _decoder_input_stage(diag_all[min(diag_all)])
+    lcu_key, poly_key = f"{prefix}{schema.LCU_COEFFS}", f"{prefix}{schema.POLY_COEFFS}"
     n_epochs = len(run["history"]["epoch"].get("test_acc") or [])
     have_beta = [
         e for e in range(1, n_epochs + 1)
         if diag_all.get(e) is not None
-        and schema.LCU_COEFFS in diag_all[e]
-        and schema.POLY_COEFFS in diag_all[e]
+        and lcu_key in diag_all[e]
+        and poly_key in diag_all[e]
     ]
     if len(have_beta) < 2:
         raise SkipFigure("fewer than 2 epochs have coeffs to derive β")
@@ -650,9 +713,8 @@ def fig_success_prob_trajectory(run: dict, book: CaptionBook) -> None:
         with np.load(path) as npz:
             if schema.SUCCESS_PROBS not in npz:
                 continue
-            raw = np.asarray(npz[schema.SUCCESS_PROBS], dtype=np.float64)
-        beta = _derive_lcu_lambda(diag_all[e][schema.LCU_COEFFS],
-                                  diag_all[e][schema.POLY_COEFFS])
+            raw = _success_prob_matrix(npz[schema.SUCCESS_PROBS])
+        beta = _derive_lcu_lambda(diag_all[e][lcu_key], diag_all[e][poly_key])
         ratio = raw / beta[None, :] ** 2
         stats.append((ratio.mean(axis=0),
                       np.percentile(ratio, 10, axis=0),
@@ -684,7 +746,8 @@ def fig_success_prob_trajectory(run: dict, book: CaptionBook) -> None:
              "Post-selection success probability across training",
              "Mean heralded post-selection probability per head against epoch, "
              "with a shaded 10th-90th percentile band over the test set.",
-             _facts(run))
+             _facts(run, extra=_herald_bound_note(run),
+                    stage=_stage_display(prefix, _n_blocks(run))))
 
 
 def fig_lcu_coefficients_heatmap(run: dict, book: CaptionBook) -> None:

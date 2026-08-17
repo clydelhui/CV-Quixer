@@ -230,6 +230,54 @@ def _diag_stages(diag: dict) -> list[tuple[str, str, str]]:
     return stages
 
 
+def _decoder_input_stage(diag: dict) -> tuple[str, str, str]:
+    """The one `_diag_stages` entry that feeds the decoder.
+
+    ADR-0003 defines "the" diagnostic state of a stacked run as the
+    decoder-input stage — the aggregator under pooling="quixer", otherwise the
+    last seq-to-seq block. `_diag_stages` yields blocks in ascending order and
+    appends ``agg_`` last, so that stage is always its final entry. For a
+    canonical run the list is the single flat namespace, so this returns
+    ``("", "", "")`` and callers keep their historic behaviour unchanged.
+
+    Used by the success-probability figures, which — unlike the coefficient
+    figures — have data for one stage only: `StackedCVQuixer.forward` keeps the
+    success probabilities of the decoder-input stage and discards the earlier
+    blocks'.
+    """
+    return _diag_stages(diag)[-1]
+
+
+def _success_prob_matrix(raw: np.ndarray) -> np.ndarray:
+    """Per-sample success probabilities as a flat ``(S, num_heads)`` matrix.
+
+    Canonical models emit one value per sample per head, ``(N, H)``, which
+    passes through. The stacked model's seq-to-seq heads emit one value per
+    *position* as well (ADR-0003), giving ``(N, H, N_positions)``; those fold
+    into the sample population — the same treatment `_state_stats` in
+    `cv_quixer/evaluation/diagnostics.py` already gives the stacked model's
+    per-position states, and it keeps the per-position spread that averaging
+    over positions would hide.
+
+    Args:
+        raw: ``(N, H)`` or ``(N, H, N_positions)`` array of raw norms.
+
+    Returns:
+        ``(S, H)`` float64 — S = N, or N × N_positions when folded.
+    """
+    arr = np.asarray(raw, dtype=np.float64)
+    if arr.ndim == 2:
+        return arr
+    if arr.ndim == 3:
+        # (N, H, P) → (N, P, H) → (N*P, H): head stays the last axis, so column
+        # h remains head h and every (sample, position) pair becomes one row.
+        return np.moveaxis(arr, 1, -1).reshape(-1, arr.shape[1])
+    raise MissingArtefactError(
+        f"`success_probs` has shape {arr.shape}; expected (N, num_heads) or "
+        "(N, num_heads, num_positions)."
+    )
+
+
 def _accuracy_from(preds: dict) -> float:
     return float((preds["y_pred"] == preds["y_true"]).mean())
 
@@ -1267,26 +1315,34 @@ def plot_polynomial_coefficient_trajectory(run: dict) -> None:
 def plot_success_prob_histogram(run: dict) -> None:
     """Distribution of the LCU/QSVT post-selection success probability
     ‖P(M)|ψ⟩‖²/λ² across the test set at the selected epoch, per head.
-    λ is derived from the saved lcu/poly coefficients (ADR-0002)."""
+    λ is derived from the saved lcu/poly coefficients (ADR-0002).
+
+    Stacked runs (ADR-0003) carry this for the decoder-input stage only, and
+    fold their per-position values into the sample population.
+    """
     preds = run["predictions"]
     if preds is None or schema.SUCCESS_PROBS not in preds:
         raise MissingArtefactError(
             f"predictions/epoch_{run['epoch']:04d}.npz missing or has no "
-            f"`success_probs` key — run `uv run python "
-            f"experiments/backfill_artefacts.py --run-dir {run['run_dir']}` "
-            "to produce it."
+            f"`success_probs` key — only models with LCU post-selection write "
+            f"it. For an old run predating the key, run `uv run python "
+            f"experiments/backfill_artefacts.py --run-dir {run['run_dir']}`."
         )
     diag = run["diagnostics"]
-    if diag is None or schema.LCU_COEFFS not in diag or schema.POLY_COEFFS not in diag:
+    prefix, _suffix, stage_label = (
+        _decoder_input_stage(diag) if diag is not None else ("", "", "")
+    )
+    lcu_key, poly_key = f"{prefix}{schema.LCU_COEFFS}", f"{prefix}{schema.POLY_COEFFS}"
+    if diag is None or lcu_key not in diag or poly_key not in diag:
         raise MissingArtefactError(
             f"diagnostics/epoch_{run['epoch']:04d}.npz missing or lacks "
-            f"`lcu_coeffs`/`poly_coeffs` (needed to derive λ) — run "
-            f"`uv run python experiments/backfill_artefacts.py "
-            f"--run-dir {run['run_dir']}` to produce it."
+            f"`{lcu_key}`/`{poly_key}` (needed to derive λ). For an old run "
+            f"predating those keys, run `uv run python "
+            f"experiments/backfill_artefacts.py --run-dir {run['run_dir']}`."
         )
-    raw = np.asarray(preds["success_probs"], dtype=np.float64)         # (N, H)
-    lam = _derive_lcu_lambda(diag["lcu_coeffs"], diag["poly_coeffs"])  # (H,)
-    ratio = raw / lam[None, :] ** 2                                    # (N, H)
+    raw = _success_prob_matrix(preds["success_probs"])                 # (S, H)
+    lam = _derive_lcu_lambda(diag[lcu_key], diag[poly_key])            # (H,)
+    ratio = raw / lam[None, :] ** 2                                    # (S, H)
     # Failure threshold applies to the RAW norm, mirroring the clamp
     # semantics in cv_attention (elements below it are forced to zero state).
     fail_frac = (raw < _SUCCESS_PROB_FLOOR).mean(axis=0)               # (H,)
@@ -1311,7 +1367,7 @@ def plot_success_prob_histogram(run: dict) -> None:
     )
     ax.set_ylabel("Count")
     ax.set_title(f"LCU/QSVT post-selection success probability "
-                 f"(epoch {run['epoch']}, test set)")
+                 f"(epoch {run['epoch']}, test set){stage_label}")
     ax.legend(fontsize=8)
     ax.grid(alpha=0.3)
     fig.tight_layout()
@@ -1322,7 +1378,11 @@ def plot_success_prob_histogram(run: dict) -> None:
 
 def plot_success_prob_trajectory(run: dict) -> None:
     """Mean + 10–90th percentile band of the normalised post-selection
-    success probability vs epoch, per head (test side)."""
+    success probability vs epoch, per head (test side).
+
+    Stacked runs (ADR-0003) carry this for the decoder-input stage only, and
+    fold their per-position values into the sample population.
+    """
     preds_per_epoch = _load_all_per_epoch_predictions(run["run_dir"],
                                                       side="test")
     epochs = sorted(e for e, d in preds_per_epoch.items()
@@ -1330,32 +1390,40 @@ def plot_success_prob_trajectory(run: dict) -> None:
     if preds_per_epoch and not epochs:
         raise MissingArtefactError(
             f"no predictions/epoch_NNNN.npz under {run['run_dir']} carries a "
-            f"`success_probs` key — run `uv run python "
-            f"experiments/backfill_artefacts.py --run-dir {run['run_dir']}` "
-            "to produce it."
+            f"`success_probs` key — only models with LCU post-selection write "
+            f"it. For an old run predating the key, run `uv run python "
+            f"experiments/backfill_artefacts.py --run-dir {run['run_dir']}`."
         )
     if len(epochs) < 2:
         print("  - fewer than 2 epochs with success_probs → "
               "skipping success_prob_trajectory")
         return
     diag_per_epoch = _load_all_diagnostics(run["run_dir"])
+    first_diag = diag_per_epoch.get(epochs[0])
+    prefix, _suffix, stage_label = (
+        _decoder_input_stage(first_diag) if first_diag is not None
+        else ("", "", "")
+    )
+    lcu_key, poly_key = f"{prefix}{schema.LCU_COEFFS}", f"{prefix}{schema.POLY_COEFFS}"
     for e in epochs:
         d = diag_per_epoch.get(e)
-        if d is None or "lcu_coeffs" not in d or "poly_coeffs" not in d:
+        if d is None or lcu_key not in d or poly_key not in d:
             raise MissingArtefactError(
                 f"diagnostics/epoch_{e:04d}.npz missing or lacks "
-                f"`lcu_coeffs`/`poly_coeffs` (needed for per-epoch λ) — run "
-                f"`uv run python experiments/backfill_artefacts.py "
-                f"--run-dir {run['run_dir']}` to produce it."
+                f"`{lcu_key}`/`{poly_key}` (needed for per-epoch λ). For an "
+                f"old run predating those keys, run `uv run python "
+                f"experiments/backfill_artefacts.py --run-dir {run['run_dir']}`."
             )
-    num_heads = np.asarray(preds_per_epoch[epochs[0]]["success_probs"]).shape[1]
+    num_heads = _success_prob_matrix(
+        preds_per_epoch[epochs[0]]["success_probs"]
+    ).shape[1]
     mean = np.zeros((len(epochs), num_heads))
     p10 = np.zeros_like(mean)
     p90 = np.zeros_like(mean)
     for i, e in enumerate(epochs):
-        raw = np.asarray(preds_per_epoch[e]["success_probs"], dtype=np.float64)
-        lam = _derive_lcu_lambda(diag_per_epoch[e]["lcu_coeffs"],
-                                 diag_per_epoch[e]["poly_coeffs"])
+        raw = _success_prob_matrix(preds_per_epoch[e]["success_probs"])
+        lam = _derive_lcu_lambda(diag_per_epoch[e][lcu_key],
+                                 diag_per_epoch[e][poly_key])
         ratio = raw / lam[None, :] ** 2
         mean[i] = ratio.mean(axis=0)
         p10[i] = np.percentile(ratio, 10, axis=0)
@@ -1368,7 +1436,7 @@ def plot_success_prob_trajectory(run: dict) -> None:
     ax.set_xlabel("Epoch")
     ax.set_ylabel(r"$\|P(M)|\psi\rangle\|^2 / \lambda^2$")
     ax.set_title("Post-selection success probability vs epoch "
-                 "(mean, 10–90th pct band, test set)")
+                 f"(mean, 10–90th pct band, test set){stage_label}")
     ax.legend(fontsize=8)
     ax.grid(alpha=0.3)
     fig.tight_layout()
