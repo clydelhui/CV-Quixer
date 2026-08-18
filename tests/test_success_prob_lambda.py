@@ -147,6 +147,28 @@ def _write_stacked_run(root, *, n_blocks=2):
     return root
 
 
+def _write_stage_sidecars(root, *, n_blocks=2, trunc=(0.4, 0.2, 0.01)):
+    """Per-stage sidecars as `eval_block_stages.py` writes them."""
+    from cv_quixer.evaluation import artefact_schema as schema
+
+    rng = np.random.default_rng(7)
+    for epoch in range(1, N_EPOCHS + 1):
+        for b in range(n_blocks):
+            # Block b's streams differ so the per-block figure has something to
+            # separate; their mean is what the model would have recorded.
+            scale = 1.0 + b
+            np.savez_compressed(
+                root / "predictions"
+                / schema.stage_prediction_filename(epoch, f"block{b}"),
+                **{schema.SUCCESS_PROBS: rng.uniform(
+                    0.05, 1.0, (N_SAMPLES, N_HEADS, N_POSITIONS)
+                ).astype(np.float32)},
+                **{k: np.float32(v * scale)
+                   for k, v in zip(schema.STAGE_TRUNC_KEYS, trunc)},
+            )
+    return root
+
+
 def _load_npz(path):
     with np.load(path) as npz:
         return dict(npz)
@@ -165,28 +187,173 @@ def _fake_run(root, epoch, fig_dir):
         "diagnostics": _load_npz(
             root / "diagnostics" / schema.diagnostics_filename(epoch)
         ),
-        "history": {"epoch": {"test_acc": [0.1] * N_EPOCHS}},
+        "history": {"epoch": {
+            "test_acc": [0.1] * N_EPOCHS,
+            "test_loss": [2.3] * N_EPOCHS,
+            # Mean over blocks of the sidecar values _write_stage_sidecars
+            # writes (scale 1 and 2), i.e. what the model would have recorded.
+            "test_trunc_loss": [0.4 * 1.5] * N_EPOCHS,
+            "test_query_trunc_loss": [0.2 * 1.5] * N_EPOCHS,
+            "test_cvqnn_trunc_loss": [0.01 * 1.5] * N_EPOCHS,
+        }},
     }
 
 
-def test_stacked_histogram_renders_from_last_block(tmp_path):
+def test_stacked_histogram_renders_the_decoder_input_stage(tmp_path):
+    """Without sidecars only the decoder-input stage has success probs, so a
+    2-block run yields exactly one file — suffixed for its stage."""
     from experiments.report_diagnostics import plot_success_prob_histogram
 
     root = _write_stacked_run(tmp_path / "run")
     fig_dir = tmp_path / "figures"
     fig_dir.mkdir()
     plot_success_prob_histogram(_fake_run(root, N_EPOCHS, fig_dir))
-    assert (fig_dir / "success_prob_histogram.png").is_file()
+    assert (fig_dir / "success_prob_histogram_block1.png").is_file()
+    assert not (fig_dir / "success_prob_histogram_block0.png").exists()
 
 
-def test_stacked_trajectory_renders_from_last_block(tmp_path):
+def test_stacked_trajectory_renders_the_decoder_input_stage(tmp_path):
     from experiments.report_diagnostics import plot_success_prob_trajectory
 
     root = _write_stacked_run(tmp_path / "run")
     fig_dir = tmp_path / "figures"
     fig_dir.mkdir()
     plot_success_prob_trajectory(_fake_run(root, N_EPOCHS, fig_dir))
-    assert (fig_dir / "success_prob_trajectory.png").is_file()
+    assert (fig_dir / "success_prob_trajectory_block1.png").is_file()
+    assert not (fig_dir / "success_prob_trajectory_block0.png").exists()
+
+
+def test_sidecars_add_the_earlier_stage(tmp_path):
+    """With sidecars present every stage renders, one file each."""
+    from experiments.report_diagnostics import (
+        plot_success_prob_histogram,
+        plot_success_prob_trajectory,
+    )
+
+    root = _write_stage_sidecars(_write_stacked_run(tmp_path / "run"))
+    fig_dir = tmp_path / "figures"
+    fig_dir.mkdir()
+    run = _fake_run(root, N_EPOCHS, fig_dir)
+    plot_success_prob_histogram(run)
+    plot_success_prob_trajectory(run)
+    for b in (0, 1):
+        assert (fig_dir / f"success_prob_histogram_block{b}.png").is_file()
+        assert (fig_dir / f"success_prob_trajectory_block{b}.png").is_file()
+
+
+def test_stage_prediction_filename_round_trip():
+    from cv_quixer.evaluation import artefact_schema as schema
+
+    assert schema.stage_prediction_filename(7, "block0_") == "epoch_0007_block0.npz"
+    assert schema.stage_prediction_filename(7, "block0") == "epoch_0007_block0.npz"
+    assert schema.stage_prediction_filename(12, "agg_") == "epoch_0012_agg.npz"
+    with pytest.raises(ValueError, match="stage prefix"):
+        schema.stage_prediction_filename(1, "")
+
+
+# ---------------------------------------------------------------------------
+# beta_trajectory — coefficients only, no predictions needed
+# ---------------------------------------------------------------------------
+
+
+def test_beta_trajectory_renders_one_file_per_stage(tmp_path):
+    from experiments.report_diagnostics import plot_beta_trajectory
+
+    root = _write_stacked_run(tmp_path / "run")
+    fig_dir = tmp_path / "figures"
+    fig_dir.mkdir()
+    plot_beta_trajectory(_fake_run(root, N_EPOCHS, fig_dir))
+    for b in (0, 1):
+        assert (fig_dir / f"beta_trajectory_block{b}.png").is_file()
+
+
+def test_beta_trajectory_keeps_canonical_filename(tmp_path):
+    """A flat-key (canonical) run keeps the historic unsuffixed name."""
+    from cv_quixer.evaluation import artefact_schema as schema
+    from experiments.report_diagnostics import plot_beta_trajectory
+
+    root = tmp_path / "run"
+    (root / "diagnostics").mkdir(parents=True)
+    rng = np.random.default_rng(3)
+    for epoch in range(1, N_EPOCHS + 1):
+        np.savez_compressed(
+            root / "diagnostics" / schema.diagnostics_filename(epoch),
+            **{schema.LCU_COEFFS: rng.normal(
+                size=(N_HEADS, N_POSITIONS, 2)).astype(np.float32),
+               schema.POLY_COEFFS: rng.normal(
+                size=(N_HEADS, 3)).astype(np.float32)},
+        )
+    fig_dir = tmp_path / "figures"
+    fig_dir.mkdir()
+    run = {"run_dir": root, "epoch": N_EPOCHS, "fig_dir": fig_dir,
+           "predictions": None,
+           "diagnostics": _load_npz(
+               root / "diagnostics" / schema.diagnostics_filename(N_EPOCHS)),
+           "history": {"epoch": {"test_loss": [2.3] * N_EPOCHS}}}
+    plot_beta_trajectory(run)
+    assert (fig_dir / "beta_trajectory.png").is_file()
+
+
+# ---------------------------------------------------------------------------
+# Per-block truncation curves
+# ---------------------------------------------------------------------------
+
+
+def test_trunc_streams_per_block_renders_one_file_per_stream(tmp_path):
+    from experiments.report_diagnostics import plot_trunc_streams_per_block
+
+    root = _write_stage_sidecars(_write_stacked_run(tmp_path / "run"))
+    fig_dir = tmp_path / "figures"
+    fig_dir.mkdir()
+    plot_trunc_streams_per_block(_fake_run(root, N_EPOCHS, fig_dir))
+    for name in ("trunc_loss_curve_per_block",
+                 "query_trunc_loss_curve_per_block",
+                 "cvqnn_trunc_loss_curve_per_block"):
+        assert (fig_dir / f"{name}.png").is_file()
+
+
+def test_trunc_streams_per_block_skips_without_sidecars(tmp_path):
+    from experiments.report_diagnostics import plot_trunc_streams_per_block
+
+    root = _write_stacked_run(tmp_path / "run")
+    fig_dir = tmp_path / "figures"
+    fig_dir.mkdir()
+    plot_trunc_streams_per_block(_fake_run(root, N_EPOCHS, fig_dir))
+    assert not list(fig_dir.glob("*_per_block.png"))
+
+
+def test_trunc_streams_per_block_skips_an_all_zero_stream(tmp_path):
+    """The convention the query / W trunc curves already use for L_W = 0."""
+    from experiments.report_diagnostics import plot_trunc_streams_per_block
+
+    root = _write_stage_sidecars(_write_stacked_run(tmp_path / "run"),
+                                 trunc=(0.4, 0.0, 0.01))
+    fig_dir = tmp_path / "figures"
+    fig_dir.mkdir()
+    plot_trunc_streams_per_block(_fake_run(root, N_EPOCHS, fig_dir))
+    assert (fig_dir / "trunc_loss_curve_per_block.png").is_file()
+    assert not (fig_dir / "query_trunc_loss_curve_per_block.png").exists()
+
+
+def test_per_block_trunc_mean_reproduces_the_recorded_aggregate(tmp_path):
+    """`StackedCVQuixer.forward` reduces each stream to a flat mean over
+    blocks, so the sidecars must average back to the recorded value. Pins the
+    invariant the eval script's self-check relies on."""
+    from cv_quixer.evaluation import artefact_schema as schema
+    from experiments.report_diagnostics import _diag_stages, _load_stage_trunc
+
+    root = _write_stage_sidecars(_write_stacked_run(tmp_path / "run"))
+    diag = _load_npz(root / "diagnostics" / schema.diagnostics_filename(1))
+    per_stream = _load_stage_trunc(root, _diag_stages(diag))
+    recorded = _fake_run(root, 1, tmp_path)["history"]["epoch"]
+    for key, field in (
+        (schema.PATCH_TRUNC, "test_trunc_loss"),
+        (schema.QUERY_TRUNC, "test_query_trunc_loss"),
+        (schema.W_TRUNC, "test_cvqnn_trunc_loss"),
+    ):
+        by_stage = per_stream[key]
+        derived = np.mean([by_stage[p][1] for p in sorted(by_stage)])
+        np.testing.assert_allclose(derived, recorded[field][0], rtol=1e-6)
 
 
 def test_stacked_ratio_never_exceeds_one(tmp_path):

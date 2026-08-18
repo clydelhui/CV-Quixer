@@ -70,6 +70,7 @@ from _thesis_style import (
 # Reuse the run loader, the per-epoch artefact readers, the stage detection and
 # every metric derivation. This script adds no data handling of its own.
 from report_diagnostics import (
+    _STAGE_TRUNC_STREAMS,
     MissingArtefactError,
     _accuracy_from,
     _cross_entropy_from,
@@ -77,7 +78,9 @@ from report_diagnostics import (
     _derive_lcu_lambda,
     _diag_stages,
     _load_all_diagnostics,
+    _load_stage_trunc,
     _per_class_acc_from,
+    _stage_success_probs,
     _success_prob_matrix,
     load_run,
 )
@@ -195,28 +198,25 @@ def _n_heralded_stages(run: dict) -> int:
 
 def _herald_bound_note(run: dict) -> str | None:
     """Caption note for a run whose figure covers one of several heralded
-    stages: what is shown bounds, rather than measures, the end-to-end
-    post-selection probability.
+    stages: what is shown is one term of a sum, not the whole model's cost.
 
-    Only the decoder-input stage's success probabilities reach the artefacts
-    (`StackedCVQuixer.forward` discards the earlier blocks'), and each omitted
-    stage contributes an independent factor in [0, 1] — `‖P(M)|ψ⟩‖ ≤ β` holds
-    for the unit-norm input every stage receives. Returns None when there is
-    only one stage and the figure is therefore exact.
+    Stages are heralded **independently** — blocks chain classically (a block's
+    input is the previous block's readouts, and every block re-prepares from the
+    vacuum), and heads are separate registers whose readouts are expectation
+    values. So no two heralded events must succeed on the same shot, and shot
+    costs add rather than probabilities multiplying (ADR-0002). Returns None
+    when there is only one stage and the figure is therefore the whole story.
     """
     stages = _n_heralded_stages(run)
     if stages < 2:
         return None
-    omitted = (
-        "the one omitted stage contributes a further factor"
-        if stages == 2 else
-        f"each of the {stages - 1} omitted stages contributes a further factor"
-    )
+    others = ("the other stage is" if stages == 2
+              else f"the other {stages - 1} stages are")
     return (
-        f"the model applies {stages} heralded stages in sequence and the "
-        f"artefacts record only the decoder-input stage shown here, so "
-        f"{omitted} in " + r"$[0, 1]$ and this is an upper bound on the "
-        "end-to-end post-selection probability"
+        f"the model applies {stages} heralded stages in sequence, each shown in "
+        f"its own figure; {others} heralded independently, so the shot cost of "
+        r"an inference is the sum $\sum_\text{stages} \sum_\text{heads} S/p$ "
+        "rather than a product of these probabilities"
     )
 
 
@@ -618,68 +618,77 @@ def fig_state_norm_histogram(run: dict, book: CaptionBook) -> None:
 
 
 def fig_success_prob_histogram(run: dict, book: CaptionBook) -> None:
-    preds = _require_predictions(run)
-    if schema.SUCCESS_PROBS not in preds:
-        raise SkipFigure(
-            "predictions npz has no success_probs key "
-            "(not recorded for this model variant)"
-        )
     diag = _require_diagnostics(run)
-    # Stacked runs record success probabilities for the decoder-input stage
-    # only, so β comes from that stage's coefficients (ADR-0003); for a
-    # canonical run the prefix is empty and these are the flat keys.
-    prefix, _suffix, _label = _decoder_input_stage(diag)
-    lcu_key, poly_key = f"{prefix}{schema.LCU_COEFFS}", f"{prefix}{schema.POLY_COEFFS}"
-    if lcu_key not in diag or poly_key not in diag:
-        raise SkipFigure(
-            f"diagnostics npz lacks {lcu_key}/{poly_key} (needed for β)"
-        )
+    # One figure per stage (ADR-0003). The decoder-input stage — the one
+    # StackedCVQuixer.forward keeps — reads the main predictions npz; earlier
+    # blocks read the sidecars written by eval_block_stages.py. A canonical run
+    # has a single empty-prefix stage and keeps its historic filename.
+    stages = _diag_stages(diag)
+    decoder_prefix = _decoder_input_stage(diag)[0]
+    n_blocks = _n_blocks(run)
+    drawn = 0
+    for prefix, suffix, _label in stages:
+        decoder_input = prefix == decoder_prefix
+        lcu_key = f"{prefix}{schema.LCU_COEFFS}"
+        poly_key = f"{prefix}{schema.POLY_COEFFS}"
+        if lcu_key not in diag or poly_key not in diag:
+            continue
+        raw_arr = _stage_success_probs(run["run_dir"], run["epoch"], prefix,
+                                       decoder_input=decoder_input)
+        if raw_arr is None:
+            continue
+        raw = _success_prob_matrix(raw_arr)                          # (S, H)
+        # The block-encoding scale, written β in the thesis. The upstream helper
+        # is named for λ (report_diagnostics / ADR-0002 notation) — same thing.
+        beta = _derive_lcu_lambda(diag[lcu_key], diag[poly_key])     # (H,)
+        ratio = raw / beta[None, :] ** 2
+        pos = ratio[ratio > 0]
+        log_x = pos.size > 0 and float(pos.max()) / float(pos.min()) > 100.0
+        colors = head_colors(ratio.shape[1])
 
-    raw = _success_prob_matrix(preds[schema.SUCCESS_PROBS])           # (S, H)
-    # The block-encoding scale, written β in the thesis. The upstream helper is
-    # named for λ (report_diagnostics / ADR-0002 notation) — same quantity.
-    beta = _derive_lcu_lambda(diag[lcu_key], diag[poly_key])          # (H,)
-    ratio = raw / beta[None, :] ** 2
-    pos = ratio[ratio > 0]
-    log_x = pos.size > 0 and float(pos.max()) / float(pos.min()) > 100.0
-    colors = head_colors(ratio.shape[1])
-
-    fig, ax = plt.subplots(figsize=(7.6, 4.4))
-    if log_x:
-        bins = np.logspace(np.log10(pos.min()), np.log10(pos.max()), 41)
-        ax.set_xscale("log")
-    else:
-        bins = 40
-    for h in range(ratio.shape[1]):
-        vals = ratio[:, h]
+        fig, ax = plt.subplots(figsize=(7.6, 4.4))
         if log_x:
-            vals = vals[vals > 0]
-        ax.hist(vals, bins=bins, histtype="step", linewidth=1.4,
-                color=colors[h], label=f"Head {h}")
-    ax.set_xlabel(
-        r"Post-selection success probability "
-        r"$\|P(M)|\psi\rangle\|^2 / \beta^2$"
-    )
-    ax.set_ylabel("Count")
+            bins = np.logspace(np.log10(pos.min()), np.log10(pos.max()), 41)
+            ax.set_xscale("log")
+        else:
+            bins = 40
+        for h in range(ratio.shape[1]):
+            vals = ratio[:, h]
+            if log_x:
+                vals = vals[vals > 0]
+            ax.hist(vals, bins=bins, histtype="step", linewidth=1.4,
+                    color=colors[h], label=f"Head {h}")
+        ax.set_xlabel(
+            r"Post-selection success probability "
+            r"$\|P(M)|\psi\rangle\|^2 / \beta^2$"
+        )
+        ax.set_ylabel("Count")
 
-    style_axes(ax)
-    outside_legend(ax)
-    save(fig, run["fig_dir"], "success_prob_histogram")
-    per_position = (
-        " Each sequence position contributes one count per head."
-        if np.asarray(preds[schema.SUCCESS_PROBS]).ndim == 3 else ""
-    )
-    notes = [f"block-encoding scale $\\beta$ ranges "
-             f"{beta.min():.3g} to {beta.max():.3g}"]
-    bound = _herald_bound_note(run)
-    if bound:
-        notes.append(bound)
-    book.add("success_prob_histogram", "Post-selection success probability",
-             "Distribution across the test set of the heralded post-selection "
-             "probability, one step histogram per attention head."
-             + per_position,
-             _facts(run, extra="; ".join(notes),
-                    stage=_stage_display(prefix, _n_blocks(run))))
+        style_axes(ax)
+        outside_legend(ax)
+        save(fig, run["fig_dir"], f"success_prob_histogram{suffix}")
+        per_position = (
+            " Each sequence position contributes one count per head."
+            if np.asarray(raw_arr).ndim == 3 else ""
+        )
+        notes = [f"block-encoding scale $\\beta$ ranges "
+                 f"{beta.min():.3g} to {beta.max():.3g}"]
+        bound = _herald_bound_note(run)
+        if bound:
+            notes.append(bound)
+        book.add(f"success_prob_histogram{suffix}",
+                 "Post-selection success probability",
+                 "Distribution across the test set of the heralded "
+                 "post-selection probability, one step histogram per attention "
+                 "head." + per_position,
+                 _facts(run, extra="; ".join(notes),
+                        stage=_stage_display(prefix, n_blocks)))
+        drawn += 1
+    if not drawn:
+        raise SkipFigure(
+            "no stage has both success_probs and lcu/poly coeffs "
+            "(earlier stacked blocks need eval_block_stages.py)"
+        )
 
 
 def fig_success_prob_trajectory(run: dict, book: CaptionBook) -> None:
@@ -689,65 +698,160 @@ def fig_success_prob_trajectory(run: dict, book: CaptionBook) -> None:
     diag_all = _load_all_diagnostics(run["run_dir"])
     if not diag_all:
         raise SkipFigure("no diagnostics npz found")
-    # Stacked runs record success probabilities for the decoder-input stage
-    # only (ADR-0003); an empty prefix recovers the canonical flat keys.
-    prefix, _suffix, _label = _decoder_input_stage(diag_all[min(diag_all)])
-    lcu_key, poly_key = f"{prefix}{schema.LCU_COEFFS}", f"{prefix}{schema.POLY_COEFFS}"
-    n_epochs = len(run["history"]["epoch"].get("test_acc") or [])
-    have_beta = [
-        e for e in range(1, n_epochs + 1)
-        if diag_all.get(e) is not None
-        and lcu_key in diag_all[e]
-        and poly_key in diag_all[e]
-    ]
-    if len(have_beta) < 2:
-        raise SkipFigure("fewer than 2 epochs have coeffs to derive β")
-
-    # One predictions file live at a time (see _stream_epochs).
-    usable, stats = [], []
-    for e in have_beta:
-        path = (run["run_dir"] / "predictions"
-                / schema.prediction_filename(e, train=False))
-        if not path.is_file():
-            continue
-        with np.load(path) as npz:
-            if schema.SUCCESS_PROBS not in npz:
+    first_diag = diag_all[min(diag_all)]
+    stages = _diag_stages(first_diag)
+    decoder_prefix = _decoder_input_stage(first_diag)[0]
+    n_blocks = _n_blocks(run)
+    drawn = 0
+    for prefix, suffix, _label in stages:
+        decoder_input = prefix == decoder_prefix
+        lcu_key = f"{prefix}{schema.LCU_COEFFS}"
+        poly_key = f"{prefix}{schema.POLY_COEFFS}"
+        # One predictions file live at a time (see _stream_epochs).
+        usable, stats = [], []
+        for e in sorted(diag_all):
+            d = diag_all[e]
+            if d is None or lcu_key not in d or poly_key not in d:
                 continue
-            raw = _success_prob_matrix(npz[schema.SUCCESS_PROBS])
-        beta = _derive_lcu_lambda(diag_all[e][lcu_key], diag_all[e][poly_key])
-        ratio = raw / beta[None, :] ** 2
-        stats.append((ratio.mean(axis=0),
-                      np.percentile(ratio, 10, axis=0),
-                      np.percentile(ratio, 90, axis=0)))
-        usable.append(e)
-    if len(usable) < 2:
+            raw_arr = _stage_success_probs(run["run_dir"], e, prefix,
+                                           decoder_input=decoder_input)
+            if raw_arr is None:
+                continue
+            raw = _success_prob_matrix(raw_arr)
+            beta = _derive_lcu_lambda(d[lcu_key], d[poly_key])
+            ratio = raw / beta[None, :] ** 2
+            stats.append((ratio.mean(axis=0),
+                          np.percentile(ratio, 10, axis=0),
+                          np.percentile(ratio, 90, axis=0)))
+            usable.append(e)
+        if len(usable) < 2:
+            continue
+
+        mean = np.stack([s[0] for s in stats])
+        p10 = np.stack([s[1] for s in stats])
+        p90 = np.stack([s[2] for s in stats])
+        num_heads = mean.shape[1]
+        colors = head_colors(num_heads)
+        fig, ax = plt.subplots(figsize=(7.6, 4.4))
+        for h in range(num_heads):
+            ax.plot(usable, mean[:, h], marker="o", markersize=3,
+                    color=colors[h], label=f"Head {h}")
+            ax.fill_between(usable, p10[:, h], p90[:, h],
+                            color=colors[h], alpha=0.15, linewidth=0)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(r"$\|P(M)|\psi\rangle\|^2 / \beta^2$")
+        style_axes(ax)
+        outside_legend(ax)
+        save(fig, run["fig_dir"], f"success_prob_trajectory{suffix}")
+        book.add(f"success_prob_trajectory{suffix}",
+                 "Post-selection success probability across training",
+                 "Mean heralded post-selection probability per head against "
+                 "epoch, with a shaded 10th-90th percentile band over the "
+                 "test set.",
+                 _facts(run, extra=_herald_bound_note(run),
+                        stage=_stage_display(prefix, n_blocks)))
+        drawn += 1
+    if not drawn:
         raise SkipFigure(
-            "fewer than 2 epochs carry success_probs "
-            "(not recorded for this model variant, or predictions/ absent)"
+            "no stage carries success_probs plus coeffs for ≥2 epochs "
+            "(earlier stacked blocks need eval_block_stages.py)"
         )
 
-    mean = np.stack([s[0] for s in stats])
-    p10 = np.stack([s[1] for s in stats])
-    p90 = np.stack([s[2] for s in stats])
-    num_heads = mean.shape[1]
-    colors = head_colors(num_heads)
-    fig, ax = plt.subplots(figsize=(7.6, 4.4))
-    for h in range(num_heads):
-        ax.plot(usable, mean[:, h], marker="o", markersize=3,
-                color=colors[h], label=f"Head {h}")
-        ax.fill_between(usable, p10[:, h], p90[:, h],
-                        color=colors[h], alpha=0.15, linewidth=0)
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel(r"$\|P(M)|\psi\rangle\|^2 / \beta^2$")
-    style_axes(ax)
-    outside_legend(ax)
-    save(fig, run["fig_dir"], "success_prob_trajectory")
-    book.add("success_prob_trajectory",
-             "Post-selection success probability across training",
-             "Mean heralded post-selection probability per head against epoch, "
-             "with a shaded 10th-90th percentile band over the test set.",
-             _facts(run, extra=_herald_bound_note(run),
-                    stage=_stage_display(prefix, _n_blocks(run))))
+
+def fig_beta_trajectory(run: dict, book: CaptionBook) -> None:
+    n_epochs = len(run["history"]["epoch"].get("test_acc") or [])
+    try:
+        diag_all = _load_all_diagnostics(run["run_dir"], n_epochs=n_epochs)
+    except (MissingArtefactError, FileNotFoundError) as exc:
+        raise SkipFigure(f"diagnostics/ not fully present: {exc}") from exc
+    if not diag_all:
+        raise SkipFigure("no diagnostics npz found")
+    stages = _diag_stages(diag_all[min(diag_all)])
+    n_blocks = _n_blocks(run)
+    drawn = 0
+    for prefix, suffix, _label in stages:
+        lcu_key = f"{prefix}{schema.LCU_COEFFS}"
+        poly_key = f"{prefix}{schema.POLY_COEFFS}"
+        epochs = [e for e in sorted(diag_all)
+                  if diag_all[e] is not None
+                  and lcu_key in diag_all[e] and poly_key in diag_all[e]]
+        if len(epochs) < 2:
+            continue
+        beta = np.stack([
+            _derive_lcu_lambda(diag_all[e][lcu_key], diag_all[e][poly_key])
+            for e in epochs
+        ])                                          # (n_epochs, num_heads)
+        colors = head_colors(beta.shape[1])
+        fig, ax = plt.subplots(figsize=(7.6, 4.4))
+        for h in range(beta.shape[1]):
+            ax.plot(epochs, beta[:, h], marker="o", markersize=3,
+                    color=colors[h], label=f"Head {h}")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(r"Block-encoding scale $\beta$")
+        style_axes(ax)
+        outside_legend(ax)
+        save(fig, run["fig_dir"], f"beta_trajectory{suffix}")
+        book.add(f"beta_trajectory{suffix}",
+                 "Block-encoding scale across training",
+                 "The subnormalisation "
+                 r"$\beta = \sum_j |c_j| (\sum_i |b_i|)^j$ of the nested LCU "
+                 "block encoding, per attention head against epoch. It is the "
+                 "denominator of the post-selection success probability, so "
+                 r"$1/\beta^2$ bounds the best achievable heralding rate: "
+                 "larger $\\beta$ means a more expensive circuit.",
+                 _facts(run, stage=_stage_display(prefix, n_blocks)))
+        drawn += 1
+    if not drawn:
+        raise SkipFigure("no stage carries lcu/poly coeffs for ≥2 epochs")
+
+
+def fig_trunc_streams_per_block(run: dict, book: CaptionBook) -> None:
+    diag = _require_diagnostics(run)
+    stages = _diag_stages(diag)
+    if len(stages) < 2:
+        raise SkipFigure("single-stage model — nothing to decompose per block")
+    per_stream = _load_stage_trunc(run["run_dir"], stages)
+    n_blocks = _n_blocks(run)
+    eh = run["history"]["epoch"]
+    drawn = 0
+    for key, fname, ylabel, hist_key in _STAGE_TRUNC_STREAMS:
+        by_stage = per_stream.get(key) or {}
+        if not by_stage:
+            continue
+        if all(v == 0.0 for vals in by_stage.values() for v in vals.values()):
+            continue
+        fig, ax = plt.subplots(figsize=(7.6, 4.4))
+        colors = head_colors(len(stages))
+        for s_idx, (prefix, _suffix, _label) in enumerate(stages):
+            vals = by_stage.get(prefix)
+            if not vals:
+                continue
+            epochs = sorted(vals)
+            ax.plot(epochs, [vals[e] for e in epochs], marker="o",
+                    markersize=3, color=colors[s_idx],
+                    label=_stage_display(prefix, n_blocks).capitalize())
+        recorded = eh.get(hist_key) or []
+        if recorded:
+            ax.plot(range(1, len(recorded) + 1), recorded, linestyle="--",
+                    color="0.25", linewidth=1.2, label="Recorded mean")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(ylabel)
+        style_axes(ax)
+        outside_legend(ax)
+        save(fig, run["fig_dir"], fname)
+        book.add(fname, f"{ylabel} per block",
+                 "Truncation leakage of each seq-to-seq block separately, "
+                 "against epoch. The model optimises only the mean over "
+                 "blocks, drawn dashed, so this decomposition shows which "
+                 "block is responsible for the leakage.",
+                 _facts(run, extra="test-side values recomputed per epoch "
+                        "from checkpoints, comparable to the recorded "
+                        "test-set mean but not to the training-time "
+                        "per-batch stream"))
+        drawn += 1
+    if not drawn:
+        raise SkipFigure("no per-block truncation sidecars "
+                         "(run eval_block_stages.py)")
 
 
 def fig_lcu_coefficients_heatmap(run: dict, book: CaptionBook) -> None:
@@ -845,6 +949,8 @@ FIGURES = {
     "state_norm_histogram": fig_state_norm_histogram,
     "success_prob_histogram": fig_success_prob_histogram,
     "success_prob_trajectory": fig_success_prob_trajectory,
+    "beta_trajectory": fig_beta_trajectory,
+    "trunc_streams_per_block": fig_trunc_streams_per_block,
     "lcu_coefficients_heatmap": fig_lcu_coefficients_heatmap,
     "polynomial_coefficients_trajectory": fig_polynomial_coefficients_trajectory,
 }

@@ -155,20 +155,32 @@ failed figure warns but does not abort the rest; `sanity_checks` runs first):
   `top_k_accuracy`, `calibration_reliability`,
   `hypernet_gate_param_histograms`, `cvqnn_param_values`,
   `photon_number_per_mode`, `state_norm_histogram`,
-  `success_prob_histogram`, `success_prob_trajectory`,
+  `success_prob_histogram`, `success_prob_trajectory`, `beta_trajectory`,
   `lcu_coefficients_heatmap`, `polynomial_coefficients_trajectory`.
   The query / W trunc figures are skipped when the stream is absent or
   identically zero (old runs, canonical runs without the stream, L_W=0).
+  `beta_trajectory` plots the per-head block-encoding scale
+  λ = Σ_j |c_j|·(Σ_i |b_i|)ʲ against epoch — derived from the per-epoch
+  coefficient snapshots alone, so it needs no predictions and no checkpoints.
 - *Slow* (need readouts/test images — from saved npz, or `--full-inference`):
   `misclassification_gallery`, `embedding_tsne`.
 - *Stacked runs* (`model="quantum_stacked"`, detected data-driven from the
-  block-prefixed diagnostics keys): the four per-stage figures —
+  block-prefixed diagnostics keys): the per-stage figures —
   `hypernet_gate_param_histograms`, `cvqnn_param_values`,
-  `lcu_coefficients_heatmap`, `polynomial_coefficients_trajectory` — render
-  one file per stage (`…_block{b}.png`, `…_agg.png`), with a separate
+  `lcu_coefficients_heatmap`, `polynomial_coefficients_trajectory`,
+  `beta_trajectory`, `success_prob_histogram`, `success_prob_trajectory` —
+  render one file per stage (`…_block{b}.png`, `…_agg.png`), with a separate
   `…_block{b}_query.png` histogram for each block's query-unitary slice.
-  Canonical runs keep the historic unsuffixed filenames; state-norm / photon
-  figures keep canonical names (they describe the decoder-input stage).
+  The success-prob pair covers the decoder-input stage from the main
+  predictions npz and every earlier stage from its sidecar (below), skipping
+  stages with no sidecar. Canonical runs keep the historic unsuffixed
+  filenames; state-norm / photon figures keep canonical names (they describe
+  the decoder-input stage).
+  `trunc_loss_curve_per_block`, `query_trunc_loss_curve_per_block` and
+  `cvqnn_trunc_loss_curve_per_block` decompose the three truncation streams —
+  which the model records only as a **flat mean over blocks** — into one line
+  per block, with that recorded mean drawn dashed. Sidecars required; skipped
+  otherwise, and always skipped for single-stage models.
 
 #### Hyperparameter sweeps
 
@@ -546,6 +558,7 @@ experiments/
 ├── full_experiment.py     60k/10k FashionMNIST, self-contained results/runs/<ts>/ dir
 ├── eval_cutoff_sweep.py   Re-evaluate a trained checkpoint at larger Fock cutoffs
 ├── eval_cutoff_sweep_all.py  Fan eval_cutoff_sweep over EVERY run in a sweep (manifest + local/slurm)
+├── eval_block_stages.py   Re-evaluate a stacked run block by block from its checkpoints → per-stage success-prob + truncation sidecars (ADR-0002/0003). Self-checks the decoder-input stage against the stored values and the per-block trunc means against history
 ├── sweep.py               Fan a (param × observable × seed) grid into full_experiment runs
 ├── resume_sweep.py        Top up a sweep: raise selected runs to a target total epoch count (manifest + local/slurm)
 ├── rerun_sweep.py         Re-roll selected runs: fresh restart with --poly-init-noise to escape uniform-predictor collapse (ADR-0007; manifest + local/slurm)
@@ -888,7 +901,8 @@ artefacts that pre-date the key (no migration).
 | `parameter_table.txt` | Snapshot of `print_parameter_table()` |
 | `checkpoints/` | `latest.pt` (every epoch), `best.pt` (best test acc), `final_model.pt`, `epoch_NNNN.pt` |
 | `figures/` | Populated by `report_diagnostics.py` (run post-hoc or partway through). Not written by `full_experiment.py` itself. |
-| `predictions/epoch_NNNN.npz` | Test side per epoch: `y_true`, `y_pred`, `y_probs`, `readouts`, `success_probs` (float32 `(N, num_heads)` raw per-sample LCU/QSVT post-selection norms ‖P(M)\|ψ⟩‖²; figures derive the subnormalisation λ from `lcu_coeffs`/`poly_coeffs` at render time — see ADR-0002. Stacked runs under `pooling="mean"` add a position axis, `(N, num_heads, num_positions)`, and cover the decoder-input stage only, so λ comes from that stage's `block{b}_`/`agg_` coeffs and the figures are an upper bound on end-to-end heralding). Canonical source for accuracy/loss/per-class/confusion/calibration figures. |
+| `predictions/epoch_NNNN.npz` | Test side per epoch: `y_true`, `y_pred`, `y_probs`, `readouts`, `success_probs` (float32 `(N, num_heads)` raw per-sample LCU/QSVT post-selection norms ‖P(M)\|ψ⟩‖²; figures derive the subnormalisation λ from `lcu_coeffs`/`poly_coeffs` at render time — see ADR-0002. Stacked runs under `pooling="mean"` add a position axis, `(N, num_heads, num_positions)`, and cover the decoder-input stage only, so λ comes from that stage's `block{b}_`/`agg_` coeffs; the earlier stages live in the sidecars below. Heralding costs **add** across stages/heads/positions rather than multiplying — see ADR-0002). Canonical source for accuracy/loss/per-class/confusion/calibration figures. |
+| `predictions/epoch_NNNN_block{b}.npz` | Optional per-stage **sidecar** for a stacked run, written by `experiments/eval_block_stages.py` (never by training): that block's own `success_probs` plus its `patch_trunc`/`query_trunc`/`w_trunc` scalars, recomputed from `checkpoints/epoch_NNNN.pt` over the same test split. Purely additive — a run without sidecars renders exactly as before. |
 | `predictions/epoch_NNNN_train.npz` | Train side per epoch: same five keys, from the clean post-epoch train eval. Enables train-side per-class/confusion/embedding figures. |
 | `predictions/test_images.npz` | One-time, reassembled `(N, H, W)` test images for the misclassification gallery. |
 | `diagnostics/epoch_NNNN.npz` | Per-epoch raw quantum diagnostics: gate-param samples (`head{h}_{gate}`), state norms (`head{h}_state_norms`), `mean_photon_number`, `lcu_coeffs`, `poly_coeffs`. |

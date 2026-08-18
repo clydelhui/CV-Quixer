@@ -66,9 +66,13 @@ The probability that the heralded LCU/QSVT implementation of `P(M)` post-selects
 successfully: `‖P(M)|ψ⟩‖² / λ²`, measured in the truncated simulation (so a small part
 of the norm deficit is Fock truncation, not heralding failure). Applies only to the
 Polynomial step — the CVQNN block `W` is unitary and has no success probability; its
-norm deficit is truncation leakage. A model of [[seq-to-seq block]]s post-selects once per stage
-but records only the decoder-input stage, so its figures are an *upper bound* on the
-end-to-end value, never an estimate of it (ADR-0002).
+norm deficit is truncation leakage. A model of [[seq-to-seq block]]s post-selects once per
+stage; training records only the decoder-input stage, and
+`experiments/eval_block_stages.py` recovers the earlier ones post-hoc so each gets its
+own figure. Stages, heads and positions are heralded *independently* (blocks chain
+classically and readouts are expectation values), so shot costs **add** —
+`Σ_stages Σ_heads S/p` — and a per-stage figure is one term of that sum, never a
+factor in a product (ADR-0002).
 _Avoid_: state norm (that is the unnormalised numerator), post-selection rate.
 
 **Subnormalisation** (`λ`):
@@ -89,7 +93,13 @@ One CV-Quixer attention stage that maps an N-token sequence to an N-token
 sequence. All positions share each head's LCU, polynomial, and CVQNN block;
 position i differs only in its query state — its output token is the readout of
 `W · P(M) · U_{q,i}|0⟩`. Stackable; the first block consumes raw patches, deeper
-blocks consume the previous block's tokens.
+blocks consume the previous block's tokens — a *classical* hand-off, since tokens
+are readouts and every block re-prepares from the vacuum.
+All three truncation streams are recorded as a **flat mean over blocks**, not
+scoped to the decoder-input stage the way state norms, photon numbers and success
+probabilities are; under `pooling="quixer"` the [[aggregator block]] joins the
+patch and `W` means but not the query mean, which has no aggregator term.
+`experiments/eval_block_stages.py` recovers the per-block values post-hoc.
 _Avoid_: attention layer, mixer block, token block.
 
 **Aggregator block**:

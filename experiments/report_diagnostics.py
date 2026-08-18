@@ -278,6 +278,26 @@ def _success_prob_matrix(raw: np.ndarray) -> np.ndarray:
     )
 
 
+def _stage_success_probs(run_dir: Path, epoch: int, prefix: str,
+                         *, decoder_input: bool) -> np.ndarray | None:
+    """One stage's raw success probs for one epoch, or None if not recorded.
+
+    The decoder-input stage lives in the main predictions npz — it is the one
+    `StackedCVQuixer.forward` keeps. Every other stage lives in a sidecar
+    written by `experiments/eval_block_stages.py`; a run that has never been
+    through that script simply has no sidecars, and callers skip the stage.
+    """
+    fname = (schema.prediction_filename(epoch) if decoder_input
+             else schema.stage_prediction_filename(epoch, prefix))
+    path = run_dir / "predictions" / fname
+    if not path.is_file():
+        return None
+    with np.load(path) as npz:
+        if schema.SUCCESS_PROBS not in npz:
+            return None
+        return np.asarray(npz[schema.SUCCESS_PROBS])
+
+
 def _accuracy_from(preds: dict) -> float:
     return float((preds["y_pred"] == preds["y_true"]).mean())
 
@@ -1312,137 +1332,295 @@ def plot_polynomial_coefficient_trajectory(run: dict) -> None:
         print(f"  ✓ {fname}")
 
 
+def plot_beta_trajectory(run: dict) -> None:
+    """Per-head block-encoding scale λ (β in thesis notation) vs epoch.
+
+    λ = Σ_j |c_j| · (Σ_i |b_i|)ʲ is the denominator of every success-probability
+    figure — the subnormalisation of the nested LCU block encoding, and the
+    quantity that makes heralding expensive (the best achievable success
+    probability is 1/λ²). It is derived entirely from the per-epoch coefficient
+    snapshots, so this figure needs no predictions and no checkpoints.
+
+    One file per stage (ADR-0003): stacked runs get `beta_trajectory_block{b}`,
+    canonical runs keep the unsuffixed name.
+    """
+    eh = run["history"]["epoch"]
+    n_epochs = len(eh.get("test_loss", []))
+    if n_epochs == 0:
+        print("  - history.json has no epoch entries → skipping beta_trajectory")
+        return
+    diag_per_epoch = _load_all_diagnostics(run["run_dir"], n_epochs=n_epochs)
+    stages = _diag_stages(diag_per_epoch[1])
+    drawn = 0
+    for prefix, suffix, label in stages:
+        lcu_key = f"{prefix}{schema.LCU_COEFFS}"
+        poly_key = f"{prefix}{schema.POLY_COEFFS}"
+        epochs = [
+            e for e in range(1, n_epochs + 1)
+            if diag_per_epoch.get(e) is not None
+            and lcu_key in diag_per_epoch[e]
+            and poly_key in diag_per_epoch[e]
+        ]
+        if len(epochs) < 2:
+            continue
+        beta = np.stack([
+            _derive_lcu_lambda(diag_per_epoch[e][lcu_key],
+                               diag_per_epoch[e][poly_key])
+            for e in epochs
+        ])                                            # (n_epochs, num_heads)
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        for h in range(beta.shape[1]):
+            ax.plot(epochs, beta[:, h], marker="o", label=f"head {h}")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(r"$\lambda = \sum_j |c_j| \, (\sum_i |b_i|)^j$")
+        ax.set_title(f"Block-encoding scale vs epoch{label}")
+        ax.legend(fontsize=8)
+        ax.grid(alpha=0.3)
+        fig.tight_layout()
+        fname = f"beta_trajectory{suffix}.png"
+        fig.savefig(run["fig_dir"] / fname, dpi=150)
+        plt.close(fig)
+        print(f"  ✓ {fname}")
+        drawn += 1
+    if not drawn:
+        raise MissingArtefactError(
+            "no diagnostics stage carries `lcu_coeffs`/`poly_coeffs` for at "
+            "least 2 epochs — only models with LCU post-selection write them."
+        )
+
+
+#: Per-block truncation streams: sidecar key → (filename, axis label, the
+#: history field carrying the block-mean the model actually recorded).
+_STAGE_TRUNC_STREAMS: tuple[tuple[str, str, str, str], ...] = (
+    (schema.PATCH_TRUNC, "trunc_loss_curve_per_block",
+     "Patch / LCU-term truncation", "test_trunc_loss"),
+    (schema.QUERY_TRUNC, "query_trunc_loss_curve_per_block",
+     "Query-unitary truncation", "test_query_trunc_loss"),
+    (schema.W_TRUNC, "cvqnn_trunc_loss_curve_per_block",
+     "CVQNN block $W$ truncation", "test_cvqnn_trunc_loss"),
+)
+
+
+def _load_stage_trunc(run_dir: Path, stages: list[tuple[str, str, str]],
+                      ) -> dict[str, dict[str, dict[int, float]]]:
+    """Per-stream, per-stage, per-epoch truncation scalars from the sidecars.
+
+    Returns ``{stream_key: {stage_prefix: {epoch: value}}}``, empty for any run
+    that has never been through `experiments/eval_block_stages.py`.
+    """
+    out: dict[str, dict[str, dict[int, float]]] = {
+        key: {} for key, _, _, _ in _STAGE_TRUNC_STREAMS
+    }
+    pred_dir = run_dir / "predictions"
+    if not pred_dir.is_dir():
+        return out
+    for prefix, _suffix, _label in stages:
+        if not prefix:
+            continue          # canonical runs have no per-stage sidecars
+        for path in sorted(pred_dir.glob(f"epoch_*_{prefix.rstrip('_')}.npz")):
+            try:
+                epoch = int(path.name.split("_")[1])
+            except (IndexError, ValueError):
+                continue
+            with np.load(path) as npz:
+                for key, _f, _l, _h in _STAGE_TRUNC_STREAMS:
+                    if key in npz:
+                        out[key].setdefault(prefix, {})[epoch] = float(npz[key])
+    return out
+
+
+def plot_trunc_streams_per_block(run: dict) -> None:
+    """Per-block truncation curves — one file per stream, one line per block.
+
+    The model records only a flat mean over blocks for each of its three
+    truncation streams (`cv_seq2seq.py`), so which block leaks is invisible in
+    the standard curves. These values come from the per-stage sidecars written
+    by `experiments/eval_block_stages.py`: they are **test-side per-epoch**
+    figures, comparable to `test_*_trunc_loss` (drawn dashed for reference) but
+    not to the training-time per-batch streams.
+    """
+    diag = run["diagnostics"]
+    if diag is None:
+        return
+    stages = _diag_stages(diag)
+    if len(stages) < 2:
+        return                # canonical run: nothing to decompose
+    per_stream = _load_stage_trunc(run["run_dir"], stages)
+    eh = run["history"]["epoch"]
+    drawn = 0
+    for key, fname, ylabel, hist_key in _STAGE_TRUNC_STREAMS:
+        by_stage = per_stream.get(key) or {}
+        if not by_stage:
+            continue
+        # Skip a stream that is identically zero everywhere — the convention
+        # the query/W trunc curves already use for L_W = 0 and canonical runs.
+        if all(v == 0.0 for vals in by_stage.values() for v in vals.values()):
+            continue
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        for prefix, _suffix, label in stages:
+            vals = by_stage.get(prefix)
+            if not vals:
+                continue
+            epochs = sorted(vals)
+            ax.plot(epochs, [vals[e] for e in epochs], marker="o",
+                    label=(label.lstrip(" —") or "block"))
+        recorded = eh.get(hist_key) or []
+        if recorded:
+            ax.plot(range(1, len(recorded) + 1), recorded, linestyle="--",
+                    color="black", linewidth=1.2, label="recorded mean")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(ylabel)
+        ax.set_title(f"{ylabel} per block (test set)")
+        ax.legend(fontsize=8)
+        ax.grid(alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(run["fig_dir"] / f"{fname}.png", dpi=150)
+        plt.close(fig)
+        print(f"  ✓ {fname}.png")
+        drawn += 1
+    if not drawn:
+        print("  - no per-block truncation sidecars → "
+              "skipping trunc_streams_per_block")
+
+
 def plot_success_prob_histogram(run: dict) -> None:
     """Distribution of the LCU/QSVT post-selection success probability
     ‖P(M)|ψ⟩‖²/λ² across the test set at the selected epoch, per head.
     λ is derived from the saved lcu/poly coefficients (ADR-0002).
 
-    Stacked runs (ADR-0003) carry this for the decoder-input stage only, and
-    fold their per-position values into the sample population.
+    One file per stage (ADR-0003). The decoder-input stage reads the main
+    predictions npz; earlier stacked blocks read the sidecars written by
+    `experiments/eval_block_stages.py`, and are skipped when absent. Stacked
+    runs fold their per-position values into the sample population.
     """
-    preds = run["predictions"]
-    if preds is None or schema.SUCCESS_PROBS not in preds:
-        raise MissingArtefactError(
-            f"predictions/epoch_{run['epoch']:04d}.npz missing or has no "
-            f"`success_probs` key — only models with LCU post-selection write "
-            f"it. For an old run predating the key, run `uv run python "
-            f"experiments/backfill_artefacts.py --run-dir {run['run_dir']}`."
-        )
     diag = run["diagnostics"]
-    prefix, _suffix, stage_label = (
-        _decoder_input_stage(diag) if diag is not None else ("", "", "")
-    )
-    lcu_key, poly_key = f"{prefix}{schema.LCU_COEFFS}", f"{prefix}{schema.POLY_COEFFS}"
-    if diag is None or lcu_key not in diag or poly_key not in diag:
-        raise MissingArtefactError(
-            f"diagnostics/epoch_{run['epoch']:04d}.npz missing or lacks "
-            f"`{lcu_key}`/`{poly_key}` (needed to derive λ). For an old run "
-            f"predating those keys, run `uv run python "
-            f"experiments/backfill_artefacts.py --run-dir {run['run_dir']}`."
-        )
-    raw = _success_prob_matrix(preds["success_probs"])                 # (S, H)
-    lam = _derive_lcu_lambda(diag[lcu_key], diag[poly_key])            # (H,)
-    ratio = raw / lam[None, :] ** 2                                    # (S, H)
-    # Failure threshold applies to the RAW norm, mirroring the clamp
-    # semantics in cv_attention (elements below it are forced to zero state).
-    fail_frac = (raw < _SUCCESS_PROB_FLOOR).mean(axis=0)               # (H,)
+    stages = _diag_stages(diag) if diag is not None else [("", "", "")]
+    decoder_prefix = stages[-1][0] if diag is None else _decoder_input_stage(diag)[0]
+    epoch = run["epoch"]
+    drawn = 0
+    for prefix, suffix, stage_label in stages:
+        decoder_input = prefix == decoder_prefix
+        lcu_key = f"{prefix}{schema.LCU_COEFFS}"
+        poly_key = f"{prefix}{schema.POLY_COEFFS}"
+        if diag is None or lcu_key not in diag or poly_key not in diag:
+            continue
+        if decoder_input and run["predictions"] is not None \
+                and schema.SUCCESS_PROBS in run["predictions"]:
+            raw_arr = run["predictions"][schema.SUCCESS_PROBS]
+        else:
+            raw_arr = _stage_success_probs(run["run_dir"], epoch, prefix,
+                                           decoder_input=decoder_input)
+        if raw_arr is None:
+            continue
+        raw = _success_prob_matrix(raw_arr)                            # (S, H)
+        lam = _derive_lcu_lambda(diag[lcu_key], diag[poly_key])        # (H,)
+        ratio = raw / lam[None, :] ** 2                                # (S, H)
+        # Failure threshold applies to the RAW norm, mirroring the clamp
+        # semantics in cv_attention (elements below it are forced to zero state).
+        fail_frac = (raw < _SUCCESS_PROB_FLOOR).mean(axis=0)           # (H,)
 
-    pos = ratio[ratio > 0]
-    # Log-x when the positive values span more than two decades.
-    log_x = pos.size > 0 and float(pos.max()) / float(pos.min()) > 100.0
-    fig, ax = plt.subplots(figsize=(8, 4.5))
-    if log_x:
-        bins = np.logspace(np.log10(pos.min()), np.log10(pos.max()), 41)
-        ax.set_xscale("log")
-    else:
-        bins = 40
-    for h in range(ratio.shape[1]):
-        vals = ratio[:, h]
+        pos = ratio[ratio > 0]
+        # Log-x when the positive values span more than two decades.
+        log_x = pos.size > 0 and float(pos.max()) / float(pos.min()) > 100.0
+        fig, ax = plt.subplots(figsize=(8, 4.5))
         if log_x:
-            vals = vals[vals > 0]   # zeros reported via fail= in the legend
-        ax.hist(vals, bins=bins, alpha=0.5,
-                label=f"head {h} (λ={lam[h]:.3g}, fail={fail_frac[h]:.1%})")
-    ax.set_xlabel(
-        r"Post-selection success probability $\|P(M)|\psi\rangle\|^2 / \lambda^2$"
-    )
-    ax.set_ylabel("Count")
-    ax.set_title(f"LCU/QSVT post-selection success probability "
-                 f"(epoch {run['epoch']}, test set){stage_label}")
-    ax.legend(fontsize=8)
-    ax.grid(alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(run["fig_dir"] / "success_prob_histogram.png", dpi=150)
-    plt.close(fig)
-    print("  ✓ success_prob_histogram.png")
+            bins = np.logspace(np.log10(pos.min()), np.log10(pos.max()), 41)
+            ax.set_xscale("log")
+        else:
+            bins = 40
+        for h in range(ratio.shape[1]):
+            vals = ratio[:, h]
+            if log_x:
+                vals = vals[vals > 0]   # zeros reported via fail= in the legend
+            ax.hist(vals, bins=bins, alpha=0.5,
+                    label=f"head {h} (λ={lam[h]:.3g}, fail={fail_frac[h]:.1%})")
+        ax.set_xlabel(
+            r"Post-selection success probability "
+            r"$\|P(M)|\psi\rangle\|^2 / \lambda^2$"
+        )
+        ax.set_ylabel("Count")
+        ax.set_title(f"LCU/QSVT post-selection success probability "
+                     f"(epoch {epoch}, test set){stage_label}")
+        ax.legend(fontsize=8)
+        ax.grid(alpha=0.3)
+        fig.tight_layout()
+        fname = f"success_prob_histogram{suffix}.png"
+        fig.savefig(run["fig_dir"] / fname, dpi=150)
+        plt.close(fig)
+        print(f"  ✓ {fname}")
+        drawn += 1
+    if not drawn:
+        raise MissingArtefactError(
+            f"no stage at epoch {epoch} has both `success_probs` and "
+            f"`lcu_coeffs`/`poly_coeffs` — only models with LCU post-selection "
+            f"write them. Earlier stacked blocks need `uv run python "
+            f"experiments/eval_block_stages.py --run-dir {run['run_dir']}`."
+        )
 
 
 def plot_success_prob_trajectory(run: dict) -> None:
     """Mean + 10–90th percentile band of the normalised post-selection
     success probability vs epoch, per head (test side).
 
-    Stacked runs (ADR-0003) carry this for the decoder-input stage only, and
-    fold their per-position values into the sample population.
+    One file per stage (ADR-0003) — see `plot_success_prob_histogram` for how
+    each stage's source is resolved. Stacked runs fold their per-position
+    values into the sample population.
     """
-    preds_per_epoch = _load_all_per_epoch_predictions(run["run_dir"],
-                                                      side="test")
-    epochs = sorted(e for e, d in preds_per_epoch.items()
-                    if "success_probs" in d)
-    if preds_per_epoch and not epochs:
-        raise MissingArtefactError(
-            f"no predictions/epoch_NNNN.npz under {run['run_dir']} carries a "
-            f"`success_probs` key — only models with LCU post-selection write "
-            f"it. For an old run predating the key, run `uv run python "
-            f"experiments/backfill_artefacts.py --run-dir {run['run_dir']}`."
-        )
-    if len(epochs) < 2:
-        print("  - fewer than 2 epochs with success_probs → "
-              "skipping success_prob_trajectory")
-        return
     diag_per_epoch = _load_all_diagnostics(run["run_dir"])
-    first_diag = diag_per_epoch.get(epochs[0])
-    prefix, _suffix, stage_label = (
-        _decoder_input_stage(first_diag) if first_diag is not None
-        else ("", "", "")
-    )
-    lcu_key, poly_key = f"{prefix}{schema.LCU_COEFFS}", f"{prefix}{schema.POLY_COEFFS}"
-    for e in epochs:
-        d = diag_per_epoch.get(e)
-        if d is None or lcu_key not in d or poly_key not in d:
-            raise MissingArtefactError(
-                f"diagnostics/epoch_{e:04d}.npz missing or lacks "
-                f"`{lcu_key}`/`{poly_key}` (needed for per-epoch λ). For an "
-                f"old run predating those keys, run `uv run python "
-                f"experiments/backfill_artefacts.py --run-dir {run['run_dir']}`."
-            )
-    num_heads = _success_prob_matrix(
-        preds_per_epoch[epochs[0]]["success_probs"]
-    ).shape[1]
-    mean = np.zeros((len(epochs), num_heads))
-    p10 = np.zeros_like(mean)
-    p90 = np.zeros_like(mean)
-    for i, e in enumerate(epochs):
-        raw = _success_prob_matrix(preds_per_epoch[e]["success_probs"])
-        lam = _derive_lcu_lambda(diag_per_epoch[e][lcu_key],
-                                 diag_per_epoch[e][poly_key])
-        ratio = raw / lam[None, :] ** 2
-        mean[i] = ratio.mean(axis=0)
-        p10[i] = np.percentile(ratio, 10, axis=0)
-        p90[i] = np.percentile(ratio, 90, axis=0)
-    fig, ax = plt.subplots(figsize=(8, 4.5))
-    for h in range(num_heads):
-        (line,) = ax.plot(epochs, mean[:, h], marker="o", label=f"head {h}")
-        ax.fill_between(epochs, p10[:, h], p90[:, h],
-                        color=line.get_color(), alpha=0.2)
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel(r"$\|P(M)|\psi\rangle\|^2 / \lambda^2$")
-    ax.set_title("Post-selection success probability vs epoch "
-                 f"(mean, 10–90th pct band, test set){stage_label}")
-    ax.legend(fontsize=8)
-    ax.grid(alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(run["fig_dir"] / "success_prob_trajectory.png", dpi=150)
-    plt.close(fig)
-    print("  ✓ success_prob_trajectory.png")
+    if not diag_per_epoch:
+        raise MissingArtefactError(
+            f"no diagnostics/epoch_NNNN.npz under {run['run_dir']} (needed for "
+            f"per-epoch λ)."
+        )
+    first_diag = diag_per_epoch[min(diag_per_epoch)]
+    stages = _diag_stages(first_diag)
+    decoder_prefix = _decoder_input_stage(first_diag)[0]
+    drawn = 0
+    for prefix, suffix, stage_label in stages:
+        decoder_input = prefix == decoder_prefix
+        lcu_key = f"{prefix}{schema.LCU_COEFFS}"
+        poly_key = f"{prefix}{schema.POLY_COEFFS}"
+        epochs, stats = [], []
+        for e in sorted(diag_per_epoch):
+            d = diag_per_epoch[e]
+            if d is None or lcu_key not in d or poly_key not in d:
+                continue
+            raw_arr = _stage_success_probs(run["run_dir"], e, prefix,
+                                           decoder_input=decoder_input)
+            if raw_arr is None:
+                continue
+            raw = _success_prob_matrix(raw_arr)
+            lam = _derive_lcu_lambda(d[lcu_key], d[poly_key])
+            ratio = raw / lam[None, :] ** 2
+            stats.append((ratio.mean(axis=0),
+                          np.percentile(ratio, 10, axis=0),
+                          np.percentile(ratio, 90, axis=0)))
+            epochs.append(e)
+        if len(epochs) < 2:
+            continue
+        mean = np.stack([s[0] for s in stats])
+        p10 = np.stack([s[1] for s in stats])
+        p90 = np.stack([s[2] for s in stats])
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        for h in range(mean.shape[1]):
+            (line,) = ax.plot(epochs, mean[:, h], marker="o", label=f"head {h}")
+            ax.fill_between(epochs, p10[:, h], p90[:, h],
+                            color=line.get_color(), alpha=0.2)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(r"$\|P(M)|\psi\rangle\|^2 / \lambda^2$")
+        ax.set_title("Post-selection success probability vs epoch "
+                     f"(mean, 10–90th pct band, test set){stage_label}")
+        ax.legend(fontsize=8)
+        ax.grid(alpha=0.3)
+        fig.tight_layout()
+        fname = f"success_prob_trajectory{suffix}.png"
+        fig.savefig(run["fig_dir"] / fname, dpi=150)
+        plt.close(fig)
+        print(f"  ✓ {fname}")
+        drawn += 1
+    if not drawn:
+        print("  - no stage has success_probs + coeffs for ≥2 epochs → "
+              "skipping success_prob_trajectory")
 
 
 # ---------------------------------------------------------------------------
@@ -1608,6 +1786,8 @@ def main() -> None:
         ("state_norm_histogram",           plot_state_norm_histogram),
         ("success_prob_histogram",         plot_success_prob_histogram),
         ("success_prob_trajectory",        plot_success_prob_trajectory),
+        ("beta_trajectory",                plot_beta_trajectory),
+        ("trunc_streams_per_block",        plot_trunc_streams_per_block),
         ("lcu_coefficients_heatmap",       plot_lcu_coefficients_heatmap),
         ("polynomial_coefficients_trajectory",
          plot_polynomial_coefficient_trajectory),

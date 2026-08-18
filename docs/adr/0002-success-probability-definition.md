@@ -29,7 +29,7 @@ Caveats recorded deliberately:
   arithmetic; its norm deficit is pure truncation leakage and stays on the separate
   `w_trunc_loss` track. Do not fold it into this figure.
 
-## The stacked model: one stage, and an upper bound
+## The stacked model: one stage per figure, and costs that add
 
 The seq-to-seq stacked model (ADR-0003) post-selects **once per stage** — once per
 seq-to-seq block, plus once more in the aggregator under `pooling="quixer"` — where
@@ -44,23 +44,53 @@ what they mean above.
   position axis into the sample population rather than averaging it away — the same
   treatment `_state_stats` gives the stacked model's per-position states — so each
   (sample, position) pair contributes one count per head.
-- **Stage.** Only the **decoder-input stage**'s success probabilities reach the
-  artefacts: `StackedCVQuixer.forward` keeps the last block's (or the aggregator's)
-  and discards the earlier blocks'. This follows ADR-0003's existing definition of
-  "the" diagnostic state, which already scopes state norms and photon numbers the
-  same way. λ therefore comes from that stage's block-prefixed coefficients
-  (`block{b}_lcu_coeffs` / `agg_lcu_coeffs`), never the flat canonical keys — which a
-  stacked run does not write at all.
-- **Upper bound.** Because `‖P(M)|ψ⟩‖ ≤ Σ_j |c_j| · ‖M‖ʲ ≤ λ` for the unit-norm input
-  every stage receives (the `U_i` are sub-isometries, so `‖M‖ ≤ Σ_i |b_i|`), the ratio
-  is in `[0, 1]` per stage. End-to-end heralding success is a product of such factors,
-  so **the reported figure is an upper bound on the end-to-end value**, not an
-  estimate of it. The bound is robust to the fact that a block's shared `M` mixes all
-  positions: any product of factors in `[0, 1]` is at most the last factor, however
-  they correlate. The thesis captions state this on multi-stage runs; a claim that
-  post-selection is *affordable* cannot rest on this figure, whereas a claim that it
-  is *costly and compounds with depth* can.
+- **Stage.** During *training* only the **decoder-input stage**'s success
+  probabilities reach the artefacts: `StackedCVQuixer.forward` keeps the last block's
+  (or the aggregator's) and discards the earlier blocks'. This follows ADR-0003's
+  existing definition of "the" diagnostic state, which already scopes state norms and
+  photon numbers the same way. λ always comes from the plotted stage's block-prefixed
+  coefficients (`block{b}_lcu_coeffs` / `agg_lcu_coeffs`), never the flat canonical
+  keys — which a stacked run does not write at all. Earlier stages are recovered
+  post-hoc by `experiments/eval_block_stages.py`, which re-evaluates a run block by
+  block from its checkpoints and writes one sidecar per (epoch, stage)
+  (`predictions/epoch_NNNN_block{b}.npz`); the figures then emit one file per stage.
+- **Per stage the ratio is a probability.** `‖P(M)|ψ⟩‖ ≤ Σ_j |c_j| · ‖M‖ʲ ≤ λ` for the
+  unit-norm input every stage receives (the `U_i` are sub-isometries, so
+  `‖M‖ ≤ Σ_i |b_i|`), so the ratio is in `[0, 1]` for each stage independently.
 
-Measuring the omitted stages is deliberately out of scope here — it would need the
-forward pass to keep every stage's values and every stacked run re-evaluated, whereas
-the scoping above is derivable from artefacts already on disk.
+### Costs add across stages, heads and positions — they do not multiply
+
+An earlier revision of this ADR claimed end-to-end heralding was a *product* of the
+per-stage ratios, making a single-stage figure an upper bound. **That is wrong**, and
+the error mattered: it framed the cheapest stage as if it bounded the whole model.
+
+Nothing in this architecture requires two heralded events to succeed on the *same
+shot*:
+
+- **Heads** are independent registers with no entanglement between them, and each
+  head's readout is an *expectation value* estimated from many shots. Head `h`'s
+  statistics can be collected on their own and the classical numbers concatenated.
+- **Blocks** chain **classically**. `tokens` is a real tensor of readouts
+  (`cv_seq2seq.py`, the block loop in `forward`) and every block re-prepares from
+  `FockState.vacuum`. No quantum state crosses a block boundary — the model is
+  inherently measure-and-refeed, so no coherent end-to-end version of it exists.
+- **Positions** under `pooling="mean"` are separate circuit runs for the same reason.
+
+So with `S` the successful shots needed per readout estimate, the cost of one
+inference is a **sum**:
+
+```
+T = Σ_stages Σ_heads Σ_positions  S / p
+```
+
+Consequences for reporting:
+
+- The correct per-head aggregate is `Σ_h ⟨1/p_h⟩` — total shot overhead — or
+  equivalently the **harmonic mean** of the per-head probabilities, which is dominated
+  by the *worst* head. Never the arithmetic mean (dominated by the best head) and
+  never a product.
+- `⟨1/p⟩ ≠ 1/⟨p⟩`. Cost is an expectation of a reciprocal; using `1/mean(p)`
+  understated the measured runs by 5–7%.
+- A figure covering one stage is **one term of a sum**, so it *understates* total
+  cost. It is not a bound on the end-to-end probability. This is why every stage is
+  now measured rather than one being reported as a bound.
