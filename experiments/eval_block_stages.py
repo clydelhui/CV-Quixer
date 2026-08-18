@@ -30,11 +30,17 @@ Two self-checks run automatically and are reported as pass/fail:
   2. The mean over blocks of each truncation stream must reproduce the
      `history["epoch"]["test_*_trunc_loss"]` the training run recorded.
 
+Epochs are independent, so a long run splits cleanly across a job array with
+`--num-shards N --shard $SLURM_ARRAY_TASK_ID` (round-robin, as in
+`thesis_run_figures.py`). Concurrent shards are safe: each writes distinct
+sidecar filenames and its own provenance file.
+
 Run:
     uv run python experiments/eval_block_stages.py \\
         --run-dir results/sweeps/<sweep>/<run>/ \\
         [--blocks all | 0 1] \\
         [--epochs all | best | 3 7] \\
+        [--num-shards 5 --shard 0] \\
         [--batch-size 64] [--device cuda] [--overwrite]
 """
 
@@ -94,7 +100,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="cuda | mps | cpu (default: best available)")
     p.add_argument("--overwrite", action="store_true",
                    help="replace sidecars that already exist")
-    return p.parse_args(argv)
+    p.add_argument("--num-shards", type=int, default=1,
+                   help="split the selected epochs across this many jobs")
+    p.add_argument("--shard", type=int, default=0,
+                   help="0-based index of this shard (see --num-shards)")
+    args = p.parse_args(argv)
+    if args.num_shards < 1:
+        p.error("--num-shards must be >= 1")
+    if not (0 <= args.shard < args.num_shards):
+        p.error(f"--shard must be in [0, {args.num_shards - 1}]")
+    return args
 
 
 def resolve_device(name: str | None) -> torch.device:
@@ -286,6 +301,14 @@ def main(argv: list[str] | None = None) -> int:
     epochs = resolve_epochs(args.epochs, history, run_dir / "checkpoints")
     if not epochs:
         raise SystemExit("no requested epoch has a checkpoint — nothing to do.")
+    # Round-robin stripe, matching thesis_run_figures.py: every epoch costs the
+    # same here, so striping balances the array without needing epoch counts.
+    if args.num_shards > 1:
+        epochs = epochs[args.shard::args.num_shards]
+        if not epochs:
+            print(f"shard {args.shard}/{args.num_shards}: no epochs — "
+                  "nothing to do")
+            return 0
 
     device = resolve_device(args.device)
     batch_size = args.batch_size or config.data.batch_size
@@ -301,8 +324,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Run:          {run_dir}")
     print(f"Model:        {config.model}, {n_blocks} blocks, "
           f"pooling={config.quantum.pooling}")
+    shard_note = (f" [shard {args.shard + 1}/{args.num_shards}]"
+                  if args.num_shards > 1 else "")
     print(f"Blocks:       {blocks}")
-    print(f"Epochs:       {len(epochs)} ({epochs[0]}..{epochs[-1]})")
+    print(f"Epochs:       {len(epochs)} ({epochs[0]}..{epochs[-1]}){shard_note}")
     print(f"Test subset:  {len(ds):,} samples (reused from subset_indices.npz)")
     print(f"Device:       {device}  batch={batch_size}\n")
 
@@ -345,7 +370,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"epoch {epoch:>4}: wrote {len(results)} sidecar(s)"
               + (f"  |  {'; '.join(checks)}" if checks else ""))
 
-    meta_path = preds_dir / "block_eval_meta.json"
+    # One provenance file per shard. The sidecars themselves never collide
+    # (distinct epochs → distinct filenames), but this file is read-modify-
+    # written, so concurrent array tasks sharing one would silently clobber
+    # each other's entries. Deterministic name → re-running an array overwrites
+    # rather than accumulating.
+    meta_name = ("block_eval_meta.json" if args.num_shards == 1 else
+                 f"block_eval_meta_shard{args.shard}of{args.num_shards}.json")
+    meta_path = preds_dir / meta_name
     meta = (json.loads(meta_path.read_text()) if meta_path.is_file()
             else {"invocations": [], "runs": []})
     meta["invocations"].append(invocation_record())
