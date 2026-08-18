@@ -384,6 +384,13 @@ _TRUNC_STREAMS = [
      "Query unitaries $U_{q,j}$"),
 ]
 
+#: Thesis display name per stream, keyed by history field. Single-sources the
+#: naming for every truncation figure, so the per-block curves and the combined
+#: figure cannot drift apart — and so the diagnostic suite's raw labels
+#: ("CVQNN block $W$", matching the config field and the npz key) never leak
+#: into a thesis figure.
+_TRUNC_DISPLAY = {test_key: label for _train, test_key, label in _TRUNC_STREAMS}
+
 
 def fig_truncation_losses(run: dict, book: CaptionBook) -> None:
     """All truncation-leakage streams that this run actually exercises.
@@ -814,7 +821,9 @@ def fig_trunc_streams_per_block(run: dict, book: CaptionBook) -> None:
     n_blocks = _n_blocks(run)
     eh = run["history"]["epoch"]
     drawn = 0
-    for key, fname, ylabel, hist_key in _STAGE_TRUNC_STREAMS:
+    for key, fname, _diag_label, hist_key in _STAGE_TRUNC_STREAMS:
+        # Thesis naming, not the diagnostic suite's raw label.
+        label = _TRUNC_DISPLAY.get(hist_key, _diag_label)
         by_stage = per_stream.get(key) or {}
         if not by_stage:
             continue
@@ -835,11 +844,14 @@ def fig_trunc_streams_per_block(run: dict, book: CaptionBook) -> None:
             ax.plot(range(1, len(recorded) + 1), recorded, linestyle="--",
                     color="0.25", linewidth=1.2, label="Recorded mean")
         ax.set_xlabel("Epoch")
-        ax.set_ylabel(ylabel)
+        # Matches fig_truncation_losses: the axis names the quantity, the
+        # title/caption names the stage.
+        ax.set_ylabel("Leaked probability")
+        ax.set_title(label, fontsize=10, pad=4)
         style_axes(ax)
         outside_legend(ax)
         save(fig, run["fig_dir"], fname)
-        book.add(fname, f"{ylabel} per block",
+        book.add(fname, f"{label} truncation by block",
                  "Truncation leakage of each seq-to-seq block separately, "
                  "against epoch. The model optimises only the mean over "
                  "blocks, drawn dashed, so this decomposition shows which "
